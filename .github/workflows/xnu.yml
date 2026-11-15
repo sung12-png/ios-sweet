@@ -1,0 +1,226 @@
+name: xnu
+
+on:
+  workflow_dispatch:
+    inputs:
+      macos_version:
+        description: macOS release whose xnu to build (13.5 = xnu-8796, iOS 16 era)
+        default: "13.5"
+      kernel_config:
+        description: RELEASE / DEVELOPMENT / DEBUG
+        default: DEVELOPMENT
+      machine_config:
+        description: xnu MACHINE_CONFIG
+        default: SWEET
+      graphics_only:
+        description: Build iOS16 Turnip and Metal userspace instead of the kernel
+        type: boolean
+        default: false
+      gles_only:
+        description: Build the Sailfish-derived iOS16 Mesa GLES integration
+        type: boolean
+        default: false
+      runner:
+        description: GitHub runner label (macos-14 images retired 2026-11-02; macos-15 built and booted kernel 0177)
+        default: macos-15
+      run_tests:
+        description: Run portable Adreno regression tests
+        type: boolean
+        default: true
+      keep_going:
+        description: make -k (collect all compile errors in one run)
+        default: "true"
+  push:
+    branches: [main]
+    paths:
+      - "xnu/patches/**"
+      - ".github/workflows/xnu.yml"
+
+concurrency:
+  group: xnu-${{ github.ref }}-${{ inputs.gles_only && 'gles' || inputs.graphics_only && 'graphics' || 'kernel' }}
+  cancel-in-progress: true
+
+env:
+  DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+  DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
+  MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
+  KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
+  MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
+
+jobs:
+  build:
+    if: ${{ inputs.graphics_only != true && inputs.gles_only != true }}
+    # macos-14 shipped Xcode 15.x (iig matching the xnu-8796 IORPC ABI) but its
+    # images were retired on 2026-11-02. macos-15 (oldest Xcode 16.0, picked
+    # below) built kernel 0177 (run 41322973942), which booted and ran normally.
+    runs-on: ${{ inputs.runner || 'macos-15' }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check portable Adreno state transitions
+        if: github.event_name != 'workflow_dispatch' || inputs.run_tests
+        run: python3 tools/check-adreno-core.py
+
+      - name: Check BSP carrier-file acknowledgements
+        if: github.event_name != 'workflow_dispatch' || inputs.run_tests
+        run: python3 tools/check-baseband-file-push.py
+
+      - name: Check amplifier profile and failure handling
+        run: |
+          python3 tools/check-sweet-amp-model.py
+          python3 tools/check-sweet-pcm-endpoints.py
+          python3 tools/check-sweet-iig-compat.py
+          cc -std=c99 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -o /tmp/test-sweet-amp userspace/adsp/test_sweet_aw2032.c userspace/adsp/sweet_aw2032.c
+          /tmp/test-sweet-amp
+          cc -std=c99 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -o /tmp/test-sweet-pcm-ring userspace/adsp/test_sweet_pcm_ring.c
+          /tmp/test-sweet-pcm-ring
+
+      - name: Fetch build script
+        run: |
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+          git -C dxb checkout -q FETCH_HEAD
+          # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
+          cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+          # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+          grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          # The upstream builder skips rejected patches. Our patches must apply.
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          builder = Path("dxb/build.sh")
+          source = builder.read_text()
+          needle = '                warning "Skipping patch ${PATCH}'
+          assert source.count(needle) == 1, "builder patch loop changed"
+          names = "|".join(p.name for p in sorted(Path("xnu/patches").glob("*.patch")))
+          guard = ('                case "${PATCH##*/}" in\n'
+                   f'                    {names})\n'
+                   '                        printf "Required project patch rejected: %s\\n%s\\n" "$PATCH" "$APPLY_CHECK" >&2\n'
+                   '                        exit 1 ;;\n'
+                   '                esac\n')
+          builder.write_text(source.replace(needle, guard + needle))
+          PYCODE
+          ls dxb/patches
+
+      - name: Deps
+        run: |
+          brew install jq gum bash cmake ninja
+          # build.sh only checks that xcodes exists (Xcode is preinstalled); no bottle on macOS 14
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/xcodes
+          sw_vers
+          ls -d /Applications/Xcode*.app
+          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          xcrun --find iig
+          echo "SWEET_REAL_IIG=$(xcrun --find iig)" >> "$GITHUB_ENV"
+          echo "IIG=$GITHUB_WORKSPACE/tools/sweet-iig-compat.py" >> "$GITHUB_ENV"
+
+      - name: Build
+        working-directory: dxb
+        env:
+          # keep going after errors so one run reports every compile failure
+          MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
+        run: bash build.sh
+
+      - name: Require SWEET GPU code in the built kernel
+        if: env.MACHINE_CONFIG == 'SWEET'
+        run: |
+          grep -F 'sweet_gpu_probe();' dxb/xnu/bsd/dev/sweet_ufs.c
+          CONFIG=$(printf '%s' "$KERNEL_CONFIG" | tr '[:upper:]' '[:lower:]')
+          grep -aFq 'SWEET GPU: GPUCC audit v2' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET GPU: ARC tables read-only complete' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET GPU: ARC readback v1 starting' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET GPU: ARC gfx raise v1 starting' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET ADRENO: CX controller v2 starting' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET ADRENO: postmarketOS SM7150 GMU clocks v1 starting' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET FB: scheduler v3 requested=' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET CPUFREQ: domain %u selected lut' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET ADRENO: DCVS perf index %u' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET RENDER: submission pipelining %s' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET RENDER: %s client connected ABI=%u slot=%u' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET BL: AppleARMBacklight published' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET RENDER: fence waits %s (sweetwaitlock=%d)' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET RENDER: window_ms=%llu gpu_busy_pct=%u' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET FB: beam-raced copy %s:' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET RENDER: owned BO pool reserved %u of %u MiB in %u blocks' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET SMMU: votes SN15=%d CN0=%d' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET SMMU: WLAN %#x/%#x -> CB%d via SMR%d' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET BT: S3 RCG in DFS mode' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET HAPTIC: AW8624 chip ID read' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET HAPTIC: serving /dev/sweet-haptic' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET RTC: calendar set from the PM6150 RTC' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'sweetbigcores' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET FILES: listening on tcp 2223' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET DDR: memory bandwidth vote' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+
+          grep -aFq 'SWEET ADRENO: GMU TCM staging errno=' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET ADRENO: SMMU map errno=' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET RPMH: poll completion v2 GIC INTID' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET GLES: backboardd will load /usr/lib/sweetgl.dylib' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET RENDER: Metal plugin ' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET RENDER: restarted backboardd for Metal discovery' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET SURF: Metal owned rows align ' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+          grep -aFq 'SWEET RENDER: CPU presentation fence gate enabled' "dxb/fakeroot/System/Library/Kernels/kernel.$CONFIG.sweet"
+
+      - name: Package build tree for local compiles
+        if: always()
+        run: |
+          # Generated headers, config option headers, mig output and the patched
+          # source: enough to re-run any single compile command from the log locally.
+          SDK=$(xcrun --sdk macosx --show-sdk-path)
+          mkdir -p sdk-kernel-platform
+          cp -R "$SDK/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform" sdk-kernel-platform/ || true
+          tar czf buildtree.tgz \
+            --exclude='*.o' --exclude='*.cpo' --exclude='*.a' --exclude='*.dSYM' --exclude='*.unstripped' \
+            --exclude='kernel.development.*' --exclude='.git' \
+            -C dxb build/xnu.obj fakeroot/usr/local/include xnu \
+            -C .. sdk-kernel-platform
+          ls -la buildtree.tgz
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-buildtree
+          path: buildtree.tgz
+          retention-days: 7
+
+      - name: Inspect closed KDK support libs
+        if: always()
+        run: |
+          mkdir -p out/kdk-libs
+          for lib in /Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a; do
+            b=$(basename "$lib" .a)
+            ar t "$lib" > "out/kdk-libs/$b.members.txt" 2>&1 || true
+            nm -m "$lib" > "out/kdk-libs/$b.nm.txt" 2>&1 || true
+            lipo -info "$lib" >> out/kdk-libs/arch.txt 2>&1 || true
+          done
+          ls -la out/kdk-libs
+
+      - name: Collect
+        if: always()
+        run: |
+          mkdir -p out
+          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+          ls -la out
+          (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-kernel
+          path: out/
+          if-no-files-found: warn
+
+  graphics:
+    if: ${{ inputs.graphics_only == true && inputs.gles_only != true }}
+    uses: ./.github/workflows/metal.yml
+
+  gles:
+    if: ${{ inputs.gles_only == true }}
+    uses: ./.github/workflows/gles.yml

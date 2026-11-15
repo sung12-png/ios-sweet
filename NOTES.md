@@ -1,0 +1,6714 @@
+## 2026-11-15 23:30 IST: build 17 = uber-shader static initializer evaluated at translation time; frames 5-9 ms
+- Build 15 (CI 43736265140, 2c27672): per-range drop_unread_scratch + constant globals keep shadows -> 26b6c: frag
+  variants 740 -> ~250 instr, cat6 230 -> ~50; slow draws 600 -> 200-270 ms; USER: home screen reached, "extremely
+  laggy 1 frame per minute" (with disasm + drawtime on), dock blur correct, later black screen (backboardd abort,
+  reason lost), then kernel "GPU LOST (quiesce 0xe00002d6 ...)" = kernel 1 s drain limit hit by slow work.
+- Build 16 (CI 43738059096, 00f3794) diagnostic "scratch load stays in <fn>: <global> ...": all remaining loads were
+  initializer-computed flags (has_position, has_dest_N, vry_has_*, vtx_attr_has_*), "bytes not known after the
+  initializer". f0004 initializer = 462 instr, 12 blocks, 4 phis, branches on is_function_constant_defined, uses
+  air.normalize_function_constant_predicate (new in iOS 26) and loads variables it set earlier.
+- Build 17 (CI 43739163337, e0454a4): evaluate_static_initializers (air_pointer_cells.inc) runs the initializer on the
+  AIR at plan time (load/store/select/icmp/casts/binops/phi/br/ret + the two fc intrinsics); run_static_initializers
+  stores the final shadows instead. 26b6e (logs/boot-26b6e.txt): "1 static initializer(s) evaluated at translation
+  time" x4, ZERO "scratch load stays", no slow fences; async completion latency_avg 5-9 ms, max 33-43 ms (was
+  seconds). Bundles kept on phone: .00f3794 (16), .2c27672 (15), .51016d1 (14), .bdc856c (13), ...
+- Phone env: /var/local/sweet-native-env = FD_MESA_DEBUG=sysmem only; no drawlog/drawtime files. Image 26b6 (xnu 2002,
+  sweetwptrkick=1; the kick is harmless and can be dropped). Awaiting USER feel test.
+- Open: kernel 1 s quiesce/drain limit (GPU LOST on slow work); the "vanished after 10-60 min" issue; whether
+  FD_MESA_DEBUG=sysmem is still wanted.
+
+## 2026-11-15 22:30 IST: slow frames = per-pixel scratch stores in uber shader; fix = native-metal build 15
+- 26b6a (xnu 2002, kernel CI 43730710146, image shim-boot-26b6.img cea2da0f = kernel + wbg ADT + 26b5 cmdline +
+  sweetwptrkick=1): slow fences show CP_RB_RPTR == CP_RB_WPTR == next_wptr (all commands consumed) and
+  RBBM_STATUS 0xe715f5 (SP/HLSQ/UCHE/RB/CCU busy); 28 WPTR kicks changed nothing -> real GPU work, not a lost kick.
+  waitUntilCompleted's own 2 s finish limit (RWA_FENCE_TIMEOUT_NS) marked the device lost -> "Metal failed to build
+  compute pipeline" abort. Build 14 = CI 43734051108 (51016d1; build 13 kept as SweetMetal2.bundle.bdc856c): 20 s
+  finish limit + timed draw log (/var/local/sweet-native-drawtime + drawlog -> "DRAWTIME seq us").
+- DRAWTIME: luma_boost 0.2 ms; fixed_frag_lph_cph full-screen variants fixed per label at ~600 ms (TimgBvcmA2Xhfn_Isrc,
+  A2S1Xhfu, Tc3sA2S1Xhfu_Idst...) or ~66 ms (TimgBdso..., Tc4p..., TmuaA2Xhf_Isrc_IsrcM1...), plain ones 2-3 ms.
+- Ruled out (observed): colour-program loops (captured constants via /private/var/tmp/sweet-native-capture ->
+  research/ios26/metal/capture-26b6, all 60 named, fc_color_inputs0=0, fc_generic=0; name->index lookup correct).
+- IR3_SHADER_DEBUG=disasm (in /var/local/sweet-native-env) on 26b6b: fixed_frag variants ~740 instr, ~230 cat6,
+  dump total 1947 stp / 355 ldp, systall ~2600, 0 loops; vertex shaders 79 cat6. Cause (from f0004 IR): the static
+  initializer copies all function constants into program-scope globals (scratch); shadows fold their loads, but
+  unused_color_params_cph (LLVM constant, address passed to apply_color_opcode via select) was tainted and kept a
+  load_scratch, and drop_unread_scratch was all-or-nothing -> every initializer store ran per pixel.
+- Fix 2c27672 (air_pointer_cells.inc): constant globals keep their shadow despite escaping into calls;
+  drop_unread_scratch drops each store no load can read (after nir_opt_constant_folding), logs
+  "scratch: N loads stay; D initializer stores dropped, K kept". Native-metal build 15 = CI 43736265140.
+- Gotcha: killing backboardd during a slow draw -> kernel clientClose 0xe00002ca -> "GPU LOST" for the rest of the
+  boot ("no msm device to open", CA falls back to OGL and hits push_surface assert). Reboot (26b6) to recover.
+- Phone: 26b6 boot logs/boot-26b6b.txt, bundle build 14, env FD_MESA_DEBUG=sysmem + IR3_SHADER_DEBUG=disasm,
+  /var/local/sweet-native-drawtime present (remove both debug settings after verifying build 15).
+
+## 2026-11-15 21:10 IST (phone clock; log mtime 21:04:09): 26b5i vanished -> fastboot, no panic; xnu 2002 building
+- USER: "still just the bar flickering. go ahead with the kernel build", then "it crashed". USB log
+  logs/boot-26b5i.txt stops at 21:04:09 with ordinary daemon lines (no panic, no launchd critical line); phone then
+  in fastboot (battery-soc-ok: yes). Same "vanished after 10-60 min" pattern as 26b4/26b5 earlier (not investigated).
+- xnu/patches-12377/2002-sweet-slow-fence-diag.patch (commit 8625130): WaitFence poll pending >= 20 ms after the
+  first poll of that fence logs once "SWEET RENDER: slow fence N pending ..." (issued/completed/next_wptr/mem_fence/
+  mem_rptr/CP_RB_RPTR/CP_RB_WPTR/RBBM_STATUS) and "slow fence N done after X us (kicks k)"; boot-arg
+  sweetwptrkick=1 rewrites CP_RB_WPTR every 20 ms while pending. Not compiled locally (scratch tree = 2001's new files
+  only). Kernel CI 43730710146. Image plan 26b6 = that kernel + sweet-n104-2x-wbg.adt + 26b5 cmdline +
+  sweetwptrkick=1 (payload-26b5 reproduced byte-identically from kernel-43568108762 + wbg ADT + its cmdline).
+- Risk noted: diagnose() reads GX registers (CP_RB_RPTR/WPTR, RBBM_STATUS) while the GPU may be collapsed.
+
+## 2026-11-15 22:10 IST: build 12 blur OK, no refusals; slow last-frame fences froze UI; build 13 waits 20 s
+- Build 12 = CI 43727478082 (b7cf321, backend d7e3fbfa; build 11 kept as SweetMetal2.bundle.fc265e2). 26b5 boot
+  logs/boot-26b5i.txt: ZERO pipeline refusals, no backboardd crash, bursts to 47 fps. USER: "homescreen doesn't load.
+  it doesn't get past the lockscreen", later "the time keeps changing from 01 to 02 whenever I touch the screen..
+  nothing else happens". SpringBoard restarted on request (372 -> 514): same.
+- Cause of the freeze (observed): one command buffer per backboardd exceeded the frontend's 2 s completion budget ->
+  rwa_command_poll set d->lost -> every later draw refused (lost device); only forced commits redrew.
+- Draw log (/var/local/sweet-native-drawlog, created AFTER backboardd start; 20000) + build 13 = CI 43728809173
+  (bdc856c, SweetMetal2 b6ffe80a; build 12 kept as SweetMetal2.bundle.b7cf321), installed live (backboardd restart,
+  no reboot): slow fences 437 (3272 ms), 440 (5032 ms), then with FD_MESA_DEBUG=sysmem 584 (3318 ms), 587 (5139 ms);
+  all label com.apple.coreanimation.command-buffer; all FINISH (GPU not hung). Each is the last command buffer
+  before the screen idles; every CA frame ends with std_vert1_lph|luma_boost_lph (f0167, BrimJumpUniforms, reads
+  air.render_target 0 = framebuffer fetch + 128x1 LUT). Fence 437 finished right after the next submission (DRAW
+  528). Kernel "fence retire N" samples (every 120th) show gpu_wait_us=3-5.
+  GUESS (not verified): the last submission before idle is not executed/observed until the GPU is kicked again
+  (WPTR write vs GMU IFPC/AHB fence, or completion detection) -- needs a kernel diagnostic (log observed/
+  lastSubmitted/completedFence = native_adreno_fence_wait[] on slow waits, RPTR/WPTR/RBBM_STATUS).
+- FD_MESA_DEBUG=sysmem (the iOS 16 default; the fresh iOS 26 root had no /var/local/sweet-native-env) made no
+  difference to the slow fences. File left in place = FD_MESA_DEBUG=sysmem.
+- Phone now: 26b5 running, bundle = build 13, backboardd 997 stable (no device lost). Awaiting USER swipe test.
+
+## 2026-11-15 21:10 IST: build 11: LOCK SCREEN DRAWN BY METAL; blur pipeline refused (by-value [8 x i8]); build 12
+- Build 11 = CI 43717026646 (fc265e2, SweetMetal2 e5f49cbf, backend 7e044e13). First attempt compiled, then failed
+  uploading the artifact (CreateArtifact timeout); `gh run rerun --failed` succeeded. Installed over SSH (tar, all 6
+  file hashes verified on the phone); build 10 kept as SweetMetal2.bundle.041879f. Phone host key changed with the
+  iOS 26 root: research/ssh/known_hosts.ios26 (direct USB link; research/ssh/known_hosts left as is).
+- 26b5 boot logs/boot-26b5h.txt. USER: "lockscreen shows up (with white time, it was red earlier). but homescreen
+  keeps loading". Dozens of com.apple.coreanimation.* pipelines compile; stage links fixed/downsample/narrow_blur OK.
+- backboardd aborted 5x (368/393/427/467/529) "Metal failed to build render pipeline" after "this render pipeline is
+  refused: instruction: an array where a number belongs, which has no single NIR width (block 0, instruction 0,
+  opcode 7) (block 0, instruction 0, opcode 17)". No launchd critical reboot this time; pid 546 then stayed up but
+  presented nothing (SWEET FB swaps_s=0.00).
+- Offline (research/ios26/metal/airtest: gep0.c, argagg.c, dis.c = donor air_print; build: gcc -DUTIL_ARCH_LITTLE_ENDIAN=1
+  -DUTIL_ARCH_BIG_ENDIAN=0 -DHAVE_PTHREAD + air_module/bitcode/layout/print + Mesa ralloc.c hash_table.c): opcode 7 =
+  GEP, 17 = CALL. variable_blur_downsample_frag_lpf/_lph + clamp variants (f0040/41/142/143) call
+  variable_blur_downsample_base(<4 x float>, <2 x float>, [8 x i8] undef, ...) = VertexDownBlurOutput tail padding.
+  translate_callee asked air_nir_bit_size for the array's NIR parameter; that soft error got pinned on the callee's
+  first instruction (a GEP). UberShader set_lum_clip_on_format (f0004/f0005) also takes
+  [2 x FragmentShaderConfig::Image] + [3 x i8] WITH values.
+- Fix b7cf321 (prepare-sweet-native-metal.py): aggregate args take no NIR param of their own; empty ones bind the
+  caller's aggregate, ones with values are flattened (one param per SSA leaf) and rebuilt in the callee; both
+  specialise the callee. Verified only that the prepare script applies to a donor a79ff07 export (no local NIR
+  build). native-metal build 12 = CI 43727478082.
+- Also seen (not investigated): once per backboardd instance "the GPU did not finish a command buffer within two
+  seconds ... GPU is wedged" shortly before the refusal (async completion latency_max_us=1290308 before it); no
+  kernel ADRENO fault line. SpringBoard's own Metal: "no msm device to open" (expected; only backboardd has GPU).
+
+## 2026-11-15 20:00 IST: build 10: samplers OK; nested insertvalue on poison array refused; build 11
+- native-metal build 10 = CI 43715967873 (backend 50c18ff9; previous kept as SweetMetal2.bundle.6a9129f): no sampler
+  refusals; pipelines (com.apple.coreanimation.PBGRAXm_A2Xhf) refused "instruction: an aggregate index out of its
+  value (block 30, instruction 12, opcode 19)"; 3 aborts -> reboot. USER: "crashed".
+- Offline (airtest/agg + ../agg26.txt): opcode 19 = INSERTVAL; fixed_frag_lph_cph/_cpf block 30 inst 12 =
+  insertvalue with 2 indices into a POISON [N x struct] constant; donor air_constant_val left undef/poison aggregate
+  elements NULL. Fix (prepare-sweet-native-metal.py): nested struct/array elements are created as empty aggregates.
+  native-metal build 11 = CI 43717026646.
+
+## 2026-11-15 19:30 IST: build 9: no missing selectors; pipelines refused (iOS 26 inline sampler layout); build 10
+- native-metal build 9 = CI 43714935271 (6a9129f, SweetMetal2 ccb460d4; previous kept as SweetMetal2.bundle.35ec3ed):
+  "iOS 26 fallbacks on 16 of 19 classes", ZERO "unimplemented -[...]" lines; backboardd aborted "Metal failed to build
+  render pipeline" after "this render pipeline is refused: interface: an inline sampler whose state is not a constant"
+  (donor air_to_nir.c plan_globals). USER: "it crashed again".
+- Offline (research/ios26/metal/airtest/samp): all 79 __air_sampler_state* globals in iOS 26 QuartzCore are data[2]
+  {state word, 0} (iOS 16: one i64). Fix in tools/prepare-sweet-native-metal.py (replace in air_to_nir.c): word 0,
+  log a nonzero word 1. native-metal build 10 = CI 43715967873.
+- Phone on 26a3.
+
+## 2026-11-15 19:05 IST: build 8 '&BGA' import WORKS; next: setResponsibleTaskIDs:count: (fix ready, NOT built)
+- native-metal build 8 = CI 43713138586 (35ec3ed, SweetMetal2 01c38531; previous kept as SweetMetal2.bundle.9551f9e):
+  "IOSurface 21/22/23 0x26424741 planes 1: plane0 offset 0 bpr 3328 828x1792" -> drawables accepted; backboardd then
+  raised NSInvalidArgumentException -[SweetNativeMetalCommandBuffer setResponsibleTaskIDs:count:] unrecognized selector
+  (x3 -> critical reboot). USER: "it crashed".
+- 26b4/26b5 runs vanished from USB after ~10-60 min twice (no panic in the log); A3 did not. Suspects: GPU active
+  (sweetgpu=9) hang, or battery drain on a 500 mA SDP charge limit. Not investigated.
+- Prepared (committed, NOT BUILT, the 8-build budget is used up): SweetMTLArchitecture.m adds the no-op
+  setResponsibleTaskIDs:count: and a -forwardingTargetForSelector: fallback on all bundle classes (log once + answer
+  0/nil). NEXT build (needs USER OK) lists every remaining missing iOS 26 selector in one boot.
+- Phone on safe image 26a3.
+- USER 2026-11-15: "you are free to do how many ever build you want" (the 8-build limit is lifted). Build 9 =
+  native-metal CI 43714935271 (6a9129f, fallback + setResponsibleTaskIDs).
+
+## 2026-11-15 18:45 IST: Metal device RUNS in iOS 26 backboardd (26b5d); drawables refused ('&BGA'); build 8
+- native-metal build 7 = CI 43712011039 (9551f9e, SweetMetal2 3e936166): "targetDeviceArchitecture -> cpu 0x1000017
+  sub 0xc" -> MTLLoader passes, library loads, command buffers run; backboardd STABLE (0 crashes, no reboot).
+  Old bundles on the phone: SweetMetal2.bundle.ios16-e0574fa, SweetMetal2.bundle.79ba8c4.
+- Screen dark (USER), SpringBoard restarted on request (367 -> 517): every drawable refused "interface: planar
+  IOSurface textures are not implemented". backboardd's 828x1792 targets are fmt 0x26424741 '&BGA' (lossless BGRA),
+  planes 1, size 5980160 (= 5963776 linear + 16 KiB metadata), bpr 3328 (SWEET SURF log).
+- Fix (build 8 = CI 43713138586, the LAST of the 8 allowed): frontend SweetNativeDrawable.m + transport sweet_drm.cpp
+  import a single-plane '&BGA' surface as linear BGRA starting at plane 0 (base = allocation page). First 4
+  planar surfaces log plane0 offset/bpr. NOTE: no CI builds left in the USER's budget after this one.
+
+## 2026-11-15 18:00 IST: iOS 26 MTLLoader disassembled; -targetDeviceArchitecture added (native-metal build 7)
+- Phone dyld cache: /System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e (+.01-.40, ~5 GB). Copied to
+  research/ios26/dsc only main + .01/.02 (+ part of .03) and single pages of .33.dylddata/.34.dyldreadonly with dd
+  over SSH (research/ios26/dsc/part). The ipsw binary is blocked by the session's auto-mode classifier; used own Python
+  (scratchpad dscmap.py) + capstone 5.0.7.
+- Metal = image at 0x1860da000 in .01; "Target device architecture is nil" is an NSString (__AUTH_CONST __cfstring);
+  failure stub 0x1862a7c74 (MTLReportFailure, line 692) is reached only from 0x1860fb3c8, inside the objc_direct body
+  of +[MTLLoader sliceIDForDevice:legacyDriverVersion:airntDriverVersion:] at 0x1860fb334: arch = [device
+  targetDeviceArchitecture]; *legacy = [arch driverVersion] (u64); *airnt = [arch versionCombined] (u32); return
+  [arch subType] << 32 | [arch cpuType]. (Selector names from selrefs 0x1e62fd388/0x1e62f8ec8/0x1e62fd5f8/0x1e62f8b20/
+  0x1e62fcb38 -> .34 strings.)
+- Fix (commit after 79ba8c4): userspace/native-metal/frontend/SweetMTLArchitecture.m, linked into both bundles;
+  +load adds -targetDeviceArchitecture to SweetNativeMetalDevice -> SweetMTLArchitecture {cpuType 0x01000017,
+  subType 0xc, driverVersion 0, versionCombined 0}; /var/local/sweet-mtl-arch "cpu sub drv comb" overrides at runtime
+  (no rebuild). native-metal CI 43712011039 = build 7 of 8.
+
+## 2026-11-15 00:00 IST: Metal on iOS 26: device + queue OK; fat metallib fixed; now MTLLoader "architecture is nil"
+- CI builds used: 6 of 8 (5 xnu26 + native-metal 43624985266 = commit 79ba8c4, SweetMetal2 dca97182, backend aaf0f53d).
+- 26b5 (1d92418f = 26b4 + sweetmtl=2 sweetgles=0, ADT wbg) with the iOS 16 SweetMetal2.bundle (CI 42213344710) in
+  /System/Library/Extensions: backboardd loads it ("native renderer FD618; AIR -> NIR -> freedreno"), opens the
+  A618 client (kernel methods 1/15/11/2/3/13/... all result=0), creates device + queue, then aborts
+  "Metal failed to load library" (x3 -> launchd critical reboot; one reboot landed in Android, others in fastboot).
+- Cause 1 (FIXED, 79ba8c4): rwa_library_open required "MTLB" at offset 0; iOS 26 QuartzCore default.metallib is
+  fat (0xCAFEBABE: AIR64 0x01000017 MTLB 1.2.9 + APPLEGPU slice). Offline research/ios26/metal/airtest/mltest:
+  slice0 OK 189 functions, fat file "not an MTLB container".
+- 26b5c (new bundle; old kept on phone as SweetMetal2.bundle.ios16-e0574fa): next abort is in Metal.framework:
+  "+[MTLLoader sliceIDForDevice:legacyDriverVersion:airntDriverVersion:]:692: failed assertion `Target device
+  architecture is nil'" -> our device class must answer -architecture (MTLArchitecture) for iOS 26.
+  NEXT: disassemble iOS 26 Metal MTLLoader sliceIDForDevice (dyld shared cache from the 23G90 IPSW / phone) to see
+  which MTLArchitecture fields it reads; implement -architecture in the frontend; native-metal build 7.
+- SAFE image now: 26a3 (no sweetgpu -> no accelerator -> Metal never loads the bundle). 26b4/26b5 load the bundle.
+
+## 2026-11-14 22:45 IST: Metal port started: iOS 26 QuartzCore shaders are compatible with the donor AIR frontend
+- USER: "wallpaper is black, start the metal port". Black wallpaper = PosterBoard/CA layers drawn only through Metal
+  (Bergamota docs/METAL_ADRENO630.md (a)); expected to come with the Metal device.
+- research/ios26/metal (git-ignored): qc26.metallib = phone's /System/Library/Frameworks/QuartzCore.framework/
+  default.metallib (iOS 26.6.2, 6.6 MB, fat: slice 0 AIR64 MTLB 1.2.9 "Apple metal version 32023.886", slice 1
+  APPLEGPU binary). bc26/ = its 189 bitcode modules.
+- airtest/ = Linux harness: donor (research/hackios-userland-reference = pinned a79ff07) air_module.c + air_bitcode.c +
+  air_layout.c + Mesa util ralloc (research/mesa-gles-reference) + a u_printf_length stub. RESULT: all 189 iOS 26
+  modules parse ("parsed 189 ok, 0 failed"); decl26.txt = 162 declared intrinsics = 92 ops, ALL handled by the donor's
+  air_intrinsics.c/air_to_nir.c (llvm.lifetime/memcpy by prefix). Shader side: no format/intrinsic gap found.
+  Not yet tested: AIR -> NIR -> ir3 lowering (needs the full Mesa build) and the Objective-C MTL* selector surface.
+- iOS 16 bundles from native-metal CI 42213344710 in research/ios26/metal/nm-42213344710: SweetMetal2.bundle
+  (native-legacy; class SweetMTL2Device, needs sweetmtl=2 sweetgles=0; SweetMetal2 eac7081c, backend cd052dd6) links
+  only Foundation/Metal/IOKit/IOSurface/CoreFoundation/libobjc/libc++/libSystem -> loadable on iOS 26 as is.
+- NEXT: install it to /System/Library/Extensions/SweetMetal2.bundle (tar over SSH), image 26b5 = 26b4 cmdline +
+  sweetmtl=2 sweetgles=0 (FB stub accelerator is then not published), boot, read backboardd's first Metal failure
+  (unrecognized selector / pipeline compile). Fallback image: 26b4.
+- 26b4 ran ~1 h, then the phone vanished from USB (no fastboot, no ECM; log ends in normal gamepolicyd jetsam
+  lines, no panic, no launchd reboot). Cause unknown; USER asked to check the phone.
+
+## 2026-11-14 19:30 IST: MILESTONE: Adreno 618 GPU up on iOS 26 (26b4); 26a3 boots; ssh reboot-to-fastboot works
+- CI 5 = 43568108762 SUCCESS (2001 with Bergamota's "SWEET AMFI" policy name). 26a3 (c5f71228): AMFI calls reach
+  Bergamota's handler again (4 "SWEET AMFI: __mac_syscall" lines as on 26c8), no AICMR abort, SpringBoard up.
+  USER: "aspect ratio looks correct" (sweetfb_scale=2), "performance is still slow", haptics: 3 buzzes felt (driver
+  self-test; iOS does not use it: no /product/haptics node yet).
+- `sweetreboot fastboot` over SSH WORKS on sweet (26a3 -> fastboot 13:42:48, again 13:54:21): unattended image tests
+  are possible whenever a 2001 kernel runs.
+- 26b3 (CI 5 + sweetgpu=9, ADT wb): CX + GMU clocks OK, stopped "missing GMU firmware properties". 26b4 (f? 5cd56466,
+  ADT boot/sweet-n104-2x-wbg.adt = wb + /sweet-adreno from tools/sweet-adreno-firmware.py with
+  research/sweet-firmware-20261023/gpu a618_gmu.bin, a630_sqe.fw, a615_zap.mdt, a615_zap.b02): GMU boot + HFI OK, ZAP
+  authenticated, SQE ME_INIT 12/12, CP fence 29/29 value 0x618c0de, OPP to 800 MHz, "NativeAdreno ABI + Metal
+  discovery published on live A618 context", backboardd restarted for Metal discovery, no crash. = the iOS 16 state.
+- NEXT for GPU (userland, the big part): SweetMetal2.bundle / libSweetNativeBackend (native-metal CI, iOS 16 build)
+  must be rebuilt against iOS 26 Metal/IOGPU (private _MTLDevice ABI changed); then sweetmtl=2 and install the bundle.
+- backboardd SIGABRT "Assertion failed: (found != slist->end()), function push_surface, file ogl-context.cpp, line
+  1186" = CA software (OGL) renderer; ALSO on Bergamota-only 26c8 (5x on 26c8b): not from 2001. USER sees SpringBoard
+  reloading. The GPU (Metal) path would replace this renderer.
+- Wi-Fi on 26a3: wland 0239 boots the modem (rmtfs/tftp/QMI, SIM read), but the modem never fetches wlanmdsp.mbn and
+  no wlfw service appears; en0 never created (radio state 0). Not solved yet.
+- Audio: SweetAudio.driver moved to /System/Library/Audio/Plug-Ins/HAL/ (sweet_audiohal SWEET_DRV) on 26a3 -> test.
+- bluetoothd aborts ("Bluetooth fatal error reason 1201", later SIGABRT) although the kernel HCI link works
+  (rx 1104 / tx 808 packets, 10 connects). Not solved yet.
+
+## 2026-11-14 12:20 IST: 2001 kernel links (CI 43551066353); 26a1/26b1/26a2 abort backboardd (AMFI); CI 5 running
+- CI builds: 3 = 43551066353 SUCCESS (first linked 2001), 4 = 43565769725 SUCCESS, 5 = 43568108762 (running). 5 of 8 used.
+- Images (all ADT sweet-n104-2x-wb.adt; driver args sweetfb_scale=2 sweetpmem=1 sweetsmmuprobe=1 sweetsmmuwlan=1
+  sweetbt=1 sweetbtfast=1 sweetbtibs=1 sweetbtsk=1 sweetamp=2 sweetvaudio=1 sweethaptic=3 sweetcharge=2 sweetfiles=1):
+  26a1 (CI 3, a73be802), 26b1 (CI 3 + sweetgpu=9, abdcd3d3), 26a2 (CI 4, 5ec55a4e). All three: backboardd + familycircled
+  abort "matched == (match_result.error_code == AICMR_MATCH)" -> launchd "rebooting due to critical process crashes:
+  backboardd" (to recovery environment -> phone ends in fastboot). USER: "crashed while loading springboard".
+- Cause: __mac_syscall("AMFI", ...) goes to the first registered policy NAMED "AMFI" with a syscall hook. The merge
+  (a) gave our policy sweet_gles_dyld_policy (ENOPOLICY for 0x5a; removed in CI 4) and (b) renamed Bergamota's
+  "SWEET AMFI" policy to "AMFI", so Bergamota's real "AMFI" syscall policy was refused (26a2: zero "SWEET AMFI:
+  __mac_syscall" lines vs four on 26c8). CI 5 restores the name.
+- Seen on 26a1 before the abort: wland + wland-0225 started (pmem reads of SMEM), BT controller up at 3 Mbaud and rampatch
+  download running, charger SDP 500 mA, SWEET REBOOT ready on sweet (IMEM mapped, PON spare write ready).
+  26b1: GPU stage 9 is scheduled 60 s after boot, the abort came first (no GPU result).
+- Open: SweetAudio.driver must be in /System/Library/Audio/Plug-Ins/HAL/ (sweet_audiohal SWEET_DRV), it was installed in
+  /Library/Audio/Plug-Ins/HAL -> move over SSH on the next stable boot. bluetoothd "fatal error reason 1201" (twice):
+  probably opened HCI while the rampatch was still loading; check after a stable boot.
+
+## 2026-11-14 08:45 IST: USER away; plan: GPU kernel green, no black bars, Wi-Fi, BT, sound (<= 8 CI builds)
+- USER: "run the GPU fix build (3 builds) ... two black bars on top and bottom ... fix it (proper aspect ratio).
+  bring up wifi, bluetooth. proper playback, sound fixes from ios 16 (total you can build up to 8 builds)".
+- CI builds used: 1 = 43547351307 (failed: stdint/pmem/duplicates), 2 = 43549447625 (fixes, running).
+- Black bars: the 828x1792 (iPhone 11) canvas is 19.5:9, the panel 20:9; Bergamota's AppleCLCD fits it (bars).
+  Fix = boot-arg `sweetfb_scale=2` (stretch to the whole panel, 2.6% vertical squeeze; HID touch mapping follows
+  the same boot-arg). A real-iPhone canvas is required (a fake size broke the status bar on iOS 16, NOTES 0061).
+  Image boot/shim-boot-26c8s.img 50e1f77e... = 26c8 + sweetfb_scale=2 (sweetbuild=2619), NOT booted yet.
+- ADT boot/sweet-n104-2x-wb.adt = final ADT + /arm-io/wlan (tools/adt-add-wlan.py; launchd starts wifid only with
+  it) + /arm-io/bluetooth with the WCN3990 rampatch/NVM (tools/adt-add-bluetooth.py, research/sweet-bt-fw-0145).
+  pkg26.sh takes ADT=... now.
+- Phone root changes over SSH on the running 26c8 (effective next boot; rollback copies on the phone):
+  * Wi-Fi: /var/local/bin/{wland,netsvc} = wland 0239 (5eb59683, CI 42603119802), /var/local/fw/modem (321 files,
+    research/sweet-wifi-fw-0131 modem partition dump), /var/local/fw/rmtfs/*.img (0600 copies), job
+    org.ios-sweet.wland (wland auto). Off switch: touch /var/local/wland.off.
+  * Audio: /var/local/bin/wland-0225 = wland 0238 (9908af6f, CI 42556308218, speaker service), /var/local/fw/adsp
+    (31 files), /Library/Audio/Plug-Ins/HAL/SweetAudio.driver (userspace/out-audio-0160), job org.ios-sweet.speaker
+    (sleep 60; WLAND_PCM_DELAY_MS=15000 WLAND_SPEAKER_SERVICE=1 wland-0225 adsp 0 > /var/local/adsp-speaker.log).
+  * /System/Library/xpc/launchd.plist 692 -> 694 jobs (all old jobs identical), root:admin; backups
+    launchd.plist.pre-wland (46753e6e..., Bergamota's) and launchd.plist.pre-speaker. Host copies research/ios26/userland.
+  * Bluetooth userland was already there (Bergamota: bluetoothd BT_HCI_TRANSPORT=H4BC:POSIX:com.apple.uart.bluetooth,
+    BlueTool stub, BlueTool.orig): needs only kernel sweetbt=1 + the ADT node.
+- Kernel (2001, 2nd revision): sweet_reboot.c now also runs on sweet (IMEM 0x146aa000 restart_reason + PM6150 PON
+  spare 0x88f, PSCI SYSTEM_RESET; no PS_HOLD) -> `sweetreboot fastboot` over SSH should land in fastboot (untested);
+  en0 IOKit face via Bergamota's sweet_net_publish_wlan; sweet_audiohal also restarts audiomxd (iOS 26 HAL host).
+
+## 2026-11-14 08:10 IST: 2001 = our iOS 16 drivers (GPU etc.) merged onto Bergamota; CI 43547351307 building
+- 26c8 (CI 43486839176 = Bergamota + 2000 cpufreq, cmdline 26r8 + sweetbuild=2618, shim-boot-26c8.img ede7450b...):
+  1st boot 19:58:53 UTC: SSH OK (launchd up 5 min). Then `dd if=/dev/rufsroot0 ... count=1026` over SSH (persistent
+  log ring, raw device while HFS mounted) returned 0 bytes and the phone stopped answering (ping/ARP dead, USB log
+  stopped). GUESS: raw UFS read beside the mounted root hung UFS I/O. Do not read rufsroot0 on a live system.
+- 26c8 2nd boot 02:13:53 UTC (USER "boot the same build again"): USB ping after ~40 s (earlier than 26r8), SSH
+  ~8 min after boot. The live USB log starts at the root mount, so the SWEET CPUFREQ lines (printed before) are not
+  in it; no dmesg/sysctl binaries on the root. Benchmark research/ios26/boot/bench.sh (toybox sha256 of 64 MiB
+  zeros): single 1.89-2.19 s, 8 parallel 2.52 s -> results in boot/bench.txt.
+- 26r8 (no 2000) rebooted 02:39:48 UTC for the baseline, bench ~8 min after boot: single 2.51-2.69 s, 8 parallel
+  4.87 s (a run 1.5 min after boot, still busy booting, was 3.3-10.9 / 7.3 s: discard). => 2000 WORKS: single
+  ~1.3x, all-core ~1.9x faster (the A55s gained most). The phone has no awk (toybox lacks it).
+- 2001 (xnu/patches-12377/2001-sweet-ios16-drivers.patch, commit b852935): git merge of research/ios26/combo `port`
+  (x12377 + our 144 cherry-picks) into `berg-cpufreq`, branch `gpu26` 4e05569. 71 conflict hunks in 18 files;
+  decisions in the patch header (Bergamota kept for USB, IOSurface, framebuffer, touch mapping, keystore, spmi;
+  ours for RPMh; one IOAcceleratorES, not published with sweetmtl; our Wi-Fi IOKit files not built). Applies on
+  tree-berg after 2000 (`git apply --check` OK). Never compiled locally (no macOS): expect CI compile errors.
+- Note: research/ios26/combo needed `git config user.name t / user.email t@t` (cherry-picks failed silently before).
+- NEXT: fix CI errors until green; boot 1 without sweetgpu (regression check vs 26c8), boot 2 with sweetgpu=9
+  (GMU/HFI/SQE/CP bring-up, kernel only). Metal userland (native backend, rebuilt for iOS 26) comes after.
+
+## 2026-11-14 00:20 IST: MILESTONE: iOS 26.6.2 BOOTS TO THE HOME SCREEN ON SWEET (26r8)
+- Image research/ios26/boot/shim-boot-26r8.img b118d8d2... booted 18:41:16 UTC: CI 43444092685 kernel (Bergamota
+  patches-12377 @37a7a7a, unchanged), ADT boot/sweet-n104-2x.adt (sweet board, N104AP/iPhone12,1, 414x896 @2x),
+  root = Renegade ios26-root-full.simg in userdata, cmdline "debug=0xc serial=3 keepsyms=1 -noprogress rd=ufsroot0
+  ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin launchd_unsecure_cache=1
+  wdt=-1 sweetusb=2 sweetarm64e=1 launchd_disable_all_timeouts=1 -v sweetearlyfb=1 cpus=8 sweetbuild=2608".
+- USER: Apple logo (backboardd boot UI), then "it booted to homescreen. everything is extremely slow ofcrs."
+- No log/SSH: at cpus=8 the USB device never answers SET_ADDRESS on sweet (seen 26e/26r8).
+- Known causes of slowness (not measured on 26 yet): CPU clocks left at the ABL default (Bergamota cpufreq runs
+  only for beryllium; our 0126/0247 not in this kernel), CPU rendering (no Adreno/Metal: our 0081-0247 + userspace not
+  ported), no AMP. cpus=1 stalls before PID 1 on 12377 (all four cpus=1 boots).
+- NEXT (proposed): (1) USB/SSH at cpus=8, (2) CPU frequency (port 0126/0247 or enable sweet in their cpufreq),
+  (3) our display/flip patches, (4) GPU (Adreno 618 kernel + Metal backend rebuilt for iOS 26).
+
+## 2026-11-14 00:05 IST: userdata FLASHED with iOS 26.6.2 (USER "flash it"); 26r1 stuck in launchd lookup; 26r8 next
+- Pre-checks: 1 device, product sweetin, partition-size:userdata 0x1AC4BFB000, type f2fs (label), max-download 768 MiB.
+  `fastboot flash userdata ios26-root-full.simg` 18:15:54-18:25:41 UTC, 23/23 sparse pieces, 46 OKAY, no error
+  (research/ios26/boot/flash-userdata-ios26.log). iOS 16 install is GONE (USER chose no backup).
+- Afterwards `fastboot getvar product` hung (>5 min); USER rebooted to fastboot.
+- 26r1 (cpus=1) booted 18:30:05 UTC, logs/boot-26r1.txt: UFS read-write, "hfs: mounted iOSRoot" (clean, no journal
+  messages), unsealed root, swap on, then load_init_program launchd.development and NOTHING more for > 6 min; no UFS
+  errors. Pattern over all boots: every cpus=1 boot stalls before/at PID 1 (26b mockfs, 26d/26f iOS16 UFS, 26r1);
+  the only cpus=8 boot with a visible result (26g, HFS RAM disk) ran PID 1. GUESS: 12377 single-CPU path broken
+  (Bergamota always boots cpus=8). Trying 26r8 (cpus=8; USB/SSH do not come up at cpus=8 on sweet -> screen only).
+
+## 2026-11-13 23:46 IST: iOS 26.6.2 ROOT IMAGE BUILT (Renegade on Linux); awaiting USER OK to flash userdata
+- build-root.sh (USER sudo): first run failed in copy (Fedora apfs-fuse 2020 = no LZBITMAP -> EIO on every file);
+  fixed by PATH -> research/apfs-fuse-current/build (upstream 66b86bd). Second run: copy 337 s, macho 99 s, cache 59 s,
+  tweaks 2 s, seal 18 s, verify FAILED only on /bin/sh (no prebuilt tools on Linux).
+- USER chose option B: finish-root.sh = berga_tools.py --tag berga-tools-v3 (Bergamota release, zip SHA-256 + manifest
+  verified, 34 files, cache research/ios26/berga-tools-cache) + stages tweaks,seal,verify,simg. 1st try: ssh skipped
+  (no ~/.ssh pubkey) -> installed research/ssh/id_ed25519.pub as ~/.ssh/id_ed25519.pub (matches the private key; log in
+  with -i research/ssh/id_ed25519). 2nd try: ssh (dropbear key-only, dash=/bin/sh, toybox), usbnet 192.168.7.2,
+  sweetnetcfg, sweetreboot, bluetooth stub, PosterBoard sweetfp.dylib, first-boot job (49 apps, wallpaper), bglrender
+  payload (inert); verify 0 FAIL; simg research/ios26/bergamota/research/ios26/ios26-root-full.simg 18,339,556,552 B
+  (24 GiB volume, 32214 chunks). Logs research/ios26/build-root.log, finish-root.log.
+- Boot images ready (our shim): research/ios26/boot/shim-boot-26r1.img 1390cfc8... (cpus=1, USB log) and
+  shim-boot-26r8.img b118d8d2... (cpus=8); both rd=ufsroot0 ufsrw=1 rootrw=1 -> ONLY after the flash.
+- NEXT (destructive, USER OK first): fastboot flash userdata ios26-root-full.simg (erases iOS 16), then boot 26r1.
+
+## 2026-11-13 22:55 IST: iOS 26 root prep; USER chose NO backup of the iOS 16 userdata ("c")
+- USER decision (22:30 IST): skip the iOS 16 backup; flashing iOS 26 into userdata will destroy the iOS 16 install.
+  Still confirm right before the flash (AGENTS.md).
+- Auto-mode classifier blocks Claude from running Bergamota code (their .sh/.py) and the downloaded ipsw binary
+  ("Code from External"). So the USER runs: research/ios26/prep-ipsw.sh (no sudo: ipsw 3.1.738 [blacktop release
+  tarball, checksums.txt OK] extracts DeviceTree.n104ap.im4p -> bergamota/research/ios26/n104ap.adt, decrypts both
+  .aea; then Bergamota mkadt --highmem --display-scale 2 --points 414x896 --identity n104ap -> boot/sweet-n104-2x.adt
+  and mkpayload (adds /chosen/manifest-properties) -> boot/payload-26r1.bin (cpus=1, USB log works) and
+  payload-26r8.bin (cpus=8, USB fails on sweet)), then `sudo research/ios26/build-root.sh` (Renegade mkroot-full.py
+  --size 24g --no-jb; output bergamota/research/ios26/ios26-root-full.simg). Both scripts are in research/ (ignored).
+- Boot line r1/r8: Bergamota mkboot-full.sh CMDLINE minus sweetfb_*/sweetbattery (Poco F1 display/battery) plus
+  -v sweetearlyfb=1: "debug=0xc serial=3 keepsyms=1 -noprogress rd=ufsroot0 ufsrw=1 rootrw=1
+  unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin launchd_unsecure_cache=1 wdt=-1 sweetusb=2
+  sweetarm64e=1 launchd_disable_all_timeouts=1 -v sweetearlyfb=1 cpus=N sweetbuild=260N".
+- Bergamota checkout: research/ios26/bergamota (sparse: xnu/patches-12377, tools/, docs/, workflow) at 37a7a7a.
+
+## 2026-11-13 22:25 IST: MILESTONE: iOS 26 KERNEL (xnu-12377) RUNS PID 1 ON SWEET (26g)
+- 26g (16:51:09 UTC): CI 43444092685 kernel + sweet-26.adt + RAM disk research/ios26/boot/test-hfs.img (16 MiB HFSX
+  "SweetTest", only /sbin/launchd = static sweet-init; built by USER with sudo mk-test-hfs.sh, SHA256 97614526...),
+  cmdline "debug=0xc serial=3 keepsyms=1 -enable_kprintf_spam -noprogress rd=md0 cpus=8 unentitled_ios_sim_launch=1
+  ignition_level=1 wdt_test=no_user_checkin wdt=-1 sweetarm64e=1 sweetearlyfb=1 -v", image 79e254f7...
+  USER: "init running as PID 1". Nothing written to the phone.
+- Why 26b/26d-f did not get there: 26b = mockfs RAM-disk path (no HFS; not used by Bergamota on 12377, cause not
+  investigated); 26d-f = iOS 16 userdata mounted read-only with an UNREPLAYED journal (replay_journal 10491904..
+  13174784, write refused) -> namei of launchd.development stalls (5-10 s in 26d, >170 s in 26f).
+- Also: 26e cpus=8 -> "SWEET CPU: 8/8" (USER), but USB device mode never answers SET_ADDRESS (host error -71, also
+  after replug); with 1 CPU (26d/26f) USB ECM works. Open issue, not needed for the next step.
+- Download (in progress): iOS 26.6.2 23G90 iPhone12,1 dmgs (Bergamota's ios26 target) via tools/remotezip.py into
+  research/ios26/ipsw/23G90__iPhone12,1/ (retry loop; Apple CDN resets: curl 56).
+- NEXT: Renegade root on Linux (needs: ipsw for AEA decryption, ldid pinned by jailbreak.py, sudo), backup of
+  userdata (iOS 16, journal dirty) BEFORE any flash, USER OK, flash, boot rd=ufsroot0 ufsrw=1 rootrw=1 + Bergamota args.
+
+## 2026-11-13 21:58 IST: iOS 26 KERNEL RUNS ON SWEET (26b-26d); PID 1 silent; 26e (cpus=8 + sampler) queued
+- 26a (no extra args): screen stopped after shim JUMP = Bergamota 0195: early console is log-only unless sweetearlyfb=1.
+- 26b (+sweetearlyfb=1 -v): USER: green early console, "BERGAMOTA verbose boot" header (1907s), then only repeating
+  "SWEET FB: stats ... swaps=0 copy_frames=0" lines, no "init running as PID 1"/"still alive" (RAM-disk test init).
+- 26c (+sweetusb=2): no USB: sweet_usb_probe() is only called from sweet_ufs_init(), which only runs for rd=ufsroot0.
+- 26d (rd=ufsroot0, NO ufsrw => read-only: every write goes through ufs_write_blocks_ex, refused when !writable;
+  syncer/sweetlog flush/selftest also off), booted 16:23:23 UTC, USB ECM live log logs/boot-26d.txt (git-ignored):
+  zone_init OK, "SWEET CPU: 1/1 CPUs initialized" (their SMP is opt-in: cpus=N, 0078), SWEET HFS registered,
+  UFS userdata read-only found, "BSD root: ufsroot0", HFS journal replay write REFUSED (errno 30, as intended),
+  "hfs: mounted iOSRoot", unsealed root, load_init_program /usr/appleinternal/sbin/launchd.development then
+  /sbin/launchd (the iOS 16 one), touch "selected GT9896 Yellowstone", USB ue0 up. Then NO userspace output
+  (only USB event/FB stats); no panic. Same symptom as the RAM-disk init.
+- GUESS: single-CPU 12377 path untested by Bergamota (they always use cpus=8). 26e = 26d + cpus=8
+  sweetsample=launchd (user pc/lr/bt of launchd, first sample 90 s after start). Image 6d2fb795...
+- package.sh: ROOTARG env (default rd=md0). sweet-usb-log.py receiver -> logs/boot-26X.txt.
+
+## 2026-11-13 20:57 IST: FIRST iOS 26 KERNEL BOOT ATTEMPT (26a) sent; awaiting USER photo
+- CI 43441594199 (macos-26) CANCELLED: no arm64 runner capacity. 7efa2c8: runner input, default macos-15-intel.
+  CI 43444092685 (7efa2c8) SUCCESS; kernel "Darwin Kernel Version 25.5.0 ... xnu-12377.121.6", SHA256SUMS OK,
+  research/ios26/boot/kernel-43444092685/. mkpayload: fixups 0, entry 0xfffffe00075c6488, kernel_end 0xfffffe00089bc000.
+- Image research/ios26/boot/shim-boot-26a.img 21,696,512 B SHA256 33f52d1e...e6f39a (package.sh 43444092685 a):
+  sweet-26.adt + RAM disk sweet-init, cmdline "debug=0xc serial=3 keepsyms=1 -enable_kprintf_spam -noprogress rd=md0"
+  (all CPUs); ramdisk == payload. fastboot product sweetin (as all recent boots), `fastboot boot` 15:27:16 UTC:
+  send OKAY 0.624s, boot OKAY 0.130s. Nothing flashed. Expect "*** SWEET userspace: init running as PID 1 ***".
+  If it hangs early: variant 26b = same + cpus=1.
+
+## 2026-11-13 20:10 IST: iOS 26 track started (USER "lets start with ios 26"; then "boot it before applying all the fix patches")
+- KEY FINDING: ry-diffusion/Bergamota (a GitHub fork of this repo, Poco F1/SD845, no PAC) boots iOS 26.6.2 (23G90,
+  iPhone12,1) to SpringBoard with touch + Wi-Fi on xnu-12377.121.6 (develop 37a7a7a, docs IOS26_PORT.md,
+  XNU12377_MIGRATION.md). Their xnu/patches-12377 = our 0001-0080 ported to 12377 + their fixes; Poco F1 drivers run only
+  when the ADT compatible says "xiaomi,beryllium" (sweet_board.h), else the inherited sweet paths. Root: Renegade
+  (tools/renegade: PAC rewrite of all Mach-Os + dyld cache, ad hoc re-sign; documented for Linux too, as root).
+- STEP 1 (running): .github/workflows/xnu26.yml (317d3e8, dispatch only) builds their series UNCHANGED at the pinned SHA
+  (fetched in CI, not vendored), macos-26 / Xcode 26.1 / KDK 26.5. CI 43441594199 (queued 14:19Z). Artifact xnu26-kernel.
+- Tools (commit after 317d3e8): mkadt.py random-seed 256 B + /chosen kernel-ctrr-to-be-enabled=1 (needed by 12377, ignored
+  by 8796); mkinit.py --raw (test init via aarch64-linux-gnu-gcc + objcopy; no clang on this host).
+  Built research/ios26/boot/sweet-init (16635 B, no relocs) and sweet-26.adt (mkadt --highmem, 12956 B).
+- FIRST PHONE TEST PLAN (non-destructive, nothing written): mkpayload kernel + sweet-26.adt + --ramdisk sweet-init,
+  cmdline "debug=0xc serial=3 keepsyms=1 -enable_kprintf_spam -noprogress rd=md0" (variant B adds cpus=1), shim/build.sh,
+  fastboot boot. Expect "*** SWEET userspace: init running as PID 1 ***". Then: Renegade root on Linux -> flash userdata
+  (DESTROYS the iOS 16 install: back up first, needs USER OK).
+- Our 0081-0247 on 12377 (later step): local scratch repo research/ios26/combo, branch `port` = x12377 (12377 + dxb 26.0 +
+  Bergamota 0001-0080) + 144 of our 146 patches cherry-picked; only conflicts were the scheduler (12377 rewrote
+  choose_processor/Edge): deferred 0167, 0248 (AMP -> CONFIG_SCHED_EDGE on 12377), dropped sched hunks of 0177-0179
+  (driver halves kept; need stubs sweet_sched_take_stats / sweet_sched_tap_mark / sweet_sched_tap_event). List in
+  research/ios26/deferred.txt. Not compiled. Bergamota generic fixes (1000-1019 etc.) still to merge into it.
+- Host: Bergamota stage .sh scripts were NOT run locally (auto-mode classifier blocked external code); CI runs them.
+- Stray repo-root file `--help` = an ADT written by `tools/mkadt.py --help` (mkadt treats argv[1] as the output); junk.
+
+## 2026-11-13 19:30 IST: USER "lets continue booting ios 27" -> feasibility check, no build
+- Host: user freed 68 GiB; added as btrfs device nvme0n1p9 to the Fedora root (/ and /home now 129 GiB, 75 GiB free).
+- OBSERVED: newest public XNU tag = xnu-12377.121.6 (macOS 26.5, `gh api repos/apple-oss-distributions/xnu/tags`);
+  no xnu-13xxx (iOS 27 / macOS 27) source yet. iOS 27 (27.2 current) oldest iPhone = iPhone 11 (A13), arm64e only.
+- Precedents: Bergamota (SD845, ARMv8.2, no PAC) boots iOS 18.7.8 to SpringBoard on xnu-11215 + "Renegade"
+  (rewrites PAC instrs 4:4 in every Mach-O + the dyld shared cache, re-signs ad hoc; kernel emulates FJCVTZS).
+  Scion-Project PR 246: xnu-12377 (iOS 26) VMAPPLE kernel linked, not booted.
+- => iOS 27 blocked on kernel source. Options given to USER: iOS 18 (proven path), iOS 26 (xnu-12377 exists, unproven),
+  or wait for xnu-13xxx. All need a rebase of our ~250 patches off xnu-8796 and a new GPU/Metal userland. Awaiting choice.
+
+## 2026-11-11 22:40 IST: 2482 + live AMP thresholds -32: USER "slightly better"
+- Interaction windows after the change: 441-467 presents/10 s (~45 fps), 0-1 missed, present avg 10.6-11.6 ms
+  (gate 7.8-8.8 ms, copy 2.4-2.6 ms), present max 33-43 ms (= the visible stutters). Compare 2471 avg ~30 fps/window.
+- Peak in the whole log: 1199 presents/10 s with gate 10 us (no GPU wait) => the present/copy path can do 120 Hz;
+  the limit is the producer (backboardd render + GPU fence wait ~8 ms/frame). Not yet baked into the kernel defaults.
+
+## 2026-11-11 22:32 IST: 2482 USER "opening app is still the same, stutters noticeably worse"; live AMP threshold A/B
+- FB timing (log windows with presents): 2471 = 299 presents + 49 missed deadlines per 10 s window, 2482 = 209 + 134.
+  gate/copy averages similar (gate ~7-8 ms, copy ~2.7 ms) => fewer frames delivered, not slower presents.
+- sweet-sysctl on the phone: hw.nperflevels 2, perflevel0 2 cpus (P), perflevel1 6 (E) => topology is as intended.
+- xnu-8796 sched_amp_common.c (read from apple-oss-distributions): spill when the smoothed P load average >=
+  (2 << PSET_LOAD_FRACTIONAL_SHIFT) + spill_count (3) and no idle P core; idle E steals when the load avg >= 2 + 1/16 AND
+  P runq > dispatching AND no idle P. GUESS: the lagging load average keeps UI bursts queued on the 2 A76s.
+- 22:31 set live (no reboot, lost on reboot): kern.sched_amp_spill_count/idle_steal/spill_steal = -32 (were 3/1/1)
+  => the gate is effectively runq-only. Revert: =3 / =1 / =1. Log offset 1003754. Waiting on USER feel.
+  If still worse than 2471: drop AMP (back to 0247 kernel/SMP ADT, 2471).
+
+## 2026-11-11 22:22 IST: 2482 BOOTED (0248 AMP topology, CI 43057766356 on adfa220); awaiting USER feel
+- CI 43057766356 headSha adfa220 verified; kernel 0a9022e7 (SHA256SUMS OK) has sched_amp.c / sched_amp_cpu_init_completed
+  strings (85 sched_amp hits; 2481's had none). USB build-2482/shim-boot-2482.img d0c1962e via scripts/package-amp.py
+  2482 43057766356 adfa220 "sweetpanelvci=0 sweetmotion=0xbf sweetfbflip=1 sweetfbgpu=1"; cmdline = 2481's with
+  sweetbuild=2482. fastboot boot OKAY 22:18:56, log boot-0225-3.txt from line 993153 (receiver PID 44887 still running).
+- Observed: no ml_parse_cpu_topology assert; launchd boot-args show sweetbuild=2482, L3 domain 2 lut 10 = 1459.2 MHz,
+  backboardd opened SweetHIDTouch, "selected GT9896 Yellowstone", FB presents running (e.g. 60 presents/10 s, copy avg
+  2.2 ms). Crash set similar to 2471 (driverkitd 1, bluetoothd 3, AegirPoster 9 vs 4 in 2471, spotlight exts).
+- "SWEET SCHED: ui_run_us a55=0 a76=0" in every window. GUESS: those counters live in the 0167/0178 code that 0248
+  compiles out under AMP, so they no longer measure anything; not evidence about P-cluster use. No sysctl binary on
+  the phone (hw.nperflevels not checked). Next: USER feel vs 2471; if needed add an AMP-aware counter. Fallback 2471.
+
+## 2026-11-11 21:55 IST: 2481 EARLY PANIC = stale CI kernel (0247 source) + AMP ADT; rebuilding 0248
+- USER: 2481 stuck on the red shim screen; panic "machine_routines.c:1055 assertion failed: phys_cluster_id <=
+  MAX_CPU_CLUSTER_PHY_ID". No USB console output (receiver log last line 21:18, i.e. the 2471 session).
+- CAUSE (verified): CI 43051261867 (workflow_dispatch 15:43:53Z) built headSha eaa347b = 0247 source; the push run
+  on 6b2db02 (43051260326) was cancelled by the concurrency group 1 s earlier. 2481 kernel has no sched_amp
+  (strings: dualq/clutch/multiq only); ml_parse_cpu_topology disassembly (archive machine_routines.o) branches
+  straight to the assert when cluster-type == P and keeps a 1-entry cluster_phys_to_logical => MAX_CPU_CLUSTERS 1.
+  The AMP ADT (cpu6-7 'P') then gives phys_cluster_id 1 > 0. => 2481 says nothing about 0248 itself.
+- LESSON: after pushing, wait for the push to land and check `gh run list ... --json headSha` before dispatching.
+- Rebuild: CI 43057766356 on adfa220 (contains 0248), macos-15-intel. Next: verify headSha + sched_amp strings in
+  the artifact, repackage as 2482 (package-amp.py), boot. Fallback stays 2471.
+
+## 2026-11-11 21:15 IST: 2471 USER "slightly better, still not satisfactory"; xnu 0248 AMP topology building
+- **xnu 0248** (xnu/patches/0248-sweet-amp-two-clusters.patch on 0247): SWEET.h __ARM_AMP__ 1, board_config
+  MAX_CPU_CLUSTERS 2 -> __AMP__ -> sched_amp (no CONFIG_SCHED_EDGE on iOS; proc_reg.h drops CONFIG_SCHED_CLUTCH
+  under AMP). ml_parse_cpu_topology: cluster-type read as a number vs 'E'/'P'; no HAS_CLUSTER -> cluster = type.
+  recommended_pset_type (thread groups on, no CLPC -> CLUSTER_TYPE_SMP): user threads > BASEPRI_UTILITY -> P,
+  kernel_task and <= utility -> E; spill to E when the P load average passes 2 + sched_amp_spill_count.
+  0167 sweet_choose_big + 0178 sweet_big_balance call sites compiled out under AMP (would cross psets).
+  Other __AMP__ code is generic (compressor threads bound to E, fast jetsam, recount per perf level, sysctls).
+- tools/adt-set-amp.py (in git): /cpus cpu0-5 cluster-type 0x45 'E' id 0, cpu6-7 0x50 'P' id 1, 10 bytes in place,
+  --smp round-trips byte-identical. USB scripts/package-amp.py = package-any.py + this ADT patch (payload ADT
+  asserted == patched). CI 43051261867 (macos-15-intel). Plan: image 2481 = 0248 + "sweetfbflip=1 sweetfbgpu=1".
+  Expect: boot log "pset_create(cluster_id=1)" style lines (kprintf only), SWEET TAP a76 share up.
+  Fallback: 2471 (no AMP).
+
+## 2026-11-11 21:05 IST: 2471 BOOTED (0247 L3 at 1459.2 MHz + flip + GPU copy by default); awaiting USER feel
+- xnu 0247 (xnu/patches/0247-sweet-l3-cache-clock.patch): L3 OSM domain 2 at 0x18321000 through the CPU-domain code
+  (top row, dark row <= 652.8 MHz), sweetl3=0 = ABL row. CI 43040552977 green; first artifact download timed out
+  (gh, slow link), retry OK. Image USB build-2471/shim-boot-2471.img d3361a14 (kernel 02a6bdb5), cmdline 0242's +
+  sweetfbflip=1 sweetfbgpu=1. fastboot boot OKAY, log from line 967725.
+- Log: "domain 2 selected lut 10 = 1459200 kHz; readback perf_state=10", "domain 2 dark row 2 = 652800 kHz", flip on
+  (GPU layout), touch selected, GPU copies 385/10 s avg 2.2 ms, 0 fallbacks.
+- RAM (USER asked "full 6 GB?"): no - XNU uses the high bank only (dram-base 0x1_00000000 size 0xfcc00000 = 3.95
+  GiB); the low 2 GiB bank holds firmware carve-outs + our driver buffers (wland 0xE0000000+, IPA 0xE4000000);
+  ~1-1.3 GiB of it is unused. UniXNU-sheng adopts its free parts (GPU pool). Not a perf lever for the app-open delay.
+- LLCC CPU-slice activation NOT done (needs the sdmmagpie slice table + activation sequence; risky).
+
+## 2026-11-11 20:40 IST: backend profile symbolized; strict-publish A/B -> glitches, no gain -> restored
+- Installed bundle = native-metal CI 42213344710 (source e0574fac, branch codex/media-0213; backend cd052dd6);
+  artifact with symbols on USB: ios-sweet-backup/native-metal-artifact-e0574fa. Kernel symbols: 2461 kernel
+  LC_SYMTAB, __kernel__+off = __TEXT_EXEC vmaddr 0xfffffe0007308000 + off. Scratch tools (session scratchpad):
+  subprof.py (inclusive/self below an anchor frame), callers.py (call chains to a frame).
+- Render thread (2977 samples incl. blocked): idle vsync wait ipc_mqueue_receive_continue 30 %; SweetMetal2
+  commit 42 % incl, runDraw 33 %, rwa_render_draw 31 %, fd_draw_vbo 26 %, flush_deferred_submits 22 %,
+  drmCommandWriteRead 632 samples (21 %): of which transport wait() 257 (kernel delay_for_interval/thread_block),
+  submitResources 160 (kernel self 112), IOSurface allocate 63, mapBo 28, vm_deallocate 25, job release/retire 67.
+  wait() chain: fd_gmem_render_tiles -> fd_submit_sp_flush -> flush_deferred_submits -> flush_submit_list ->
+  drmCommandWriteRead -> dispatch -> wait (strict publish: sweet_drm.cpp:546 waits fences.back(), or EBUSY 575).
+- A/B: /var/local/sweet-native-strict-publish -> .off + backboardd restart: USER "performance feels the same, but
+  there are many bugs and glitches. apps disappearing while opening" -> RESTORED (file back, backboardd 943, log
+  "strict IOSurface publication"). => the strict wait is load-bearing for correctness and not the perf limit.
+- backboardd restart also re-links the brightness slider (expected; not yet confirmed by USER).
+
+## 2026-11-11 20:10 IST: SpringBoard spindump on 2461 (60 s, USER opened/closed apps): our driver = half the render thread
+- spindump SpringBoard 60 10 -noProcessingWhileSampling -noText -o /var/tmp/sb2461.spindump; heavy text
+  /var/tmp/sb2461-heavy.txt (phone); host copy in the session scratchpad (spin2461/heavy.txt, not in git).
+- CPU in 60 s: backboardd 46.5 s, SpringBoard 36.4 s, kernel_task 21.6 s, spindump 16.6 s, wland-0225 7.0 s.
+- SpringBoard: main thread 17.6 s; XBApplicationSnapshot image generation 3.2 + 0.7 s; UIKit animation manager
+  ~3.8 s. Main-thread leaves diffuse as on 11-02: libobjc 26 %, QuartzCore 14 %, CF 11 %, UIKit 11 %, malloc 6 %.
+- backboardd render thread (com.apple.coreanimation.display.primary) 34.7 s = 58 % of an A76 for the whole minute.
+  Leaves: libSweetNativeBackend.dylib 31 % (unsymbolized ???), QuartzCore 27 % (CA's own updater/render), platform
+  memmove/memset 12 %, malloc 9 %, kernel (mach_vm_deallocate, mutex wait/drop) 8 %, SweetMetal2 4.5 %, plus
+  __vfprintf in the hot path. => ~half of the render thread (~17 s/min of A76 time) is our Metal backend + its
+  copies/allocations/locks: the largest controllable CPU cost, and it competes with SpringBoard for the 2 A76s.
+- Memory system (read-only via sweet-pmemrw): L3 OSM domain 0x18321000 (stock DT cpucc reg-names osm_l3_base):
+  PERF_STATE 7 = 1190.4 MHz of max row 10 = 1459.2 MHz (LUT 300/556.8/652.8/768/844.8/940.8/1132.8/1190.4/1305.6/
+  1382.4/1459.2). Nothing in XNU sets it (Android: memlat governors cpu0/cpu6-cpu-l3-lat). LLCC 0x9200000
+  (qcom,sdmmagpie-llcc): slice ATTR0/ATTR1 for slices 0-2 at +0x21000.. all 0, TRP_STATUS slice 1 = 0x2 -> CPU slice
+  apparently never configured/activated (Android's llcc driver does it). Both modest gains, not the main cause.
+- Next candidates: (1) symbolize libSweetNativeBackend hot paths (tools/sweet-spindump-profile.py + native-metal
+  symbols) and cut copies/allocs/logging per draw; (2) kernel: L3 to row 10 + LLCC CPUSS slice activation;
+  (3) AMP topology so SpringBoard's main thread gets A76 time.
+
+## 2026-11-11 19:45 IST: GPU PRESENT COPY WORKS (2461 = 0246 + sweetfbflip=1 sweetfbgpu=1); app-open delay unchanged
+- 0246 first CI 43028275216 failed (redefinition of 'stride' in flipSetup); fixed (rename to pitch), CI 43031175549
+  green (kernel 847e944f). Images: build-0246/shim-boot-0246.img 3be8e9f7 (flip/GPU off = 0245 behaviour), build-2461/
+  shim-boot-2461.img b4c8222c (+ sweetfbflip=1 sweetfbgpu=1). 2461 booted (log from line 936810), touch OK.
+- Log: "SWEET FLIP: on (GPU layout): buffers 0x9c000000 0x9ca00000 (0xa00000 bytes), pitch 4352"; per 10 s
+  copies = presents (356/399/448), fallbacks 0, broken 0, flip timeouts 0, underruns 0. GPU copy avg 2.3-2.9 ms (max
+  12-20 ms) vs CPU copy 5.6-8.6 ms; present_avg 9.8-11.2 ms (was 15-17.7), acquire 0, gate (CA fence) 7.3-7.6 ms.
+- USER: "picture looks fine, still delay when opening apps. the performance is basically same."
+- SWEET TAP (43 busy windows of 72): SpringBoard on-core a55 median 159 ms + a76 234 ms = ~393 ms CPU per 600 ms
+  after a tap (0179: ~420 ms); first swap after the tap median 19 ms. => the delay is SpringBoard CPU work, not
+  present/GPU. The present thread runs on cpu4 (A55), so the freed copy time does not give the A76s anything.
+- Next (not started): fresh SpringBoard spindump during app opens on 2461 (last one 11-02, 0179) to see what the
+  0.4 s is; candidates: snapshot generation / image decode in SpringBoard, CA commit cost, AMP topology for UI threads.
+
+## 2026-11-11 19:00 IST: xnu 0246 GPU present copy building; UniXNU-sheng reviewed; slider cause found
+- USER: "move frame copying to GPU" + "check how UniXNU-sheng made the animation so smooth".
+- UniXNU-sheng (github UniXNU/UniXNU-sheng, porting.toml): A740 (SM8550, several x our A618) still ~70 fps avg.
+  Its display: "dpu-scanout=2" DIRECT SCANOUT (display pipes fetch the compositor surface through a stage-1 window
+  of the display SMMU bank, no copy; the flip waits for the frame's GPU fence = removed their flicker). GPU: Turnip +
+  metal2vulkan (AdrenoMetal), fence waiters woken by the GPU interrupt, submissions no longer clean 8.5 MB of context
+  buffers each time, GPU DCVS with wake boost, GPU memory pool. Brightness: CoreBrightness needs
+  backlight-marketing-table + backlight-calibration-parameters; vmm-present selects VMBLControl, which drops every
+  brightness request. => our long-term present = direct scanout + VIG0 QSEED scaler (1125x2436 -> 1080x2400).
+- Brightness slider (0244/0245): NOT the ALS work. First 0245 boot: slider writes 4142..32413 arrived. After a
+  SpringBoard restart (TERM; 0244 and this boot) the slider writes nothing -> restart backboardd to recover (pending
+  USER ok).
+- **xnu 0246** (xnu/patches/0246-sweet-fb-gpu-present-copy.patch on 0245, apply --check OK, not compiled locally):
+  sweetfbgpu=1 -> both flip buffers with 4352 pitch (RB_2D_DST_PITCH is in 64-byte units; ABL's 4320 is not),
+  buffer 0 0x9c000000, buffer 1 0x9ca00000 (0xa00000 each, region ends 0x9d700000); ABL frame converted into buffer 1,
+  VIG0 SRC0 + YSTRIDE0 switched in one flush. kern.sweet_fb_gpucopy 0 CPU / 1 GPU nearest / 2 bilinear. Kernel GPU
+  window 0xb0000000..0xc0000000: scanout 0xb0000000 / 0xb1000000, scratch 0xb1f00000, 4 LRU source slots from
+  0xb2000000 (32 MiB). Stream: CCU flush/invalidate, RB_CCU_CNTL 0x08000000, 2D rects, BLIT_CNTL 0x10f03000,
+  SP_2D_DST_FORMAT 0xf180, src/dst info 0x30 linear WZYX, CP_BLIT SCALE, CCU colour flush; async submit + fence wait
+  (200 ms) without holding the gate. Panic/console text draws in ABL's 4320 layout into buffer 0: keep sweetfbgpu off
+  for panic hunting. CI 43028275216 (macos-15-intel).
+- Test image plan: 0246 + "sweetfbflip=1 sweetfbgpu=1"; fallback = same kernel without them (= 0245 behaviour).
+
+## 2026-11-11 18:50 IST: PAGE FLIP WORKS (0245 mode 1, guard 64): USER "there are no glitches"
+- 0245 re-booted from fastboot (log from line 922109), touch OK, SSH OK. kern.sweet_fb_flip=1 (guard 64, mask 0x20041):
+  448 flips/10 s, latch wait avg 1.3 ms max 8.2 ms, 0 timeouts, 0 underruns, all flushes in the active area (10 guard
+  waits). SpringBoard restarted on request (26 -> 409; phone ps has no awk/pgrep: use `set -- $(ps ax | grep ...)`).
+  USER: no glitches, performance the same (expected: the CPU copy still runs, now into the back buffer).
+- Why 0181 flashed and 0245 does not is NOT proven (0245 differs by the line guard; mode 3 without guard was also
+  clean). Keep the guard on.
+- Next: GPU 2D blit into the back buffer (removes the 6-8 ms CPU copy per frame); make sweetfbflip=1 the image default
+  once a longer session is clean. Brightness slider broken (USER suspects the sensor/ALS work) - investigating.
+
+## 2026-11-11 18:30 IST: 0245 booted; mode 3 no flashes with guard on AND off; USB link lost (enumeration -71)
+- CI 43020344687 (macos-15-intel, main c0b1e3a-ish: patch 0245) green. Image build-0245/shim-boot-0245.img 60950040
+  (kernel 81d5a7e9), cmdline = 0244's with sweetbuild=245. fastboot boot OKAY, log from line 908847, touch OK.
+- mode 3 guard=64: 287 flushes/10 s all landed in the active area (7 guard waits, 1.5 ms total); USER "no flashes while
+  closing apps". mode 3 guard=0: USER again "no flashes". => the 0244 "small flashes" are NOT explained by flush
+  timing (and flushes almost never land in blanking anyway). Unresolved: they may have been display off/on or
+  brightness steps (0244's mode 3 window had several display off/on + DCS 0 / 8 / 12 changes), not the flush.
+- mode 1 (real flip) NOT tested yet: the USB link dropped at 18:20:12 IST (host: descriptor read -71, "not accepting
+  address") ~2 min after the last sysctl write; USER: phone works fine, replugged; still not enumerating after 3+ min.
+  Same class as the 0203/0205 drops (line ~780: suspect the 0200 dark-mode USB poll). Phone state: 0245, mode 3,
+  guard 0, mask 0x20041 (live, not persistent).
+- USER asked why GPU progress is slow; answer given from measured data (per-draw CPU ~100 us, submit drains + ~22 MB
+  cache walks per command, polled fences with ~20 ms avg / ~110 ms max completion, ~300 Mpx/s fill at a verified
+  800 MHz = GPU starved, CPU present copy). Next GPU-perf work: per-frame GPU busy via counters first.
+
+## 2026-11-11 18:00 IST: 0244 BOOTED; flip modes tested live -> back buffer OK, the CTL0 flush itself causes flashes
+- CI 43013438379 (macos-15-intel, main 529f1b2) green; arm64 runs never got a runner. Image USB
+  build-0244/shim-boot-0244.img c3f77842 (kernel 396357f2), cmdline = 0242's + sweetbuild=244. fastboot boot ~12:05
+  UTC, log boot-0225-3.txt from line 799339. Touch OK (GT9896). NO reboot: the 2nd "Darwin Kernel Version" at
+  +19927 is the USB log backlog replay (launchd uptime matched the fastboot boot; USER: "phone didn't reboot").
+- New tool /var/local/bin/sweet-sysctl (userspace/tools/sweet-sysctl.c, tools CI 43017753192, sha256 6d8af7ec...):
+  the phone has no sysctl(8). `sweet-sysctl kern.sweet_fb_flip=N kern.sweet_fb_flip_mask=0x..`
+- MDP INTR_STATUS latches with INTR_EN=0 (first read 0x8000100, vsync bit 27 set every present) -> counters valid.
+- Results (USER at the phone):
+  - mode 2 (scan only back buffer 0x9c9f0000, ~5 s): nothing odd noticed; log 403 presents, 0 underruns -> MDSS reads
+    the back buffer fine.
+  - mode 3 mask 0x20041 (buffer 0, SRC0 rewrite + flush per present): "flashes here and there, but only small";
+    296 flushes/10 s, latch wait avg 365 us max 7.9 ms, 0 underruns.
+  - mode 3 mask 0x1 (VIG0 only): flush bit clears in ~1 us (not held to vsync?); flashes "still there while closing apps".
+  - mode 0: "no black flashes".
+  => 0181's flashes come from re-flushing ABL's pipeline, not from the back buffer; INTF underrun bits stay 0.
+- Brightness: backboardd sends only 0/1 (DCS level 8) this boot; ALS now streams real 8-9 lux (0242 had only the
+  fake initial 100 lux) -> auto-brightness pins minimum (guess). Workaround: `/var/local/bin/panel.sh bl 1024`
+  over SSH (USER: "brightness is fine"); backboardd resets it on its next change (lock/unlock).
+- USER perf: opening animation still delayed/jittery (expected, 0244 has no perf change); recents "slightly smoother".
+- Phone now: 0244 running, mode 0, mask 0x20041.
+- Next: (a) flush only inside vertical blanking (INTF line counter) and a pure flush without the SRC0 write;
+  (b) read-only DPU register dump under OrangeFox (Linux flips without flashing) to compare with ABL's state.
+
+## 2026-11-11 17:10 IST: xnu 0244 (live page-flip modes + MDP underrun counters) + 0243 IPA diag building
+- USER: stay on ios-sweet (no HakiOS/UEFI); start the GPU copy + page flip, and include the mobile-data diagnostic.
+  Phone in fastboot. Order: page flip first (a GPU blit into the scanned buffer cannot be beam-raced), GPU copy after.
+- 0243 CI 42647290166 (and redispatch 42650140017) FAILED "job was not acquired by Runner" (macOS arm64 capacity);
+  nothing compiled. 0243 has never been built.
+- **xnu 0244** (xnu/patches/0244-sweet-fb-flip-live-modes.patch, written against the 0242 CI buildtree
+  42629741309 + 0243, git apply --check OK; not compiled locally, no clang). Root sysctls, applied at the next present:
+  kern.sweet_fb_flip 0 = buffer 0 beam-raced (default) / 1 = 0181 double-buffer flip / 2 = scan + draw ONLY the
+  back buffer 0x9c9f0000 (black = MDSS cannot read it) / 3 = buffer 0 + SRC0 rewrite + CTL0 flush every present
+  (flashes = the flush itself blanks frames); kern.sweet_fb_flip_mask = CTL0 flush bits (default 0x20041).
+  Boot-arg sweetfbflip=N = start mode. 10 s line "SWEET FLIP: mode= flips= ... src0= mask= presents=
+  underrun_intf1= underrun_intf2= vsync_seen=" (MDP INTR_STATUS 0x1014 bits 26/27/28 read+cleared per present;
+  whether the status latches with INTR_EN=0 is UNVERIFIED: vsync_seen>0 would confirm). Panic text draws only into
+  buffer 0, so IPA/panic tests stay in mode 0.
+- CI: push run 43013293193 cancelled by the concurrency group when I dispatched 43013438379 on macos-15-intel.
+- /home is FULL (~40 MB free): buildtree extracted to the session scratchpad (tmpfs); images go to
+  /run/media/dan/MUSIC/ios-sweet-backup/build-NNNN (USER: use the USB drive for storage).
+- Plan: image 0244 (= 0242 extras sweetpanelvci=0 sweetmotion=0xbf) -> flip test over SSH: mode 2, mode 3, mode 1,
+  masks 0x1 / 0x20001; USER reports flashes per mode. IPA: 2441 = 0244 + sweetipa=1, 2442 = + sweetipadiag=2,
+  2443 = + sweetipadiag=1 (see the 11-10 03:15 entry).
+
+## 2026-11-10 03:15 IST: phone back on 0242; IPA death = ~30-40 s after "configured"; xnu 0243 diagnostic building
+- USER: "build the diagnostic kernel, boot 0242 for now". 0242 fastboot boot OKAY (log from line 778302).
+- Timeline (10 s "SWEET FB: timing" ticks), all three sweetipa=1 boots: "SWEET IPA: configured" falls between tick N and
+  N+1, modem endpoints open ~same window, last log line comes after tick N+3 -> death 30-40 s after configure. si_thread's
+  first 30 s report (si_report) is due exactly then and NO "SWEET IPA: <n> s:" line ever reached the log. Strong lead,
+  not proof (the USB log loses the last <100 ms). The backboardd lines at the end are only what was printing then.
+  wland 0008 has no 30 s timer (only 3 s step waits). Apps-SMMU: IPA got CB5 via SMR7/SMR8, no other SMMU writes
+  after it in the window. BO pool is XNU high memory (not near the IPA DMA 0xe4000000..0xe4700000).
+- **xnu 0243** (b4c4d5c, CI 42647290166 on push): sweetipa=1 only. Heartbeat "SWEET IPA DIAG: beat +<ms>" every 2 s for
+  180 s; first 3 reports print "SWEET IPA DIAG: report N at <ms>: <step>" + 300 ms pause before each step (first line,
+  GSI ch0 state, ch3 state, second line); boot-arg sweetipadiag 0x1 = modem endpoints stay closed, 0x2 = no report.
+  Source was rebuilt in the scratchpad from patches 0192/0193/0194/0241 (sweet_ipa.c + coachz_ipa/); gcc syntax check
+  with stub headers OK (only the old `delay` implicit decl + host %llu warnings).
+- Plan: image 2431 = 0243 + sweetipa=1 (expect the death; markers show the step); 2432 = + sweetipadiag=2 (no report: if
+  it survives past 40 s, the report is the trigger); 2433 = + sweetipadiag=1 (endpoints closed). Panic photo still wanted.
+
+## 2026-11-10 02:30 IST: 2421 data test BOOTED (0242 kernel + sweetipa=1, wland 0241 on the phone)
+- Packaged USB build-2421/shim-boot-2421.img ba4984da3378 (kernel 99574bce = 0242, CI 42629741309, main 0178876) with
+  scripts/package-any.py 2421 ... "sweetpanelvci=0 sweetmotion=0xbf sweetipa=1"; cmdline = 0242's + sweetipa=1.
+  fastboot boot OKAY. Log boot-0225-3.txt from line 770461.
+- RESULT (log): INIT_DRIVER ok 1, INIT_COMPLETE, endpoints open, rmnet_ipa0 up; 0x27 "answered success"; 0x23 install
+  filter rule (8 rules logged) "answered (13 ids) -> 0; FILTER_INSTALLED_NOTIF ... -> 0"; modem then sent 0x24 on the
+  client port. pdp_ip0..3 registered (initially down). CommCenter crashed once (sig 11, as on 2401) and restarted.
+  Data port set up (DPM open 0, WDA data format 0, 25 held binds sent); WDS 0xa2 replies for mux 1..5, active 0.
+  NO PANIC so far (log kept growing past the 2401 panic point). No WDS Start Network (svc 1 msg 0x20) seen yet ->
+  pdp_ip still down. Next: USER checks status bar / toggles Cellular Data; then look for svc 0x1 msg 0x20 in the log.
+- USER: "it kernel panicked. it stuck in boot." No panic text in the USB log; it ends at line 774432 (last line
+  "hfs_clonefile: cluster_write failed - 34"; last IPA/BB lines ~WDS svc 0x1 replies, err 0xf/0x4a). Panic came later
+  than on 2401 (several minutes in, after the IPA handshake + filter rules), so answering 0x27/0x23 moved it, not fixed it.
+- 2421 boot #2 (USER request, same image): fastboot boot OKAY, log from line 774433. Same IPA result (0x27/0x23 answered,
+  0x24 from the modem, pdp_ip0..3, CommCenter sig 11 once). Log STALLED at line 778301, last line "SWEET SURF: backboardd
+  trap 2" (first IOSurface lock of backboardd's first 1125x2436 surface); no panic text.
+- OBSERVATION: all three sweetipa=1 boots stop at the same phase, ~1800 log lines after "install filter rule answered":
+  2401 after backboardd "create id 3" (log then restarts with a new kernel), 2421#1 ~80 lines after trap 3, 2421#2 at
+  trap 2. Without sweetipa (0242, 2402) backboardd goes on past this. GUESS (unverified): a fixed time after the modem
+  endpoints open (IPA RX/GSI interrupt or DMA into memory that something else owns), not the display code itself; the
+  backboardd lines are just what is printing at that moment.
+- Next: photo of the panic screen (0193's was "panic (CPU 3 Caller 0xfffffe0..."); kernel diag options: keep IPA up but
+  skip the modem endpoint open (bisect RX buffers vs QMI), and print panic text to the USB log/persistent log before halt.
+
+## 2026-11-10 02:00 IST: 0242 BOOTED (crack-line fix + 0241 IPA QMI); awaiting USER lock/unlock check
+- CI 42629741309 (main 0178876) green. Image USB build-0242/shim-boot-0242.img 17402d096639 (kernel 99574bce), extras
+  sweetpanelvci=0 sweetmotion=0xbf (sweetpanelsleep default 2; NO sweetipa, so the 0241 IPA code is inactive).
+  Markers "black + brightness 0" and "FILTER_INSTALLED" verified in the kernel. fastboot boot OKAY.
+- Log boot-0225-3.txt from line 679418: launchd up (sweetbuild=242), SWEET BB 22/22 services published, wland READY.
+  Crashes so far = usual noise (bluetoothd, driverkitd, *Spotlight, assetsd, CommCenter x1).
+- To check: lock -> line gone? (log "SWEET FB: display off (black + brightness 0)", "SWEET PANEL: blank: brightness 0 ->"),
+  unlock -> brightness restored. Next data test = 2421 (0242 kernel + sweetipa=1).
+- USER asked for a SpringBoard restart: TERM to pid 294 over SSH -> new SpringBoard 343. Before that, backboardd (292)
+  and SpringBoard were only ~50 s old although the boot was minutes earlier (an earlier userspace restart? not checked).
+- USER: "line is gone when locked" -> 0242 CRACK-LINE FIX CONFIRMED (log: display off (black + brightness 0), blank
+  brightness 0 -> err 0, 8 off/on cycles). USER: touch not working. Cause: NOT 0242: the 45 s SweetTouch probe read an
+  all-zero Goodix info page (0x4022 zeros, pid=00000000) -> "no unique supported IC ... stopping" (same as 0087 on 10-19;
+  49 other boots in boot-0225-3.txt selected GT9896). One-shot probe, no live retry -> reboot to fastboot, boot 0242 again.
+  TODO kernel: retry the probe (e.g. 3x, 5 s apart) when the Goodix pid reads 0.
+- 0242 boot #2 (log from 688518): touch probe failed AGAIN, same way. Raw bytes differ from every good boot: 0x4022 all 0
+  (good: "9896" fw 03.02.00.0c), 0x4032 "02 06 00.." (good: "03 5f 5f ad.."), 0x8240 random (good: ~0x09xx sensor data).
+  GUESS: GT9896 sits in its boot ROM / firmware not running; warm fastboot boot does not power-cycle it. Nothing before
+  the probe differs on the display side (only "display on", no blank), and the 0241/0242 diff touches no I2C/touch code.
+  A/B: waiter boots known-good 2402 next (build-2402, CI 42614675470). If 2402 also fails -> chip state, try a full power-off
+  / OrangeFox touch check; if 2402 works -> 0242 kernel related after all.
+- RESULT: 2402 (e3ef1b1c, log from 697645) ALSO fails: 0x4022 zeros, pid=00000000, "no unique supported IC". => NOT the
+  0242 kernel. Touch chip state (or hardware: screen is cracked) persists across warm fastboot boots. Next: USER boots
+  OrangeFox (power + vol-up): does touch work there (Linux goodix pulses reset / may load fw)? Then OrangeFox Power off
+  (cold) -> power + vol-down -> fastboot boot 0242. TODO kernel: on zero info page pulse the reset GPIO and re-probe.
+- RESOLVED: fastboot reboot recovery -> OrangeFox: USER "touch works on orangefox"; dmesg goodix: powers vtouch regulator,
+  vdd-gpio 90, reset-gpio 8, irq-gpio 9 -> PID 9896 VID 03 02 00 0c, config equal with flash. Then adb reboot bootloader
+  (NO power-off) -> fastboot boot 0242 (log from 720096): "selected GT9896", pid=39383936. Touch back.
+- Cause (strong lead): SweetTouch never powers/resets the chip (log "TLMM reset=0 irq=0 vdd90=0" on good AND bad boots,
+  only votes L11C) -> it works only while the chip still runs from the previous OS (OrangeFox/Android). Some boot left it
+  in boot ROM (0x4032 "02 06"), and every later iOS boot inherited that. Recovery when touch is dead: boot OrangeFox once,
+  then reboot bootloader -> fastboot boot. TODO kernel: do the Linux power-on itself (vdd-gpio 90 high, reset-gpio 8
+  low->high pulse, wait for fw) and re-probe on a zero info page.
+- USER: "touch now works" on 0242 (boot from 720096). Current phone state: 0242 running, crack-line fix + touch OK.
+
+## 2026-11-10 01:30 IST: CRACK LINE SOLVED (live): panel awake + black frame + DCS 0x51 = 0 -> fully dark; xnu 0242 builds
+- USER: the line is a physical crack, always visible while lit; Android darkens it while asleep.
+- 2402 (0240 + sweetpanelsleep=0: CPU fade to black, panel awake, no 28/10): line still visible; log: brightness stayed
+  892 on display off (no DCS sent). Live while locked: `panel.sh bl 0` (DCS 0x51 0) -> USER "the line disappeared";
+  unlock -> normal brightness; next lock -> line back (one-shot poke). So: sleep-in shows it, VCI cut kills wake,
+  awake + black + brightness 0 = dark.
+- xnu 0242 (main 0178876, CI 42629741309 with 0241): sweetpanelsleep default 2 = fade to black + DCS 51 0 after
+  120 ms on display off, wanted level resent on display on; 1 = old DCS 28/10, 0 = fade only.
+- xnu 0241 (same build): IPA QMI 0x27/0x24 success, 0x23 rule ids + FILTER_INSTALLED_NOTIF (only with sweetipa=1).
+
+## 2026-11-10 00:30 IST: 2401 data test: INIT_DRIVER ACCEPTED, handshake complete, endpoints open; then kernel panic
+- 2401 (0240 kernel + sweetipa=1, wland 0241): "INIT_DRIVER answer: ok 1", INIT_COMPLETE, "modem endpoints open, channel
+  states TX 0:2 RX 3:2; pdp_ip0..3 = mux 1..4", rmnet_ipa0 up. Modem then sent IPA QMI 0x27 (63 B) and 0x23
+  INSTALL_FILTER_RULE (2260 B): both "not handled" (redfin answers 0x27/0x23 with success, echoes rule ids from
+  filter_spec_ex byte 168 in TLV 0x15, and sends FILTER_INSTALLED_NOTIF 0x24). CommCenter crashed once (sig 11) and
+  restarted; ~25 s later the kernel panicked (USER: "kernel panicked. stuck in boot"). No panic text in the USB log or
+  the persistent log (logs/persist-2401.txt, last flush before the IPA lines). Panic cause still unknown.
+- Next data build: answer 0x27/0x23 + FILTER_INSTALLED_NOTIF (redfin ipaqmi.c), and flush the persistent log on panic
+  (or ask the USER for a photo of the panic screen).
+
+## 2026-11-10 00:40 IST: OrangeFox screen off/on observed: panel stays powered, NO sleep-in; screen fully dark, no line
+- OrangeFox (Linux 4.14 msm DRM, panel 'xiaomi k6 38 0c 0a fhd dsc video'): DT reset seq <0 1>,<1 10>; reset gpio
+  pm6150l 9; lp11-init; supplies (sysfs consumers of soc:qcom,dsi-display): pm6150_l13 1.9 V (vddio) + pm6150_l18 3.0 V
+  (VCI); DSI ctrl pm6150l_l3 1.2 V.
+- Power-key off/on x3 with a 4 Hz watch (l13, l18, l3c, mdss gdsc, backlight, DPMS): NOTHING changed; drm.debug=0x16:
+  only page flips (FB 170/207 alternating), none during the off time, vblank off/on. => OrangeFox blanks by showing a
+  black frame and stopping updates; panel powered, video running, no 28/10. USER: "line was not visible, screen fully
+  dark". dmesg copy research/ofox-blank-dmesg-20261109.txt (git-ignored).
+- Hypothesis: the line is a property of the panel's display-off/sleep-in state (28/10), not of the lit panel. Test:
+  sleep = black scanout buffer + DCS 51 = 0, no 28/10 and no VCI cut (wake cannot fail). Cost: DDIC + DSI link stay up.
+
+## 2026-11-09 23:40 IST: mobile data step 1 staged: kernel IPA path (sweetipa=1) + wland 0241 (0239 stack + IPA steps)
+- Kernel IPA code (bsd/dev/sweet_ipa.c + coachz_ipa) is mainline Linux's IPA v4.2 driver order (coachz = SC7180): table
+  init by immediate commands before INIT_DRIVER is already there. 0193's panic after INIT_DRIVER is the open bug; 0194
+  (in main) prints each new IPA/GSI interrupt set before handling it. No kernel change for step 1.
+- wland 0241 = userspace/wifi/wland-0239 + 0008 (old wland 0005 IPA steps), CI 42617783761, 8424251f. Phone:
+  /var/local/bin/wland = 0241 (next boot); rollback cp wland-0239 wland. Inactive without sweetipa=1.
+- Test image USB build-2401/shim-boot-2401.img 76cb384b = 0240 kernel + sweetipa=1. Expect: SWEET IPA configured ->
+  set up -> INIT_DRIVER -> irq lines; a panic is possible (Nov 4) -> phone reboots to ABL, user re-enters fastboot.
+
+## 2026-11-09 23:00 IST: 0240 (no idle D-cache flush + AKS 0x6) booted: USER "animation does feel better"; app-open delay remains
+- Image USB build-0240/shim-boot-0240.img bb134af5 (CI 42614675470, main f94ac2a, + sweetpanelvci=0 sweetmotion=0xbf).
+  Log from line 612146. Wi-Fi + SIM OK; mobile data not implemented yet (expected).
+- Present path unchanged in the busy windows (vs 0235): present_avg 15-17.7 ms = gate (GPU fence) 6.1-7.9 ms + copy
+  5.6-8.6 ms; up to 541 presents/10 s (54/s). The felt gain is CPU-side (warm caches), not the present path.
+- Next perf candidates (docs/notes/redfin-findings-2026-11-09.md): 0234's 2-thread copy into main; cacheable source
+  mapping for the copy (redfin 0978); GPU fence on interrupt (redfin 1040); app-open = SpringBoard CPU on A55.
+- Next data: step 1 of the IPA plan (INIT_DRIVER without the kernel panic; wland 0239 + 0005's IPA steps).
+
+## 2026-11-09 22:00 IST: REPO CONSOLIDATED: single `main` branch; side branches recorded and deleted (USER request)
+- USER: "update the readme on github ... clean the repository up ... should only have a single main branch, but
+  everything should be recorded separately". Testing stopped for now.
+- main = claude/sensors-0238 (code: speaker 0225 line + sensors 0237/0238) + claude/audio-0009 (this NOTES line) +
+  the old GitHub main (PRIVACY.md, AGENTS.md rules, README, metal2.yml). 38 NOTES sections that only existed on the
+  speaker branches -> docs/notes/speaker-line-2026-11-06.md. Wi-Fi boot daemon stack -> userspace/wifi/wland-0239 +
+  .github/workflows/wifi-0239.yml. Every former branch: docs/branches/README.md (tip hash, result) and, where commits
+  are not in main, docs/branches/<name>/*.patch (33 branches, 3.3 MB). Privacy scan of the new files: no ID values.
+- Full backup of all 50 branch tips before deletion: USB ios-sweet-backup/git-bundles/ios-sweet-all-branches-20261109.bundle.
+- Phone state at stop: booted 0238 (sweetmotion=0xbf); /var/local/bin/wland = 0239 (Wi-Fi/cell), wland-0225 path =
+  wland-0238 (speaker + sensors; rollback wland-0225.orig); soc0 files + rebuilt sensor registry in place.
+  Untested image ready: USB build-2381 (0238 kernel + sweetmotion=0xff, iOS orientation service for auto-rotate).
+- Next: modem ERR-FATAL on ~1/3 boots; auto-rotate via 2381; auto-brightness (only 31 ALS samples seen); Compass
+  (devmotion8 bit 0x400); sleep diagnostic (DCS readback); perf needs measurement first.
+
+## 2026-11-09 21:25 IST: 0238 boot: 6 sensors, prox service live; orientation OFF by mask -> image 2381 (sweetmotion=0xff)
+- 0238 (log from line 583119): modem OK. wland-0238: "motion: 6 sensors", accel 50 Hz, gyro 200 Hz (iOS changes rates),
+  als, "orientation 1 posted"; SNS_DEVMOTION fusion on. Kernel: prox service registered, backboardd sets DetectionMode
+  0/1/3/5, ScreenUnlocked. "orientation off (sweetmotion=0xbf)", "devmotion8 off".
+- Mask bits (SweetMotion.h): 1 accel, 2 gyro, 4 als, 8 prox, 0x10 compass, 0x20 pressure, 0x40 ORIENT, 0x80 devmotion
+  {0xff0c,4}, 0x400 devmotion8 {0xff0c,8} (locationd heading). 0xbf lacks 0x40 (my packaging choice, copied from sunfish).
+  sunfish keeps 0x40 off on purpose: their auto-rotate = adspboot --sns-rot -> /var/local/sweet-orient "R N" read by
+  SweetMetal2 (iOS orientation service rotated their display wrongly). Sweet has NO sweet-orient reader.
+- Test image: USB build-2381/shim-boot-2381.img 5150ca32d3ad = 0238 kernel (CI 42556304946) + sweetmotion=0xff
+  (adds iOS orientation service; sweetbuild=2381 is only a label). Compass heading may also want 0x400 later.
+
+## 2026-11-09 21:10 IST: 0237 USER: rotation NO, auto-brightness NO, speaker YES -> 0238 staged
+- Kernel: "SWEET MOTION: orientation off (sweetmotion=0x37)" + "sample type 10 flags 0x3: service not registered" x6:
+  wland posts orientation, but 0237's mask has no orientation service -> no rotation by design of that image. 0238
+  (sweetmotion=0xbf) adds it + prox. backboardd configures accel/gyro/als (ReportInterval, ALSIntegrationMode); only 31
+  ALS samples in wland's count -> auto-brightness unexplained, check on 0238.
+- /var/local/bin/wland-0225 = wland-0238 (9908af6f) for the next boot; registry (157 files) kept.
+
+## 2026-11-09 21:00 IST: SENSORS WORK (0237 boot #3): accel + gyro + ALS stream, orientation posted
+- After the soc0 files + stale-cache removal: registry rebuilt on this boot (399 persist writes, 157 files in
+  /var/local/sensors-persist/registry/registry: adux1050_0*, ak0991x_0*, icm/lsm/tsl/bu27 groups ...).
+  First lookup (registry still building) 0, then: "sns: motion: accel 3739 gyro 3673 als 31 compass 0(off), written 7445",
+  acc ~(-0.9, 3.9, 9.0) m/s^2, "orientation 1 posted" / "orientation 5 posted". sensd: SUID events for ambient_light,
+  gyro, mag; no "proximity"/"pressure" SUID in 0237 (0238 adds prox placement + compass/devmotion).
+- Gotcha: the speaker job starts 60 s after boot and rotates adsp-speaker.log only then; reading earlier shows the
+  previous boot (cost one wrong conclusion this session).
+- Modem ERR-FATAL again this boot ([137] ms): 3 of the last ~8 boots. Next item after the sensor check.
+- TODO: script the soc0 files + "clear registry when soc0 changes" (tools/), and keep wland-0237/0238 in the speaker job.
+
+## 2026-11-09 20:45 IST: 0237 boot #2: soc0 reads OK now; registry skipped every config (stale cache) -> cache moved aside
+- soc0 served correctly (hw_platform "SWEET" read, 6 bytes; soc_id, subtype, version, revision all -> 0). sns_reg_version
+  rewritten ("version=1\0", 10 B). Still "motion: 0 sensors".
+- Cause: persist registry/registry/sns_reg_config (3805 B, 2026-11-05) is the registry's record of processed config files
+  ({"/vendor/etc/sensors/config/X.json": {"data": "1793888155"}} for all 41); written on 11-05 when soc0 was missing, so
+  no group matched; files unchanged -> every json skipped, no groups, no drivers. (sunfish: "registry builds (87 files)".)
+- Moved to /var/local/sensors-persist-stale-20261109/ (registry-sns_reg_config, sns_reg_version.0237b);
+  registry/registry now empty -> full rebuild on the next boot. Expect many "persist write" lines in adsp-speaker.log.
+- Speaker job still wland-0237. Wi-Fi this boot: not checked yet.
+
+## 2026-11-09 20:15 IST: 0237 boot: sensors PD up, 0 sensors -> cause: no /sys/devices/soc0 -> fake soc0 files written
+- 0237 (log from line 524773): modem OK (wlfw up), /dev/redwood-motion ready (mask 0x37), wland-0237 in the speaker job:
+  "sns: SNS service 400 at 5:e", sensors PD attached and served (registry readdir of /vendor/etc/sensors/config: 41 files
+  incl. sm7150_icm4x6xx_0, sm7150_lsm6dso_0, sm7150_ak991x_0, sm7150_tsl2540, sm7150_bu27030_0), but "motion: 0 sensors"
+  x5, "the DSP has no mag/pressure sensor".
+- Cause (strong lead): the PD reads /sys/devices/soc0/hw_platform and platform_subtype ~20 times -> ENOENT (fastrpc maps
+  /sys/devices/soc0 -> /var/local/fw/soc0, which was EMPTY). Every sm7150_*.json has "config": {"hw_platform": [..., "SWEET"],
+  "soc_id": [..., "365"]} -> no config matched -> no driver. sns_reg_version was written EMPTY.
+- On-device change (like sunfish tools/sunfish-soc0-files.sh): /var/local/fw/soc0/{,g_}hw_platform=SWEET,
+  {,g_}platform_subtype_id=0, {,g_}platform_version=65536 (guess), platform_subtype=Unknown, soc_id=365, revision=1.0.
+  Moved /var/local/sensors-persist/registry/sns_reg_version -> sns_reg_version.0237-empty so the registry is rebuilt.
+  Effective next boot (one FastRPC/SMMU session per boot). TODO: script it (tools/) once it works.
+
+## 2026-11-09 19:50 IST: 0236 second boot: modem ERR-FATAL with wland 0239 too -> the modem crash is intermittent, not 0005-0018
+- wland 0239 at boot ("boot 43" again = same as the 0235 boot: the old guard would have refused; UUID guard started it).
+  Modem PAS boot OK, glink/qrtr up, rmtfs read modemst1, then "[37] smp2p: modem state 7 ERR-FATAL" -> no Wi-Fi, no SIM.
+  SMEM item 421 (modem crash reason) "not found" (wland-0008 item 421 2/1/0). Log copy /var/local/wland-0236b-fail.log.
+- Record so far: modem ERR-FATAL on 0232 (late hand start, wland-0232) and 0236 #2 (boot, wland 0239); OK on 0234 (0004),
+  0236 #1, 0235 (0239). So the 0232 failure is NOT proof that 0005-0018 breaks Wi-Fi. Cause UNKNOWN (EFS/rmtfs timing?).
+- USER: 0236 "performance feels exactly the same". Next boot 0237: /var/local/bin/wland-0225 = wland-0237 (1b22da17) staged;
+  rollback cp wland-0225.orig wland-0225.
+
+## 2026-11-09 19:30 IST: 0235 result: no visible change ("jitters, slight delay while opening app still exists")
+- 0235 boot (log from line 485173; usblog missed the first seconds, so the "timer coalescing" init line was not seen;
+  active state unconfirmed). Busy windows: ~37 presents/s, present_avg 17 ms = gate (GPU fence) 7.3-7.9 ms + copy 7.2-8.3 ms
+  (one thread in 0235), max 31-38 ms. Idle windows: 5.4 ms.
+- All three perf builds (0234 copy x2, 0235 no coalescing, 0236 both + x4): USER sees at most a small gain. => neither the
+  copy alone nor timer slop is the limit. Known from 11-01/02 (spindumps): app-open delay = ~150-170 ms SpringBoard main
+  thread CPU before the first animation frame, mostly on A55 (kernel sees 8 cpus as one SMP cluster); GPU ~7-8 ms/frame.
+- Candidate next steps (none built): (a) USER-side A/B: Reduce Transparency + Reduce Motion (fewer GPU blur passes);
+  (b) check whether backboardd blocks in present (fence wait + copy serial with its next frame) and pipeline it;
+  (c) real AMP cluster topology (mkadt: 2 clusters, __AMP__) so the scheduler puts UI threads on A76 by design - large.
+
+## 2026-11-09 19:10 IST: Wi-Fi fix SAVED as the default; booting 0235
+- KEEP: Wi-Fi boot daemon = wland 0239 (5eb59683) = branch claude/wifi-0239 7fa30a5 (myfork), CI 42603119802.
+  Copies: phone /var/local/bin/wland and wland-0239; USB ios-sweet-backup/wland-keep/wland-0239-5eb59683.
+  Any future Wi-Fi/cell work starts from claude/wifi-0239 (0001-0004 + 0005 scan + 0006 list + 0007 guard), NOT from
+  the 0005-0018 stack (its `auto` mode crashed the modem on 0232).
+- Speaker job reverted to wland-0225 (eb04140c) for a clean perf test; wland-0238 still staged as /var/local/bin/wland-0238.
+
+## 2026-11-09 19:00 IST: 0236 + wland 0239 tested: Wi-Fi list instant (after warm-up); perf no visible gain; 0238 staged
+- 0236 boot (log from line 443230), wland 0239 started at boot ("boot 44 session <uuid>"), modem fine, wlfw up.
+  Active scan works: 553 frames in 33 scans vs 48 in 28 with 0004 (all nearby APs -81..-94 dBm). Every wifid FW_SCAN
+  answered from the list within ms. USER: first open "still takes 1 min+", a few minutes later "it is instant now".
+  (First-open delay = radio bring-up/first scans after boot; not measured precisely.) SIM works.
+- Kernel/wland mismatch noticed (not fixed): bridge lists APs heard in the last 120 s, flame_sta drops age > 60 s.
+  apple80211 get/set printf is capped: later SCAN_REQ/SCAN_RESULT lines stop appearing.
+- Perf: USER 0234 "improvement there, not that noticeable"; 0236 "feels the same". 0235 not booted separately.
+  Next perf step needs measurement of app-open latency (GPU vs SpringBoard vs scheduler), not more copy threads.
+- Staged for the next boot: /var/local/bin/wland-0225 = wland-0238 (9908af6f; the speaker job execs that path).
+  Rollback: cp /var/local/bin/wland-0225.orig /var/local/bin/wland-0225 (eb04140c). Boot image 0238.
+
+## 2026-11-09 18:20 IST: 0234 tested; wland 0239 (scan fix on the 0004 stack + boot-session guard) installed for next boot
+- 0234 boot (log boot-0225-3.txt from line 428768), wland 0004: USER: Wi-Fi + SIM work, Settings no longer crashes;
+  animation improvement "there" but not very noticeable. Log: copy_avg_us 3.5-5.4 ms (was 8.4 ms one-thread), 0-1 missed
+  deadlines per 10 s.
+- wland 0239 (branch claude/wifi-0239 7fa30a5, CI 42603119802 OK): patches 0001-0004 + 0005 fast scan (= old 0019, applied
+  unchanged) + 0006 fresh list (= old 0020) + 0007 boot stamp keyed on kern.bootsessionuuid; workflow = the 0004-era
+  build step. wland 5eb59683, artifact on USB build-0239/art.
+- Phone: /var/local/bin/wland = 0239 (effective NEXT boot; old stamp "50" will not match a UUID). Rollback:
+  cp /var/local/bin/wland-0004 /var/local/bin/wland (ef9a6d24). wland.running-0004 = the inode the current process runs.
+
+## 2026-11-09 17:05 IST: 0232 boot: Wi-Fi + SIM DOWN; wland boot-guard bug; wland-0232 crashed the modem; 0004 restored
+- Boot-guard BUG (also explains past "wland refuses / died" cases): /var/local/wland.boot stores "boot %ld" = boot time in
+  seconds, and the phone clock restarts at the same fake 1969 epoch every boot -> 0231 and 0232 were both "boot 47" ->
+  "wland: already started in this boot" -> no Wi-Fi, no baseband (CommCenter crash loop sig 11, Settings unstable).
+  Fix in the next wland build: key the guard on kern.bootsessionuuid. Until then remove /var/local/wland.boot before a reboot.
+- Started wland-0232 by hand (guard moved to wland.boot.stale): modem booted, then "[1092] smp2p: modem state 7 ERR-FATAL"
+  -> no wlfw, no Wi-Fi. 0004 on the previous boot: modem fine, wlfw up. Cause (0005-0018 stack vs late start) UNKNOWN.
+- Restored: /var/local/bin/wland = 0004 ef9a6d24; tried binary kept as wland-0232.tried; guard moved to wland.boot.0232run.
+- Wi-Fi tests 0232/0233 as built are void. Next: port 0019/0020 (+ guard fix) onto the 0004 stack.
+
+## 2026-11-09 16:40 IST: 0231 hardware: mode 7 (soft reset + snapshot + CTL flush) ran, wake STILL BLACK
+- Log boot-0225-3.txt from line 341502. 5+ cycles, all steps 0 errors; after cold start DSI status 0x8 (0230: 0x2008),
+  stream running. USER: reaches the home screen (touch works) but the display stays black.
+- The usb log receiver re-sends old buffer (repeated boot-args with identical timestamps): not userland restarts.
+- Both sleep builds failed. Panel state after the VCI cut stays unknown: DCS readback returns 0 bytes even from a live panel
+  (our read sequence is wrong). Next diagnostic = fix readback first (compare Linux dsi_ctrl read: cmd engine, BTA, RDBK
+  count), and check the stock DT power sequence (vddio, any panel-enable GPIO, the panel's own PMIC) - no dtc here.
+- Working fallback: the 0227-novci sleep (VCI kept on): wakes reliably, line stays visible while locked.
+
+## 2026-11-09 16:10 IST: 0230 hardware: cold restart ran as designed, wake STILL BLACK
+- Log: logs/boot-0225-3.txt from line 280701 (the receiver kept running). Sleep: INTF_1 off -> lanes LP-11 (lane_status
+  0x1f1f, ctrl 0x1f5), reset low, VCI off. Wake: VCI on, reset pulse, 45/45 on-command in LP with the link idle, no errors;
+  "cold start (mode 1)"; stream resumed (intf1 en 1, frame counter advancing, lane_status 0x1f00). USER: display does not wake.
+- DCS read 0x0A returned 0 bytes (count 0, ack 0, no timeout) BOTH asleep-before-reset AND after the on-command -> the
+  readback path itself does not work (the panel was certainly alive at the first read), so it gives no panel state.
+- Next: 0231 (soft reset + snapshot restore + CTL flush). Mode 1 reported "regs differ 0", so the snapshot part likely changes nothing.
+
+## 2026-11-09 10:15 IST: ALL 9 IMAGES BUILT + PACKAGED (none booted); live sensor check; TEST GUIDE
+Images: /run/media/dan/MUSIC/ios-sweet-backup/build-02NN/shim-boot-02NN.img (+ NN-boot-manifest.json). All CI green.
+| img | sha256[:12] | what | cmdline extra | wland to use |
+| 0230 | 85c06bad9526 | sleep: cold restart (INTF/DSI stop-start) | VCI cut on | as is |
+| 0231 | 4a8232689fab | sleep: + DSI soft reset/snapshot + CTL flush | VCI cut on | as is |
+| 0232 | 1095a37f2ae2 | Wi-Fi fast scan + SMS/NAS trace | sweetpanelvci=0 | /var/local/bin/wland <- wland-0232 |
+| 0233 | 2e07b2ea190c | Wi-Fi fresh list + IPA data retest | sweetpanelvci=0 sweetipa=1 | wland <- wland-0233 |
+| 0234 | b7543fb04bdd | perf: 2-thread copy | sweetpanelvci=0 | as is |
+| 0235 | 075498357c0c | perf: no timer coalescing while lit | sweetpanelvci=0 | as is |
+| 0236 | ed60c6fa3624 | perf: both + 4-thread copy | sweetpanelvci=0 | as is |
+| 0237 | cc6b36ba4174 | sensors (accel/gyro/ALS/compass HID) | sweetpanelvci=0 sweetmotion=0x37 | wland-0225 <- wland-0237 |
+| 0238 | 039abfecf607 | sensors + devmotion/Compass/prox | sweetpanelvci=0 sweetmotion=0xbf | wland-0225 <- wland-0238 |
+- Staged on the phone (verified sha): /var/local/bin/wland-0232 f18a63bf, -0233 90ab17ad, -0237 1b22da17, -0238 9908af6f.
+  Active: /var/local/bin/wland = 0004 ef9a6d24 (Wi-Fi), wland-0225 eb04140c (speaker job). Swap = copy over, keep .orig.
+- CAUTION Wi-Fi: the Wi-Fi daemon has been wland 0004 since 11-04 ("0005 broke Wi-Fi" was only suspected). 0232/0233 wland
+  carry 0005-0018. If Wi-Fi does not come up with them, restore 0004 and build 0019/0020 on the 0004 stack (they do not apply
+  as is: 0010 touched radio.c/bridge.c context).
+- Live sensor check on 0227-novci (no /dev/redwood-motion): wland-0237 started from a clean ADSP: channels 33 ms, "sns: SNS
+  service 400 at 5:e". Lookups found 0 sensors because after a wland RESTART "no SMMU FastRPC stream" (the SMMU stream can be
+  set up once per boot) -> sensors PD gets no registry. Needs a real boot (the speaker job starts wland at boot, where SMMU
+  setup works). Restarting wland adsp: kill -TERM leaves the ADSP down; a restart right after can show "already up" with no
+  channels -> use WLAND_ADSP_FRESH=1. Speaker wland-0225 restored (channels up) but FastRPC files not served until reboot.
+- Packaging: /run/media/dan/MUSIC/ios-sweet-backup/scripts/{fetch-ci-any.py,package-any.py,batch-*.sh} (run with bash/python:
+  FAT stick, no exec bit). Artifact downloads from Azure blob reset often: retry loop.
+- Per test, look for: 0230/31 "SWEET PANEL: link (...)", "read 0xa (asleep, link idle)" (expect 0x08 data), "cold start";
+  0232 "bridge: scan answered from the ... list"; 0233 "SWEET IPA:" lines; 0234/36 copy_avg_us in "SWEET FB: timing";
+  0235 "timer coalescing off while the display is on"; 0237/38 wland log "sns:" + "SWEET MOTION:".
+
+## 2026-11-09 09:00 IST (03:30 UTC): all 9 builds dispatched; perf + sensors tracks
+- Perf 1 **xnu 0234** (claude/perf-0234, CI 42555473053): scaled present copy on 2 threads (present + helper cpu5),
+  8-row bands interleaved (beamWait stays valid). Measured before (0227, animation): 36 fps, present 18.1 ms = gate 8.1
+  (GPU fence) + acquire 1.6 + copy 8.4 ms on cpu4 (A55). sweetcopythreads=1..4.
+- Perf 2 **xnu 0235** (claude/perf-0235, CI 42555567187): timer_call_slop returns 0 while the display is lit
+  (sweet_timer_nocoal via sweet_dark_set; separate from kern.timer.coalescing_enabled that wland holds for audio).
+  sweetuicoal=0 = old.
+- Perf 3 **xnu 0236** (claude/perf-0236, CI 42555692914; first run 42555600642 cancelled: empty patch, fixed in a
+  follow-up commit, force-push was refused): 0234 + 0235 + sweetcopythreads default 4 (cpu5,3,2 helpers).
+- Sensors 1 **xnu 0237 + wland 0021** (claude/sensors-0237, CI xnu 42556227828, wifi 42556232239): "Pixel 5 repo" =
+  DenialOfGravity/ios-redfin (MIT, via sunfish = Pixel 4a, SAME SM7150). Kernel: codex's 0213 sensor HID services +
+  sunfish 0229 /dev/redwood-motion (bsd/dev/sweet_motion.c, init next to /dev/pmem). wland: sunfish phone/sensors
+  (userspace/sensors, LICENSE.redfin) built in; ADSP announces SNS 0x190 at 5:e (seen in /var/local/adsp-speaker.log);
+  WLAND_SNS options (default --sns-motion --sns-secs 0). Package sweetmotion=0x37.
+- Sensors 2 **xnu 0238 + wland 0022** (claude/sensors-0238, CI xnu 42556304946, wifi 42556308218): + sunfish 0241 (prox
+  Placement), 0243 (DeviceMotion {0xff0c,4}), 0245 (Compass type 2); SNS_DEVMOTION=1 default. Package sweetmotion=0xbf.
+- Microphone: NOT built. Stock mixer_paths: handset-mic = TX macro DEC0/1 <- SWR_MIC <- WCD9375 ADC1/ADC2 (SoundWire codec).
+  Needs AP drivers for LPASS TX macro + SoundWire master + WCD937x (Linux: thousands of lines) - no blind build possible;
+  sunfish's mic path (cs35l41 amp is speaker-only) does not cover it. Both sensor/mic builds went to sensors instead.
+- Sleep 0230/0231 compiled OK; wifi 0019/0020 compiled OK.
+
+## 2026-11-09 09:30 IST: USER away 8 h: 9-build plan (sleep 2, perf 3, wifi+cell 2, sensors+mic 2); builds on separate branches
+- USER plan: each track its own CI build(s), tested later one by one, then combined. Branches all from claude/speaker-0224 (83efd1b).
+- 0229 hardware (+ live /dev/pmem pokes on 0229 and 0227-novci): line gone, wake black. Findings: LANE_CTRL 0x01000000 (no
+  forced HS clock). DCS reads never return while video streams (RDBK_DATA_CTRL 0x1d0 count 0; ABL leaves 0x29). Whole on-command
+  resent live in HS: still black. Stopping only the DSI video engine while INTF_1 runs -> FIFO 0xdddd.... errors, lanes idle,
+  DSI soft reset does not restart it. Reading MDP from userland (/dev/pmem 0xae00000/0xae01000 region) FROZE the phone: do not.
+  INTF_TIMING_ENGINE_EN is offset 0 (INTF_1 0xae6b800, en=1 in the kernel's beam probe). 0227-novci locked: sleep-in again (HS)
+  and brightness 0 do not touch the line; DT pm6150l amoled (ab/ibb/oledb, swire) is status disabled -> VCI cut is the only lever.
+- Sleep 1 **xnu 0230** (claude/sleep-0230 18ba975, CI 42554715454): cold link restart: sleep 28/10 -> INTF_1 off -> DSI video off
+  (LP-11) -> DCS read 0x0A -> reset low -> VCI off; wake VCI on -> reset pulse -> clear errors -> on-command (LP, cmd mode) ->
+  read 0x0A -> DSI video on -> INTF_1 on. sweetpanelcold=1 default (0 = 0229).
+- Sleep 2 **xnu 0231** (claude/sleep-0231, CI 42554742586): same, default sweetpanelcold=7 (+ DSI soft reset with ABL snapshot
+  restore of changed config regs, + CTL0 INTF/flush).
+- Wi-Fi/cell 1 **xnu 0232 + wland 0019** (claude/wifi-0232, CI xnu 42555062063, wifi 42555065429): active scan (wildcard
+  probe, 40/110 ms dwell; DFS stays passive by channel flags), scan requests answered at once from a <30 s list + refresh;
+  kernel traces WMS(SMS)/NAS QMI headers (no TLVs). Package with sweetpanelvci=0.
+- Wi-Fi/cell 2 **wland 0020** (claude/wifi-0233, CI wifi 42555134319; kernel = 0232): rescan every 20 s while not joined and the
+  display is on. Package with sweetipa=1 (IPA data path retest; 0194 trace never booted; 0193 panicked after INIT_DRIVER).
+- Pixel 5 reference the USER named: not found locally or on GitHub (searched ios-flame forks, redfin); used ios-flame/sunfish.
+- Non-sleep images must carry sweetpanelvci=0 (0229 base cuts VCI -> black wake).
+
+## 2026-11-09 03:30 IST: 0228 hardware: re-init sent but still black -> 0229 adds the panel reset pulse
+- 0228 boot: sleep 28/10 + VCI off; wake VCI on + "K6 re-init 45/45 commands, 0 needed HS, PPS split 0, ~310 ms -> 0"
+  (90-byte 9E went through the FIFO whole, LP) + 51 level restored. USER: screen stays black. => DDIC ignores the
+  on-command after VCI loss without a reset (Linux always resets after power-on).
+- 0229 (83efd1b, CI 42527667615): sweet_spmi_panel_reset(): only SID 4 0xc8xx (pm6150l GPIO 9 = DT
+  qcom,platform-reset-gpio); reads TYPE/SUBTYPE/MODE/DIG_OUT_SOURCE/EN + APID owner (logged, first 4 calls),
+  refuses unless enabled LV/MV digital output owned by EE0; writes only 0xc844 bit 7 + readback.
+  Sleep: 28/10, reset low, 10 ms, VCI off. Wake: VCI on, 10 ms, reset <0 1>,<1 10>, 45-packet on-command.
+  Package audio-runtime/package-0229.py -> USB build-0229. If still black: check the "reset GPIO" log line
+  (refused?), then suspects = DSI host state after the panel vanished (LP11/ULPS, controller error/reset), vddio.
+
+## 2026-11-09 03:00 IST: 0227 hardware: VCI cut removes the crack line, but wake stays black -> 0228 full re-init
+- 0227 booted twice. Battery now honest: "16% (curve 14%)" after charging (was 17% vs 1-5%). Phone died once at a real
+  ~7-14% under -875 mA load on USB; console ended normally (no panic) -> brownout, not a crash.
+- Panel: sleep = 28/10 HS + "panel VCI ldoa18 off -> 0"; wake = "on -> 0" + 11/29 acked + 51 level 561 acked. USER:
+  "no line either. display is completely dark" -> VCI is what feeds the crack line; the DDIC loses its setup when VCI
+  goes. One wake was missed by the power key: SWEET KEYS read error pon-ok=0 (PRE-EXISTING: 33x on 0225, 35x on 0203).
+- Usable fallback image: USB build-0227/shim-boot-0227-novci.img (506e3de0..., cmdline + sweetpanelvci=0); BOOTED now.
+- 0228 (196c550, CI 42524969981): on wake after a VCI cut replay Xiaomi's 45-packet on-command (LP, HS retry; 90-byte
+  9E PPS split via Samsung B0 00 3B 9E offset if the 64-byte FIFO refuses it). Host mock: 45/45, split used.
+  Package audio-runtime/package-0228.py -> USB build-0228. If 0228 wake is still black: add reset GPIO (pm6150l GPIO9,
+  DT <0 1>,<1 10>) before the list, or memory-DMA for the PPS.
+
+## 2026-11-09 02:30 IST: phone died at "16%" (real ~1%) -> 0227 battery gauge fix; 0227 = 0226 + gauge
+- USER: phone turned off while iOS showed 16%; Android charge screen said 1%. Cause (code + log): SweetBattery seeds
+  from the PM6150 QG SDAM (0xb646 valid, 0xb647 SOC) = Android QG's last saved value, stale (17% every boot, while the
+  curve said 3-5%), and an SDAM seed disabled the at-rest drift to the curve (0162) -> error never corrected.
+- 0227 (9a97c28, CI 42522068917): SDAM seed only within 15 points of the curve (else logged "stale, not used");
+  drift at rest always; rest-corrected OCV < 3550 mV caps shown SOC at curve+3%. Package audio-runtime/package-0227.py
+  (USB build-0227). Boot 0227 directly (contains 0226 panel VCI-off). 0226 CI 42521488630 also built (superseded).
+- USER is charging the phone in the Android charge screen.
+
+## 2026-11-09 02:15 IST: drain fix verified; 0226 panel VCI-off (crack line) building
+- After coreduetd disabled (boot 0225 #4): locked 150 s total CPU 85 s (was 174 s; window had 3 wakes); coreduetd gone,
+  biomed 2.0 s (was 16.6 s); battery +18/+34 mA on USB (was -149/-321). Speaker launchd job WORKS (wland-0225 pid 82
+  at boot). SpringBoard pid 297 (restarted once during boot; cause not checked).
+- Crack line: Xiaomi DT (MiCode sweet-r-oss sweet-sdmmagpie.dtsi + sdmmagpie-sde-display.dtsi + sdmmagpie-regulator.dtsi):
+  K6 panel vddio = pm6150_l13 "ldoa13" (VRM, 1.9 V, pre-off 20 ms), vdda-3p3 = pm6150_l18 "ldoa18" (XOB 3.0 V, pre-off
+  10 ms), reset = pm6150l GPIO 9, reset seq <0 1>,<1 10>, lp11-init; on-command (LP) = 49 cmds incl. DSC enable 9D 01 +
+  89-byte PPS 9E; off (HS) 28/10. Touch is on pm6150l_l11 + tlmm 90 (separate). Only display uses L13A/L18A.
+- 0226 (claude/speaker-0224 d8a2cd0, CI 42521488630): step 1 = VCI (ldoa18) off after sleep-in, on before sleep-out (no
+  re-init). sweetpanelvci=0 disables. Step 2 if the line stays or wake breaks: reset + both rails + 49-cmd re-init.
+  Package: audio-runtime/package-0226.py (outputs USB build-0226/shim-boot-panel-0226.img).
+
+## 2026-11-09 01:45 IST: LOCKED BATTERY DRAIN #1 = coreduetd busy loop (~0.9 core, ~200-350 mA); disabled
+- Measured (0225, locked 150 s, USB attached): 174 s CPU in 150 s. coreduetd 136 s, biomed 16.6 s, wland-0225 3.3 s,
+  wland auto 3.2 s, rest < 3 s each. coreduetd thread "com.apple.coreduet.knowledgestorage.execution" serves an XPC
+  request from dasd (dasd blocked on it) -> CoreDuet -> BiomePubSub/BiomeStreams. Stores small (knowledgeC.db 5 MB,
+  WAL 3.5 MB). cpu_resource .ips for coreduetd since 2026-10-29 (e.g. 56% CPU over 162 s). SIGTERM ignored; SIGKILL
+  -> relaunched (pid 667) and immediately ~0.9 core again. Root cause inside CoreDuet UNKNOWN (no symbols: the
+  ipsw tool download was blocked; fs_usage/lsof/log absent). Next diag option: sweetdtlog=coreduetd,dasd boot-arg.
+- A/B with SIGSTOP (locked): battery current running -149/-321 mA (discharging on USB) vs stopped +32 mA
+  (charging); dasd/SpringBoard/backboardd unaffected for 90 s.
+- FIX (next boot): /private/var/db/com.apple.xpc.launchd/disabled.plist + com.apple.coreduetd = true.
+  Rollback: disabled.plist.pre-coreduetd (same dir) or USB launchd-20261109/disabled.plist.orig. Cost: CoreDuet
+  predictions/suggestions/Screen Time-style knowledge unavailable. Re-measure locked CPU after reboot.
+
+## 2026-11-09 01:30 IST: Wi-Fi daemon died silently; reboot; speaker launchd job; console receiver on USB
+- USER: Wi-Fi disconnected and could not reconnect. Observed: `wland auto` (launchd org.ios-sweet.wland, RunAtLoad,
+  no KeepAlive) exited ~12 min into the boot; wland.log ends on a normal stats line, no .ips, dmesg empty from iOS.
+  Cause UNKNOWN (timing roughly matched a SpringBoard restart; wland-0225 speaker sender ran alongside). It refuses a
+  second start per boot (/var/local/wland.boot) -> rebooted 0225.
+- Console receiver now writes to the USB stick: `python3 tools/sweet-usb-log.py
+  /run/media/dan/MUSIC/ios-sweet-backup/logs/boot-0225-3.txt` (out/err next to it). Grep it for "CRASH wland" if
+  Wi-Fi drops again. wland keeps the previous run as /var/local/wland.log.prev.
+- Speaker auto-start: launchd job /System/Library/LaunchDaemons/org.ios-sweet.speaker.plist added to
+  /System/Library/xpc/launchd.plist (533 jobs; all 532 old jobs identical): `sleep 60` then WLAND_PCM_DELAY_MS=15000
+  WLAND_SPEAKER_SERVICE=1 /var/local/bin/wland-0225 adsp 0 > /var/local/adsp-speaker.log (.prev rotated); RunAtLoad
+  only, never restarts (one DSP session per boot). Rollback: /System/Library/xpc/launchd.plist.pre-speaker (phone)
+  or USB ios-sweet-backup/launchd-20261109/launchd.plist.orig. Effective NEXT boot; this boot started by hand (pid 289).
+- NEXT: USER chose SLEEP over App Store (blocked by Apple attestation, not to be spoofed) and over 120 FPS (long
+  open-ended GPU work). Sleep sub-goal to confirm with USER: locked battery drain / full panel off / tap to wake.
+
+## 2026-11-09 01:15 IST: SPEAKER AUDIO FIXED (0225) — USER: "sound works perfectly, its instant no delay"
+- Boot 0225 (image 4fe2b8bc...) after charging; migration had finished (sentinel gone, 32 apps installed);
+  SpringBoard restarted on USER request; service wland-0225 pid 561 (run-speaker-0225.py, log
+  /var/local/adsp-0225-011047.log). USER confirms: instant start/stop, no stutter, volume OK, no cut-outs.
+- The service is still started BY HAND each boot (run-speaker-0225.py). TODO: launchd job for wland-0225 so
+  speaker audio comes up automatically; merge claude/speaker-0224 (0bdca82) into the main audio line.
+
+## 2026-11-09 00:52 IST: migration ran on the SAME 0225 boot; 32 apps INSTALLED; phone then ran out of battery
+- Observed: after the sentinel was created, backboardd/SpringBoard restarted and datamigrator started at once (not
+  next boot). SystemAppMigrator installed all 32 apps into /private/var/containers/Bundle/Application (staged dir
+  now empty). Migration then HUNG: CoreLocationMigrator -> locationd "com.apple.locationd.synchronous", and
+  locationd itself is deadlocked internally (main thread <- CLHarvestControllerSilo); restarting locationd did not
+  help. Fix applied: /System/Library/DataClassMigrators/CoreLocationMigrator.migrator renamed to
+  CoreLocationMigrator.migrator.sweet-disabled (revert = rename back once location works) + killed the stuck
+  plugin wrapper; next wrapper ran (2+ min CPU). Maps/Preferences migrators also link CoreLocation: may hang too.
+- ~00:50 the phone stopped answering; USER: battery ran out. Sentinel /private/var/datamigrator/migrate was still
+  present -> migration resumes on next boot (journaled HFS+, kernel replays the journal on mount).
+- NEXT: USER charges, fastboot -> boot 0225 again (USB build-0225 image) -> watch migration (spindump the
+  migrationpluginwrapper if CPU stalls) -> home screen -> run-speaker-0225.py -> sound test (volume buttons,
+  pause/resume/seek). Then SLEEP. Speaker sound result on 0225 still PENDING.
+
+## 2026-11-09 00:15 IST: 0225 booted (speaker fixes v2); iOS ROOT GROWN TO 107 GiB; app migration armed
+- 0224 (a7c309d, kernel CI 42507039951, wland 42507043455) booted: DSP consumption ~100 periods/s even idle
+  (8 slots fixed the slow sender). USER: "sounds loud"; then sound stopped on a volume change: ch0 SYSST
+  0x2711 = OVPS|ADPS -> our 0xcc2a fault mask reset both amps. Xiaomi AW_PID_2032_SYSST_CHECK_MASK only counts
+  UVLS|BSTOCS|NOCLKS|OCDS|OTHS -> 0225 mask 0x482a. FIFO hit 16384 frames (340 ms) around play/pause -> 0225
+  hard cut to target when >6144 frames over (cuts= in live line).
+- 0225 = claude/speaker-0224 0bdca82, kernel CI 42510127873 (kernel c141e136...), wland CI 42510130899
+  (wland eb04140c...). Image /run/media/dan/MUSIC/ios-sweet-backup/build-0225/shim-boot-0225-speaker.img
+  SHA256 4fe2b8bcc5f4... (USB stick "MUSIC" = PC storage now; /home is FULL). fastboot boot OKAY; service
+  /var/local/bin/wland-0225 started via work/speaker-runtime/run-speaker-0225.py (log /var/local/adsp-0225-*.log).
+  USER listening result PENDING.
+- PHONE ROOT WAS FULL (12 MB free of 16 GiB) -> SpringBoard restart loop. Backed up (sha-verified) + removed old
+  debug dumps (USB ios-sweet-backup/phone-var-local-20261109, phone-var-tmp-20261109). USER then asked for the
+  full userdata size and chose "grow without backup": tools sweet-hfs-grow (userspace/tools/sweet_hfs_grow.c,
+  CI 42509758761, fsctl HFSIOC_RESIZE_VOLUME = _IOW('h',2,u64) on "/") grew the mounted journaled HFS+ root
+  16.00 -> 107.06 GiB (114953269248 B = userdata 114970046464 - 16 MiB: the kernel log ring owns the last
+  4 MiB+4 KiB). 91 GiB free; persisted across the 0225 reboot.
+- Preinstalled apps (USER request): 32 apps in /private/var/staged_system_apps; SystemAppMigrator installs them
+  via InstallCoordination only during data migration. Prefs backed up to USB prefs-before-migration-20261109/
+  prefs.tar; sentinel /private/var/datamigrator/migrate (mobile:mobile) created -> migration runs on the NEXT
+  boot (expect progress UI). If anything resets, restore from prefs.tar. Then restart the speaker service.
+- USER next priority after sound: SLEEP.
+
+## 2026-11-08/09: speaker 0224 (Claude) — latency/stutter/volume fix built; kernel CI running; NOT booted
+- USER (after the 0219 revert): Codex's speaker audio works but stutters, takes 1-2 s to start/stop with video,
+  low volume, thin. Discarded the uncommitted 0222 mkadt.py canvas change (USER: no lower resolution).
+- DIAGNOSIS (code + Codex 0220/0221 live counters, observed): HAL writes on mach time into the kernel ring
+  (`SWEET_PCM_RING_FRAMES` 65536 = 1.36 s, writer never blocks, drop-oldest). The sender refilled only
+  433-486 of 500 DSP periods per 5 s because 1 ms poll sleeps took 17-33 ms under timer coalescing (0221
+  helper: coalescing on avg 18 ms, off 1.0 ms). Consumer ~6% slow -> ring permanently full = the 1-2 s lag
+  (paused/resumed audio waits behind 1.36 s of backlog) + drop-oldest overruns + zero-padded short reads =
+  stutter. Volume: kernel `sweet_aw2032_start` clamped >= 24 dB attenuation; stock Music profile reg5 =
+  2.75 dB (read locally from the private ACF), so playback was ~21 dB under stock.
+- FIX branch `claude/speaker-0224` (from codex/speaker-timer-0221), commit a7c309d, pushed to myfork:
+  wland patch 0018 + userspace/adsp/sweet_pcm_fifo.h jitter FIFO (drain kernel ring each refill, 30 ms
+  prebuffer, rebuffer on dry source, trim backlog unused over two 1 s windows); coalescing off ONLY while the
+  amps play (restored on idle/exit/SIGTERM/INT/HUP); amp idle reset 10 s (was 1 s); 8 DSP slots (was 4);
+  env knobs WLAND_SPEAKER_ATTEN_DB (default 0 = stock), WLAND_PCM_PREBUF_MS, WLAND_SPEAKER_IDLE_MS; 5 s live
+  line gains fifo/max/starts/padded/trimmed/dropped. Kernel: 24 dB floor removed, never louder than the vendor
+  profile. Dropped the never-booted 0218 ISB timer patch so kernel 0224 = 0219 kernel + amp floor change only.
+- Host tests pass locally: FIFO simulation (256..4096-frame HAL cycles, 2/33 ms late wakes, 1.36 s stale backlog:
+  steady FIFO 64-166 ms, no gaps), PCM 8-slot queueing, amp model (stock-level start, fault paths),
+  amp/ring/endpoint/glink checks. Expected total latency ~0.15-0.25 s (FIFO + 80 ms DSP queue), not measured.
+- CI: native sweet-wifi 42507043455 SUCCESS (wland 620366d16e39f9d5..., verified, at
+  work/speaker-runtime/native-0224 -> symlink to /tmp scratch). Kernel xnu 42507039951 in progress (macos-26-intel).
+- DISK: /home is FULL (5 MB free of 61 GB). 0224 artifacts live on tmpfs
+  /tmp/claude-1000/-home-dan-ios-sweet/059c0883-c3ae-45cc-b822-6ab155557f1f/scratchpad/{native-0224,build-0224}
+  (LOST on PC reboot). Nothing deleted; ask USER before freeing space.
+- NEXT: fetch-ci-0224.py + package-0224.py (audio-runtime; outputs to build-0224) -> USER fastboot ->
+  `fastboot -s 21fd1806 boot shim-boot-0224-speaker.img` -> stage-0224.py -> run-speaker-0224.py (one DSP
+  session per boot) -> USER plays video, pause/resume; compare 5 s live counters (completed ~500/5 s,
+  padded/trimmed small). Thin sound NOT addressed beyond volume: suspects iOS d22_speaker_general (iPhone X
+  tuning) and the silent amp I/V-sense input; re-evaluate after the volume fix.
+
+## 2026-11-08 23:05 IST: REVERTED to 0219-speaker (pre-0222, default 1125x2436) — verified; canvas experiments paused
+- USER: "move back to the default resolution, older build, boot the already existing image". Booted
+  shim-boot-0219-speaker.img (the newest pre-0222 image that HAD booted; 0221-timer was never booted) via
+  `fastboot -s 21fd1806 boot` (logs/fastboot-0219-revert.txt OKAY; hash 9c23fbe8c10e... matched its manifest).
+- VERIFIED on boot (fresh section of logs/boot-revert-20261108.txt): boot-args `sweetbuild=219`; log line
+  "AppleCLCD 1080x2400 ... presented as 1125x2436"; backboardd SURF surfaces 1125x2436 bpr 4608; no real panic
+  (gPanicBase debug chatter + `exec DumpPanic` job name only); MobileGestalt REGENERATED: SubType 2436, scale 3.
+- Present stats (busy 10 s windows): copy_avg 3409-6344 us full-frame (was ~20000 us on the 0222/0223 upscale),
+  beam_avg 2667-3607 us with beam_skips=0 — beam alignment works again; 0145-0219 presentation restored.
+- MG cache deleted+synced BEFORE the 0219 boot (backup mg-backup/MobileGestalt.pre-revert-20261108.plist). An
+  interim 0223-xr boot (22:29) was needed ONLY because the fileserver exists only in a booted sweet session and
+  the phone was already in fastboot with a stale XR cache.
+- RECURRING tonight: in-session USB ECM drops (console dead at 22:03 and ~22:32; interface vanished host-side).
+  Self-recovered/was re-asserted at 22:34 (replug era); TCP 2223 + SSH then worked. Same class as the drops noted
+  on the 0203/0205 era. Watch this — 3rd drop today.
+- SEE ALSO the 22:05 entry: 0223-xr second boot; tear diagnosis unchanged: 0222/0223 per-pixel copyScaled = ~20 ms
+  full-frame > 8.33 ms frame → beamWait always skips (log evidence); 0223 only fixed the estimate. IF canvas work
+  resumes: 0224 = fast-copy patch (run-table/NEON inner loop, target <7 ms full-frame) AND/OR a presentcpu=6
+  (A76) repackage A/B — both PARKED by the user's revert decision today. The A/B image was never created; only
+  the verified 0219/0223 images sit in the audio-runtime work dir.
+
+## 2026-11-08 22:05 IST: 0223-xr SECOND boot live and verified (user asked to re-install the last image)
+- The prior session left a pending `fastboot boot` + receiver; the phone entered fastboot ~21:57 IST and
+  `shim-boot-0223-xr.img` (SHA256 990b43a8ee8c20ab... = manifest) booted again: logs/fastboot-0223-xr-2.txt OKAY
+  (Sending/Booting OKAY). Live capture: logs/boot-0223-xr-2.txt.
+- Verified in the log: boot-args contain `sweetbuild=223 ... sweetfb_mode=4`; backboardd surfaces 828x1792;
+  SpringBoard exec'd; 0 panics. Crash counts (known set): PassKitSpotlight 24, assetsd 20, bluetoothd 12,
+  CommCenter 8, driverkitd 4.
+- MG cache on disk = SubType 1792, scale 2 (mg-backup/MobileGestalt.bootstate-20261108.plist) — same-canvas
+  reboot needs no MG wipe. Total time to first console packet 2026-11-08 ~21:57:53 IST.
+- USER verdict on XR canvas (Split828 status bar provider) and tearing after the 0223 copy-speed fix: PENDING.
+
+## 2026-11-08 07:2x-08:1x IST: 0223 XR BOOTED (commit 9415b5a, CI 42402373045); presents live, stable; USER visual check pending
+- 0223 = tear-band fix ("copy-speed statistic in panel rows, not presented" + mode-1 column-map rem loop). CI xnu run
+  42402373045 SUCCESS (head 9415b5a8a2f9...). Kernel downloaded via HTTP-range fetch (8 threads, ~30 s) from artifact
+  13586347051 into /home/dan/Documents/Codex/2026-11-05/new-chat/work/audio-runtime/kernel-0223/
+  (kernel.development.sweet 25b4ff2fa8dd8daf7b5d40566ca67c3274e8f4dbc27b5b71d07c4825fde9901e, SHA256SUMS verified).
+- Packaged with package-0222.py (base shim-boot-0207-dtlog.img 7ca0d7a7...); both variants share kernel 25b4ff2f:
+  shim-boot-0223-hd.img 191961ba9b6cf8f54e58e1bbdf5fd857e4ed27ed1cf19055443e10b1a9339ee4 (750x1624, fresh this session,
+  manifest 0223-boot-manifest.json) and shim-boot-0223-xr.img 990b43a8ee8c20abb1fdba5e4909ecf232a15eef67f88d7f636c45d9b78c99c1
+  (828x1792, manifest 0223-boot-manifest-xr.json; packaged by the previous session 07:15 IST).
+- MG state OBSERVED via fileserver get (192.168.7.2:2223; saved mg-backup/MobileGestalt.bootstate-20261108.plist):
+  ArtworkDeviceSubType 1792, scale 2 (product description string stale "iPhone X"; pixels are the XR canvas) -> the
+  on-disk cache already matched the 828x1792 canvas, so NO MG rm was needed before the xr boot. (Previous MG pulls:
+  .pre-0222/.post-0222b 2026-11-07 evening, .xr 00:29 IST after the 0222-xr test, .now 00:03.)
+- UNRESOLVED EVENT (honest): while I was preparing the boot the device left fastboot and self-booted ~07:26 IST; console
+  captured 07:26-07:45 in logs/boot-0223-xr.txt: system up (SpringBoard exec) but ZERO presents the whole time and the FB
+  thread in idle ticks (callbacks=20/10s = the 500 ms dark-mode tick) - the panel never got any frame; ended back in
+  fastboot ~07:45 (reboot source unknown; no panic text). The manifest was later flipped to booted:true with
+  booted_at_utc 01:59:54Z (= 07:29:54 IST, edited by the previous agent between my first read and now) - so the previous
+  session had booted 0223-xr at ~07:29. Why THAT boot never presented while MY boot of the SAME file does is unexplained
+  (my boot raced through a normal USB attach; the prior session's kickoff was not logged).
+- CONTROLLED RESULT: fastboot -s 21fd1806 boot shim-boot-0223-xr.img (Sending 17636 KB OKAY / Booting OKAY, log
+  logs/fastboot-0223-xr-2.txt); console logs/boot-0223-xr-2.txt (receiver restarted after the server restart killed the
+  first one; its stdout must go to a FILE - the first receiver died of BrokenPipe because nohup left stdout as my
+  closing pipe, NOT a device issue). Boot healthy: SpringBoard exec'd; per 10 s: presents 342-395, present_avg ~23 ms,
+  copy_avg ~20 ms, beam_skips 342-395, coalesced ~320 (numbers in the 0178-era 380-520 range), missed_deadlines 0-2,
+  callbacks=1200 (FB ticks live, unlike the zero-present boot); no panic string; sweet drivers armed (AMP/PCM/CHARGER/
+  GPU audit v2; cmdline = 0219 manifest + sweetbuild=223 + sweetfb_mode=4, 536 B).
+- Known crash set only: bluetoothd, assetsd, PassKitSpotlight (same pc 0x1f9597198 family). Haptics serving iOS
+  ("60 s: 77312 frames, 6 buzzes"). Wi-Fi scanning.
+- AWAITING USER at the phone: (1) status bar has a REAL provider at 828 (no giant red rdar://45025538 bar - the
+  Split828 provider exists); (2) scroll/animate: the horizontal split bands (tearing) should be GONE.
+  If both pass: XR 828x1792 becomes the presentation of record; the 750x1624 HD idea retests on the same fix
+  (shim-boot-0223-hd.img is ready; MG rm+sync required before an hd boot since the disk cache holds 1792 now).
+- Receiver still running: `python3 tools/sweet-usb-log.py logs/boot-0223-xr-2.txt` (from /home/dan/ios-sweet;
+  err -> logs/receiver-0223-2.err, out -> logs/receiver-0223-2.out). Stop it or leave it for live capture.
+- Lesson (REPEATS): agents hand off mid-flight here - check artifact mtimes and manifest booted flags BEFORE re-running
+  packaging/boot steps, and never let a backgrounded script inherit my shell's stdout/stderr pipes.
+
+## 2026-11-07/08: 0222 HD presentation (750x1624) live; MG-cache reset fixed oversized UI; tear noise diagnosed; 0223 building
+- GOAL kept: lower display resolution at the SAME aspect for performance. Kernel patch xnu/patches/0222-sweet-display-hd.patch
+  (commit 2ea20b6, branch codex/speaker-stream-0222, CI 42397350899 green): AppleCLCD presents **750x1624 @2x = 375x812
+  points** (sweetfb_mode=3 default; the exact old iPhone X point geometry/scale at 44% fewer pixels), nearest-neighbour
+  upscaled onto the whole 1080x2400 panel in copyScaled() (rem-accumulator, 64-bit pair stores). `sweetfb_mode=4` same
+  build presents **828x1792** (real iPhone XR/11 panel; there IS a UIKit status-bar provider at width 828, Split828 notch
+  227x32 - the 750 width has NO provider, cf rdar://45025538/45024438). mkadt.py: /chosen display-scale 2, disp0 canvas
+  750x1624 (committed in the worktree; main tree copy still uncommitted).
+- Package: `/home/dan/Documents/Codex/2026-11-05/new-chat/work/audio-runtime/package-0222.py` (now parameterised:
+  --screen hd|x xr adds `sweetfb_mode=4`, --build/--kernel-dir/--commit/--run; B=build number names the artifacts).
+  Outputs used so far: `shim-boot-0222-hd.img` SHA256 7e365a94a561d9343c5924d182d7412721e1f4c55add65d7f0906071bba11da6
+  (Shas: hd ADT e57c4b5cfd19..., xr ADT bff84f59a324... cmdline 0219 manifest + sweetbuild=222, 521 B) and `shim-boot-0222-xr.img`
+  SHA256 8e0a23cb0262084b3a96e9cd1fa3097315014b9738352a8f5340252648fab2cd (ADT canvas 828x1792 subtype 1792 scale 2,
+  cmdline + `sweetfb_mode=4`, 536 B). NOTE: `0222.adt` on disk currently holds the XR canvas (hd variant re-generates
+  on demand).
+- DEVICE RESULT 0222-hd: booted OKAY; first boot showed oversized UI, huge red rdar bar, Control Centre off-centre,
+  flicker. **ROOT CAUSE = MobileGestalt disk cache** (UIKit laid out 1125x2436@3 over the 750x1624 kernel canvas).
+  Fix WITHOUT a rebuild, via the fileserver only: backed the cache up
+  (mg-backup/MobileGestalt.pre-0222.plist), `tools/sweet-files.py rm
+  /private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist`
+  + `sync` + reboot. Verified post-reboot cache: pixels 750x1624, ArtworkDeviceSubType 1624, ArtworkDeviceScaleFactor 2
+  (was 2436/scale 3); cache STABLE mid-session (no cfprefsd re-flush). USER CONFIRMED: **UI size now correct, Control
+  Centre centered - the scale fix is DONE via USB, no build for that part.**
+- REMAINING 1: red rdar status bar at 750 (expected: no Split750 provider). Test in flight: boot 0222-xr (828x1792,
+  Split828 provider exists) - user must reboot to fastboot for `fastboot -s 21fd1806 boot shim-boot-0222-xr.img`.
+  MG cache ALREADY deleted+synced for that boot.
+- REMAINING 2: "horizontal split bands (tearing), only when content moves" (screen tearing). DIAGNOSED from the code:
+  present()'s copy-speed statistic was `copy_ns / h` with h = PRESENTED line height (1624), but the upscaled copy writes
+  2400 PANEL rows: fCopyRowNs ran 1.478x high, beamWait() (which models rows as panel rows) started the copy too early
+  and the scan caught the copy mid-frame - new only in the HD presentation (at 1125x2436 the factor was 2436/2400=1.0,
+  which is why 0145-0219 never showed it). FIX = xnu/patches/0223-sweet-display-copy-speed.patch (commit 9415b5a, CI
+  run 42402373045 running): divide the statistic by the PANEL rows actually written (sweet_fb_scaled_row span), plus a
+  while-loop rem fix for the mode 1 (1125 downscale) column map (sim: 2.5M errors -> 0; 750/828 stay exact). After it
+  goes green: `python3 package-0222.py --kernel-dir kernel-0223 --build 223 --commit 9415b5a --run 42402373045`
+  (put the downloaded kernel in kernel-0223/), shas from the manifest, MG rm+sync FIRST, then fastboot boot.
+- UIKit/RE facts kept: provider match = class nativeDisplayWidth vs screen width AND notch(point) vs exclusion area x
+  scale, eps 0.0001; classes only for 828/1080/1125/1170/1242/1284; message "No status bar visual provider for screen %@
+  ... rdar://45025538". Notch point sizes: 828 = 227x32, 1080 226x34.33, 1125 209x30, 1170 210x32, 1242/1284 209.33x30.
+- Lesson (REPEATS): any canvas change needs the MG cache deleted + reboot, and XNU logs only reach the sweetlog
+  partition (no SSH) - fileserver (port 2223, tools/sweet-files.py put/get/rm/mkdir/link/chmod/sync; no ls; get ERR 2
+  = ENOENT) is the only live channel. Phone in fastboot = 21fd1806.
+- PARKED (0219 era): App Store fix - 0219 sweetstore dylib + XNU injection patch, kern_exec.c:488 apply failure.
+  No new attempt this session.
+
+- Directory `/home/dan/ios-sweet/shim/out/batch-20261106/`; `SHA256SUMS` and `README.md` there. All eight are temporary
+  `fastboot boot` images with the 0207 shim/stock DTB/ADT unchanged; no partition/root changes.
+- 01/02/03/04 Metal native profiles A-D: `sweetmtl=2`, 120 Hz caller rows/async, 120 Hz all rows/sync, 120 Hz
+  kernel import sync/A55 present, 60 Hz 128-byte rows/sync. Builds A/B/D succeeded; C's CI retry was cancelled in
+  the queue, so 03 reuses A's identical-source kernel with C's boot arguments (manifest notes this).
+- 05 speaker 0212: `sweetamp=2` writes the stock 37-register AW882xx L/R sequences and leaves both amps enabled.
+  No `/dev/sweet-audio`/PCM yet. Sidecar `sidecar/wland-0014/wland` (bf568dc9...) sends a 3 s 697/1209 Hz DTMF
+  after `WLAND_AFE=1`; run it after the >50 s amp init. Audibility unverified.
+- 06 sensors/camera 0214: sensor HID services (`sweetmotion=0x77`) plus read-only `kern.sweet_camprobe`
+  (`sweetcamprobe=1`). No real ADSP sensor samples and no camera capture/AppleCamIn yet.
+- 07 iServices 0209: known-good SSH/SpringBoard diagnostic image (`sweetdtlog=akd,adid,appstored,fairplayd.H2`,
+  `sweetservtrace=1`); Apple ID login remains unfixed.
+- 08 media 0211: row-stride candidate; booted previously with Wi-Fi, Safari/video not validated, H264SW SIGBUS not
+  proven fixed.
+- Image SHA-256 (first 16): 01 b49698d0c7cfa97f, 02 021617d37c95f982, 03 a2362cfe52810836, 04 3284ca664ebaf257,
+  05 d66ebbafbc9f8dff, 06 2df52ef2d5012aac, 07 6cfe48cd8e273475, 08 2be69fce130b3fb6.
+- Next: user connects the phone in fastboot; boot 01/02/03/04 for animation smoothness, 05 + wland 0014 for the
+  speaker checkpoint, 06 for sensor/camera registration, 07 for a fresh iServices trace, 08 for Safari/video.
+
+## 2026-11-05 22:45 IST: wland 0013 — ADSP audio PD answers; PRI_MI2S clock, config and port start all status 0
+- wland 0011 (CI 42066647562, wland 25dde74f...): graceful ADSP stop request not acked by the live ADSP;
+  `WLAND_ADSP_FRESH=1` + PAS auth/reset reloads it. The preserved stale GLINK tails stalled the handshake
+  (tx 1056/1072, rx 5504/5504).
+- wland 0012 (commit 2d17298, CI 42067571003, wland 5fc55509...): APR `AVCS_CMD_ADSP_EVENT_GET_STATE` on
+  `apr_audio_svc` + `glink_resync` (backwards head -> RX_TAIL=RX_HEAD; before VERSION TX_HEAD=TX_TAIL). Fresh run:
+  stale tx 0/1080 -> 0/0, rx 0/8 preserved; all 6 channels opened; FastRPC root + sensors PD served 1072 calls
+  (apps_std, sensor-registry reads, persist writes/rename `sns_reg_config`); GET_STATE -> "ADSP state 1 (running)";
+  alive at 12/22/32/42 s, clean at 45 s. The `fastrpc_port_s.c:176` assertion in SMEM item 423 was stale from an
+  earlier boot, not this run. Log /var/local/adsp-0012.log.
+- wland 0013 (commit 51bc78e, CI 42071786308, wland 0da7320f...): `WLAND_AFE=1` sends AFE clock
+  (Q6AFE_LPASS_CLK_ID_PRI_MI2S_IBIT 0x100, 1.536 MHz), I2S config (port 0x1000, 48 kHz, 16-bit, SD0, stereo, WS
+  internal) and device start. All three basic responses status 0: 0x100f3, 0x100ef, 0x100e5. The AFE service APR
+  token is the port *index* 40 (`q6audio_get_port_index(AFE_PORT_ID_PRIMARY_MI2S_RX)`), not the port id. The v1
+  param_hdr is accepted by this ADSP; the v3 fallback (AFE_PORT_CMD_SET_PARAM_V3 / AFE_SVC_CMD_SET_PARAM_V2) is
+  built and host-tested but unused. Fresh run READY after 139 ms (slave-kernel 6), alive the full 30 s. Phone log
+  /var/local/adsp-0013-afe.log. This is docs/audio-plan.md milestone 3's DSP half: the LPASS PRI_MI2S port runs.
+- Still not audible: the two AW88263S amps are powered down (0197 read only their IDs), TLMM MI2S pins
+  49/50/52/51 are not muxed by the kernel, and no PCM source exists. The iOS SweetAudio HAL writes
+  /dev/sweet-audio, which the kernel does not provide; media playback needs ADSP ASM shared-memory playback.
+  Headphone jack (WCD9375 SoundWire/reset/regulators) untouched.
+- xnu 0208 diagnostics: the starved macos-15 run was cancelled (jobs cancelled/skipped) and redispatched on
+  macos-15-intel as run 42069587462 (branch codex/media-0208, commit 81762fb); build success. Not downloaded or
+  booted yet; no Safari fix claimed.
+- Next: (1) find the AW882xx ACF blob in the vendor partition (read-only) and add MI2S pinctrl + a minimal amp
+  power-up/unmute/status driver to xnu, test after `WLAND_AFE` starts; (2) then /dev/sweet-audio + ASM
+  shared-memory playback; (3) WCD9375 jack. No partition writes or root changes.
+
+## 2026-11-05 21:55 IST: wland 0009b on the ADSP; GLINK handshake failure found; 0010 FastRPC port built
+- wland 0009b (CI 42061143817, wland 8192ba0c...): the stale-fatal fix works; a fresh `wland-0009b adsp 45` reached the
+  GLINK edge. IPCRTR did NOT open: the ADSP's first VERSION (1, features 7) is followed ~34 ms later by a reset of its
+  shared tx head to 0 (its early descriptor re-init). The old single-channel link.c then read the zeroed ring as 2047
+  VERSION commands and filled our tx fifo (desc 478 tx head 0x3ff0, tail 0); the ADSP never consumed it. ADSP still
+  ran to the usual sensor-PD dog (SMEM 423, 0xe5). No partition/root changes.
+- Wrote patch 0010 (`userspace/wifi/patches/0010-sweet-adsp-fastrpc.patch`, commit 0713a4b, pushed to myfork
+  claude/audio-0009): `adspedge.c` multi-channel lpass edge (IPCRTR + fastrpcglink-apps-dsp, intents,
+  RX_DONE_W_REUSE, QRTR hook for pdmapper), `fastrpc.c` ported from the sunfish reference (sensors root+sensors PD
+  serving `/var/local/fw/sensors` and `/var/local/fw/dsp`), `adsp_smmu.c` (kernel 0206 PMEM_SMMU: 0x1b23 translating
+  bank IOVA 0x80000000 | 3<<32, other audio SIDs identity). glink.c now bounds-checks the shared indices and, for the
+  ADSP edge, preserves the peer's ends and waits 1.5 s (`WLAND_EDGE_DELAY_MS`) before VERSION.
+- Staged on the phone: `/var/local/fw/sensors` (119 files, 584K) and `/var/local/fw/dsp` (35 libs, 12M); root 200MiB free.
+- CI wland 42063984265 (branch claude/audio-0009) queued at 21:57; install as wland-0010 and test with
+  `WLAND_NO_RPC=1 ... adsp 20` first (channels), then `adsp 60` (FastRPC). Reattach after a crash needs a fresh ADSP.
+- USER also asked to fix Safari audio/video playback together. Media diagnostics 0208 was pushed (commit 81762fb,
+  branch codex/media-0208; previously blocked, now accepted) and xnu CI 42064161965 queued; boot it after the ADSP
+  milestone to reproduce the mediaserverd/backboardd faults once. Diagnostic only, no fix claimed yet.
+
+## 2026-11-05: USER switched from sideload to native Apple ID/App Store; actual ADI error captured
+- Sideload PAUSED by USER. EeveeSpotify files copied to /Applications/EeveeSpotify.app (884 SHA256s matched),
+  registration FAILED with MCMErrorDomain 98 NOT_CODESIGNED; no launch. Temporary helper and registration plist
+  removed. No cache deleted; small cache backup verified locally. Last free filesystem space ~202 MiB.
+- USER entered fastboot. Temporary 0207-iserv boot accepted (Sending + Booting OKAY), no flash.
+  Image is workspace work/iserv-runtime/shim-boot-0207-iserv.img, SHA256
+  5ecdef977707afc6606f642945e739fbc5f62c8a98bb18ff66d05102054ec875.
+  Only logging args/header checksum changed from 0207-dtlog; kernel/ADT unchanged; cmdline 585 bytes,
+  sweetdtlog=akd,adid,appstored,fairplayd.H2. Existing UDP receiver retained; raw captures stay private.
+- Wall clock reset to 1970 after boot; corrected to current host UTC. Native Foundation TLS reached Apple
+  authentication host (HTTP 404 test path, certificate validation enabled); SecRandomCopyBytes returned 0.
+- USER then reproduced "Verification failed MD is invalid" and Store "forever stuck in loading".
+  Native akd: provisioning start/end HTTP 200; ADIProvisioningStart succeeded; ADIProvisioningEnd -42410.
+  Error chain AKAnisetteError -8004 -> AKUnderlyingADIErrors -42410. Meaning unresolved; no fix claimed.
+  Separate activation-record/BAA errors observed. appstored bag timeout ASDErrorDomain 515; fairplayd.H2
+  repeatedly starts; exact exit cause not yet captured. Do not equate HTTP 200 with successful provisioning.
+- Entitlement-limited synthetic probe got NSCocoaErrorDomain 4099 from anisette XPC and -34018 keychain;
+  these probe failures do not establish the native Settings/keychain cause. All probes removed after runs.
+- Isolated worktree workspace/work/iserv-diagnostics, branch codex/iserv-diagnostics, commit b9c1a64:
+  0209 bounded syscall-number/errno + exit-code diagnostics for adid/fairplayd.H2, boot-arg sweetservtrace=1,
+  default off. No payloads, paths, IDs, auth/signing/activation changes. Patch apply check passed;
+  full compile and hardware test pending. Native nonlocal BSD returns/Mach traps are outside this first probe.
+- Asked specific approval to push this branch to DC28088/ios-sweet + Actions build because earlier automatic
+  review rejected project diagnostic uploads without explicit payload/destination authorization. NO PUSH/CI YET.
+  Next after approval: build 0209, package same hardware baseline + sweetservtrace=1; test once.
+- Updated user-facing outputs/iServ-Notes.md in current chat workspace. Raw logs/firmware/credentials not committed.
+
+## 2026-11-05 20:01 IST: 0207 YouTube reproduction crashes; 0208 diagnostics prepared, external build awaiting approval
+- USER: YouTube in Safari caused a visible SpringBoard restart. Captured private logs/boot-0207-dtlog.txt:
+  mediaserverd repeatedly SIGBUS at unslid H264SW.videocodec PC 0x1f0f4c914 (str q0,[x10,x3]), bad destination
+  in prot 5/5 shared-region mapping; backboardd SIGSEGV in a copy from IOSurface shared state while reading EDR metadata.
+  The source of the bad pointers is not established. Prior NSNumber/objectForKey exception absent in this capture.
+- Isolated worktree /home/dan/Documents/Codex/2026-11-05/new-chat/work/media-0208, branch codex/media-0208,
+  commit 81762fb: bounded media surface mapping/plane diagnostics + mediaserverd/backboardd fault argument registers.
+  Syntax checks 0/2 failed; patch apply --check passed against research/buildtree-0195/xnu. No behavior fix claimed.
+- Push to DC28088/ios-sweet + xnu.yml dispatch was rejected by automatic approval review; neither ran.
+  Need USER approval for this specific branch/payload/build. No CI run ID or new image exists. Phone remains on 0207.
+- Next after approval: push isolated branch, dispatch on macos-15-intel, package 0208-dtlog and reproduce once.
+  Speaker FastRPC work and saved sensor files unchanged; no partition flash or root modifications.
+
+## 2026-11-05 19:48 IST: Codex resumed Claude: sensor files pulled read-only; 0207-dtlog booted
+- USER: continue Claude handoff; phone in OrangeFox; pull sensor files first, then boot completed image.
+- Mounted vendor EROFS read-only at /mnt/sweet-vendor-readonly; copied etc/sensors (119 files) and lib/rfsa/adsp
+  (35 files) into ignored research/sensors-0207/vendor. Verified all 154 file SHA256s against the device
+  (12,591,771 bytes total); manifest pull-manifest.json + device-SHA256SUMS. Unmounted afterwards. No partition writes.
+- Both xnu runs 42040394031 / 42040400391 SUCCESS, head 79f8745315553c6de395afb10b7d3409016d550e.
+  Verified local kernel SHA256SUMS, boot-image header and diagnostic markers. Temporary fastboot boot of
+  shim/out/shim-boot-0207-dtlog.img returned OKAY; image SHA256
+  7ca0d7a7f283adf831d6c0b2dda61bb36a5176781664a93e952d89b7d2cd327d.
+- Existing USB receiver PID 88195 retained; it appends to logs/boot-0205-dtlog.txt. Start offset 14082211,
+  recorded in research/sensors-0207/0207-boot-start.json. Extracted new segment to logs/boot-0207-dtlog.txt.
+  Early capture 755715 bytes: sweetbuild=207 confirmed, SpringBoard/backboardd/mediaserverd each exec once,
+  no matching crashes for those processes or panic in that capture. USB SSH works; all three processes alive.
+- Asked USER to test Safari YouTube with Bluetooth headphones. Playback success NOT established yet.
+  Sensor files are saved on the host only; FastRPC listener port/install and ADSP sensor-PD survival remain pending.
+  Speaker/jack/mic still need that work. No builds dispatched/cancelled and no firmware/config files published.
+
+## 2026-11-05 19:35 IST: USER priorities after today; Safari media root cause; 0206/0207 building
+- USER order: speaker (ADSP) -> sensors -> GPS -> Apple ID / iServices. Sensors share the ADSP work (SEE sensors PD
+  over FastRPC); GPS = modem LOC (QMI) + locationd; Apple ID needs Apple hardware attestation (FairPlay/SEP/device
+  certificates): not to be spoofed (DRM/attestation circumvention); only non-attested paths can be checked.
+- USER also: tap to wake; resize the 16 GiB iOS volume to the ~107 GiB userdata partition (kernel's HFS+ has
+  HFSIOC_RESIZE_VOLUME; full 16 GiB backup first), then let SystemAppMigrator install the 32 staged apps
+  (/private/var/staged_system_apps, 496 MB; root has 231 MiB free: not before the resize).
+- Safari/YouTube/web media root cause (0205 sweetdtlog + research/dsc local symbols): mediaserverd
+  "-[__NSCFNumber objectForKey:]" in VideoToolbox (FPSupport_ShouldApplyVideoTrackMatrix -> IOService
+  DisplayPipePlaneBaseAlignment, CFDictionaryGetValue "PlaneBaseAlignmentLinear"); SweetFramebuffer published a bare
+  number since 0046. xnu 0207 publishes {PlaneBaseAlignmentLinear = 64}. 0206 = PMEM_SMMU for the ADSP port.
+  claude/pm-merged CI 42040394031 / 42040400391 (intel) -> shim/out/shim-boot-0207-merged.img (+ 0207-dtlog).
+- USB link dropped twice on 0203/0205 while the user used the phone (replug fixes it); suspect 0200's dark USB
+  20 ms poll, not proven.
+
+## 2026-11-05 18:40 IST: wland 0008 `adsp` on 0204: ADSP READY, then the same sensor-PD dog; MODEM SURVIVES now
+- wland 0008 (commit eee43ef; CI sweet-wifi 42032699830, wland 1ec27069...; on the phone as /var/local/bin/wland-0008, boot
+  wland unchanged): ADSP SMP2P items fixed to in 443 / out 429 (0006/0007 had them swapped; the modem's <435 428> proves
+  qcom,smem = <in out>) + "sleepstate" entry (ios-flame adspboot au14). Run `wland-0008 adsp` (log /var/local/adsp-0008.log):
+  votes lcx 5 / lmx 4 -> 0, out item 429 "master-kernel" 0 "sleepstate" 1, PAS 1 init/mem/auth all 0/0, 19586305 bytes,
+  QMP acked; "glink: the remote has no rx fifo (item 480)", "no GLINK link in 10 s" -> exit (0007 has no READY wait).
+- Read-only after (`wland-0008 item N 2`): ADSP out item 443 = "smp2p" 0, "slave-kernel" 7 (READY + unvote + ERR-FATAL),
+  "sleepstate_see"; item 480 now exists (the ADSP's FIFO came later than our 10 s); crash item 423: "err_qdi.c:1040:EF:
+  sensor_process:0x1:TMR_CLNT_1:0xe7:dog_virtual_user.c:240:USER-PD DOG detects stalled initialization" (as 0195).
+  MODEM: slave-kernel 6 (fine), cellular + Wi-Fi traffic continue (0195: modem fatal with the ADSP).
+- Next (sound): the sensor PD needs its registry/config files over reverse FastRPC (ios-flame adspboot fastrpc.c, au10-au15;
+  postmarketOS hexagonrpcd): a FastRPC listener on fastrpcglink-apps-dsp + a translating SMMU bank for SID 0x1b23 (sweet
+  DT: audio-ion 0x1b21, fastrpc cbs 0x1b23-0x1b28 = sunfish's) - kernel side on sweet (userland apps-SMMU access stalls a
+  CPU here) - + sweet's /vendor/etc/sensors files (not pulled yet; read-only OrangeFox pull needs the USER's OK).
+  Also: wland waits >10 s for GLINK, with a READY wait first.
+- Also today: YouTube/web media don't play: mediaserverd aborts on Safari media (0202-0204); xnu 0205 (sweetdtlog) builds
+  to read its os_log. backboardd SIGSEGV twice during the UFO test (parked by the USER).
+
+## 2026-11-05 17:00-18:10 IST: 0202 + merged 0203 on the phone: panel sleep WORKS; haptics/BT audio/charger in one image
+- 0202 (logs/boot-0202.txt): 28/10 in HS ("dcs 0x28 HS sent ... ack_err=0 timeout=0 dma_ctrl=0x14000000"; ABL's DMA_CTRL
+  was LP|embedded), 11/29 LP, 6 cycles. USER: "the display sleeps and wakes normally"; a crack line on the panel stays lit
+  (on Android it goes dark).
+- 0203-noblack (shim/out/shim-boot-0203-noblack.img ebca12b4, sweetpanelblack=0: no black fill, DCS only). USER: lock
+  screen "cannot see at all" -> DCS 28/10 in HS really turn the panel off; the lit crack line = panel rails still
+  powered. Next for full Android-like off: panel regulators/ELVDD + reset (research the K6 DT supplies first; risky).
+- 0203 merged (claude/pm-merged = 0196-0203 stacked; CI 42020549243 on macos-15-intel: FIRST kernel built on Intel,
+  works; the arm run 42019079955 was never given a runner. Image shim/out/shim-boot-0203-merged.img 769056ad, kernel
+  3763cab9, extra args sweetvaudio=1 sweetcharge=2 sweetchgsdp=900; panel sleep default on, taps 30 ms at the DT drive
+  0x6a, sweethapscale=1 = old scaling). Boot 18:02: charger SDP 900 mA + FCC 2000 again, haptics served, panel cycles
+  clean. USER: "the tap haptics feels alright".
+- Open: speaker/jack/mic (ADSP path, wland 0007 not installed), full panel power-off (crack line), tap to wake (USER),
+  charging check on a wall charger / below 99 %, Wi-Fi not joining (wland scans), CommCenter loop seen on 0197.
+
+## 2026-11-05 16:15-16:55 IST: hardware results of 0199/0200/0198/0197 (USER at the phone, PC USB)
+- 0199 charging (logs/boot-0199.txt): "source SDP (apsd 0x1, typec 0x8, aicl on): target 900 mA"; ICL 0x1370 0x0a -> 0x12
+  (500 -> 900 mA, ICL status 900), FCC 0x1061 0x1e -> 0x28 (1500 -> 2000 mA), all read back, no SPMI errors. Battery 99%:
+  no charging gain measurable (one -428/-477 mA sample under load). Still to test: wall charger / lower battery.
+- 0200 sleep (logs/boot-0200.txt): 11 lock/wake cycles; DCS 28/10 "sent" (DMA done) ~178 ms, 11/29 ~128 ms, CPU dark rows
+  A55 row 4 1248 MHz / A76 row 1 652.8 MHz, pollers slowed/restored each time. USER: "it never actually sleeps. the
+  screen goes very dark" = iOS's min brightness (DCS 0x51 level 8) with the panel still on; touch stopped while dark (by
+  design), works after unlock. Cause (guess): K6 DT off-command-state "dsi_hs_mode", 0200 sent them LP. -> xnu 0202
+  (claude/sleep-0200, CI 42014904260, image shim/out/shim-boot-0202.img 9137f57b): 28/10 in HS, ACK_ERR logged per
+  command, one black pass on display off. USER wish (later): tap to wake.
+- 0198 haptics (logs/boot-0198.txt): VirtualAudio moved in at 180 ms after root mount (before mediaserverd);
+  mediaserverd stable with it; "open by mediaserverd[28]", 73 buzzes/min while the USER typed, 0 faults, 0 capped. USER:
+  "haptics works fine now. no delay, the strength is normal. tho a quick strong buzz would make it much better".
+- 0197 audio (logs/boot-0197.txt): both AW882xx answer: TOP 0x34 and BOT 0x35 chip ID 0x2032, regs 01=0000 02=0100
+  03=ffff 04=4003 05=0038 (powered down). USER: Bluetooth headphones: keyboard clicks play in the headphones (HCI tx 13.6 KB
+  -> 101.8 KB) = BLUETOOTH AUDIO WORKS. Speaker silent (expected: no ADSP path). Settings > Sounds opens very slowly,
+  Control Center slow; this boot had a CommCenter crash loop ("Unable to communicate with AppleBaseband driver" x15+,
+  0 SWEET BB lines although wland logged "bb READY"; seen x2 on 0191b/c before) - not from 0197 (started before the amp
+  probe). Wi-Fi still not joining (wland scans fine). bluetoothd crashes 3x per boot (reason 1201) on every image.
+- VirtualAudio is now enabled ON DISK (persists). Test file /var/mobile/Containers/Shared/AppGroup/4B73F233-.../File
+  Provider Storage/sweet-bt-test.wav (30 s tones; no Files app in this build).
+
+## 2026-11-05 09:30 IST: audio / haptics / charging / sleep: four test images (0197-0200) built, NOT booted yet
+- USER (08:15, away 8 h, phone not connected): fix audio (speaker, headphone, BT audio, mic), haptics, charging, sleep +
+  power management; each its own CI build and boot image; the USER tests all four together, then merge.
+  USER (mid-session): "the 3 buzzes were felt in last boots" (sweethaptic=2/3 test buzzes work).
+- Reference used: Yofuness/ios-flame main (Pixel 4a sunfish, same SM7150 + PM6150; MIT) cloned read-only to
+  research/flame-sunfish-20261105/main (docs/features/{audio,haptics,charging,sleep-wake}.md, xnu 0242/0257 dark idle).
+  Xiaomi sweet-r-oss smb5-reg.h/smb5-lib.c/qpnp-smb5.c, Linux pinctrl-sm7150.c, gcc-sm7150.c in research/ref-20261105.
+  0195 CI build tree (patched source) in research/buildtree-0195 (own git repo: branches p0196..p0200, pall).
+- Local syntax check without a Mac: pip libclang in the session scratchpad + tools/xnu-cc.py's command extraction
+  (fake clang that parses with libclang); catches compile errors in seconds. Not a link check.
+- Findings from old logs (observed): 0195 "SWEET HAPTIC: serving /dev/sweet-haptic (0 frames written so far)": iOS never
+  played anything on the Actuator. VirtualAudio.plugin sits in /Library/Audio/Plug-Ins/HAL.disabled since image v12.
+  sunfish: VirtualAudio + their HAL driver = AirPods music (U11) and Actuator haptics (hp3); VirtualAudio only makes
+  devices for UIDs "Actuator"/"Null_Device". Guess: the same blocks sweet's haptics AND Bluetooth audio.
+  0195b battery lines on USB at 14%: "-122mA external=1 charging=1" (positive = charging): fast-charge state but the
+  battery drains -> input current limit below the load. Display "off" = CPU fade only, panel lit, all pollers at full
+  rate, CPUs pinned at the top LUT row all the time (SweetCPU writes PERF_STATE once at boot).
+- Cmdline is 594 of 607 bytes (mkpayload truncates silently!). The new images drop sweetgles=0 (default) and
+  sweetoslog=CommCenter (cellular debugging only): 560 + extras.
+- Patches (each applies on 0196 alone; branch per feature, from claude/pm-base-0196 = codex/cellular + 0196):
+  - 0196 sweet_audiohal.c: sweetvaudio=1 renames HAL.disabled/VirtualAudio.plugin -> HAL/ at boot (only if
+    SweetAudio.driver exists; kills mediaserverd once if it already runs); sweetvaudio=0 moves it back. PERSISTENT.
+    Undo by hand: mv /Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin /Library/Audio/Plug-Ins/HAL.disabled/
+  - 0197 (claude/audio-0197) sweet_amp.c sweetamp=1: AW882xx TOP 0x34/BOT 0x35 chip-ID probe on QUP0 SE4 (gpio53/54
+    qup04 WEST, resets gpio64/72 NORTH, wrap0 s4 clocks), read only, reset + pins restored.
+  - 0198 (claude/haptic-0198): CONT mode registers written once; per buzz 5 writes; taps >= 40 ms (sweethapmin=MS);
+    "SWEET HAPTIC: open by NAME[pid]", "first sound from iOS", 60 s stats.
+  - 0199 (claude/charge-0199) sweet_charger.c + sweet_spmi_write (whitelist 0x1042 0x1061 0x1340 0x1342 0x1365 0x1366
+    0x1370 0x1643, EE0-owned APIDs only, retry on collision): sweetcharge=1 dumps/status, =2 sets ICL from Type-C Rp /
+    APSD (Rp3A 2000, Rp1.5A/DCP/CDP/QC 1500, float/OCP 1000, SDP sweetchgsdp=500|900|1500 only with AICL on), cap
+    sweetchgmax=2000, FCC raised to 2000 only if lower, unsuspend, charge enable if disabled, watchdog pet. FV/JEITA
+    never written. Lines "SWEET CHARGER: ...".
+  - 0200 (claude/sleep-0200) sweet_dark.c (from ios-flame 0242/0257, MIT): on RequestPowerChange(0): panel DCS 28/10
+    (sweetpanelsleep=1; wake 11, 120 ms, 29, brightness resent; a failed DCS -> old CPU fade), USB 20 ms poll after 2 s
+    quiet, USB log 250 ms, touch stopped, keys 40 ms, FB tick 500 ms after 5 s, CPU rows A55 <=1248 MHz, A76 <=652.8
+    MHz (sweetdarkclk=0 keeps). sweetdark=0 disables all. Lines "SWEET DARK:", "SWEET PANEL:", "SWEET CPUFREQ: dark".
+  - claude/pm-merged: the same four stacked (0199/0200 rebased, only diff context differs) for the combined image.
+- CI (DC28088/ios-sweet xnu.yml): all SUCCESS on macos-15, ~10 min each, first try:
+  0198 haptic 41961918212, 0199 charge 41962252752, 0200 sleep 41962689785, 0197 audio 41963332686, merged
+  41963950021; wland 0007 sweet-wifi 41963473750 (macos-15-intel) -> research/wifi-41963473750 (wland 9c1e4e23...).
+  Kernels in xnu/out-0197..0200, xnu/out-0201-merged (SHA256SUMS checked). Downloads: the plain artifact download crawls
+  (~50 KB/s); fetch only the kernel member of the zip with HTTP ranges (scratchpad kget.sh/zipget.py; 90 s).
+- Images (research/pm-0196/package.py N KERNELDIR 'extra' MARKER; 0195 shim/DTB/ADT sweet-0189.adt): 
+  | image (shim/out/) | kernel | image SHA256 | extra boot-args |
+  |---|---|---|---|
+  | shim-boot-0197.img audio | 14072eed | c8db1c9a... | sweetvaudio=1 sweetamp=1 |
+  | shim-boot-0198.img haptics | 5a85776d | 12f8274b... | sweetvaudio=1 (sweethaptic=3 as before) |
+  | shim-boot-0198-vaoff.img revert | 5a85776d | c90002ea... | sweetvaudio=0 (moves VirtualAudio back out) |
+  | shim-boot-0199.img charging | 3fdb2c26 | 8040f6c8... | sweetcharge=2 sweetchgsdp=900 |
+  | shim-boot-0200.img sleep | 9e142c54 | 440fcafa... | sweetpanelsleep=1 (sweetdark/sweetdarkclk default on) |
+  | shim-boot-0201-merged.img all | 43c907a1 | d0c71ab8... | sweetvaudio=1 sweetcharge=2 sweetpanelsleep=1 (606 bytes: no room for sweetchgsdp=900) |
+- NOT done / honest state: speaker, wired headphones and mics need the ADSP audio path (APR/AFE, WCD937x over
+  SoundWire); the ADSP crashed the modem on 0195 (sensor PD stall) and wland 0007 (lpass edge: QRTR, pd-mapper, tftp)
+  is only now built (CI 41963473750, success, not installed). 0197 only proves the amp I2C bus. Next for sound: install
+  wland 0007 as /var/local/bin/wland-0007 and run `wland adsp` with it (USER present, modem may crash -> reboot), then
+  APR (milestone 2). sunfish's phone/wifi/adspboot.c (MIT) has a working ADSP+APR+AFE+ASM speaker path to port.
+- Test plan for the USER (all temporary `fastboot boot`, no flashing):
+  1. charging 0199: plug a wall charger, then the PC; watch the battery % rise; log "SWEET CHARGER: source ... target"
+     and the status lines (icl cfg/now, mA in SWEET BATTERY lines should turn positive).
+  2. sleep 0200: lock with the power key: screen fully dark (panel off), wake with power key: picture back, touch works;
+     leave locked 10+ min and compare battery drop with an older image.
+  3. haptics 0198 (moves VirtualAudio in!): Settings > Sounds & Haptics switches, keyboard, long-press: buzz.
+  4. audio 0197: Bluetooth headphones: play music; log "SWEET AMP: TOP @0x34: chip ID ...".
+  If mediaserverd/backboardd misbehave after VirtualAudio moved in: boot the sweetvaudio=0 image (VAOFF) or mv it back.
+
+## 2026-11-04 21:10 IST: Wi-Fi broken since wland 0005 boots (suspected); boot wland reverted to 0004 for a test
+- USER: "wifi doesn't toggle on". Kernel logs: Wi-Fi scans in boot-0190b/0190c/0191 (wland 0004), none from 0191b on (first
+  boot with wland 0005; also the first boot after the battery ran flat). On 0195b the modem never announces WLFW (0x45) in
+  330 s; pd-mapper is only asked tms/pdr_enabled and tms/pddump_disabled; cellular registers fine.
+- Test: /var/local/bin/wland = 0004 (ef9a6d24) again; 0005 kept as /var/local/bin/wland-0005, 0006 as wland-0006. Next boot shows
+  whether 0005 broke the WLAN PD start. IPA work (0005) is paused anyway (sweetipa off since 0195).
+- wland 0007 builds: 41852158214 cancelled twice in the runner queue (once by the USER); redispatched 41857731941 (intel) and
+  41857741378 (macos-15), first success wins.
+
+## 2026-11-04 19:55 IST: 0195 booted; ADSP runs but its sensor PD stalls -> ADSP fatal -> MODEM fatal (Wi-Fi/cell down)
+- Image shim/out/shim-boot-0195.img 182f95b2 (kernel 0195 = 0194 + lcx/lmx; no sweetipa), boot 19:48:32, logs/boot-0195.txt.
+  (Downloaded in 8 parallel byte ranges from the artifact's signed blob URL: the plain download kept timing out.)
+- `wland adsp` with the votes: wland asked level index 15 (16 table slots) -> ERANGE (34); real tables: lcx.lvl
+  {0,16,64,128,256,384} (top index 5), lmx.lvl {0,16,128,256,384} (top 4). Voted 5/4 by hand (0), adsp-shutdown 0/0, boot again:
+  PAS all 0/0, QMP acked, still no SMP2P item 429 in 30 s. TODO in 0006: vote the highest nonzero level like boot_modem.
+- SMEM crash reasons: item 423 (LPASS) "err_qdi.c:1040:EF:sensor_process:0x1:TMR_CLNT_1:0xe7:dog_virtual_user.c:240:USER-PD DOG
+  detects stalled initiali[zation]" -> the ADSP root PD runs, its sensor user PD waits for AP services (QRTR on the "lpass" GLINK
+  edge: pd-mapper/servreg, sensor registry files) that do not exist yet, the PD watchdog kills the ADSP.
+  item 421 (modem) "glink_channel_migration.c:667:Assertion status == GLINK_STATUS_SUCCESS failed" (wland: smp2p modem state 7
+  ERR-FATAL at 85 s) -> the modem died with the ADSP: no Wi-Fi/cellular until reboot (USER: "wifi doesn't toggle on").
+  WLFW (0x45) had not appeared on this boot before the crash either (unexplained).
+- RULE: do not boot the ADSP again before wland serves the lpass edge (GLINK + QRTR + pd-mapper/servreg), milestone 2.
+
+## 2026-11-04 19:20 IST: lower-resolution experiment (USER asked; no build): IOMobileGraphicsFamily canvas override crashes backboardd
+- Wrote /private/var/mobile/Library/Preferences/com.apple.iokit.IOMobileGraphicsFamily.plist {canvas_width 720, canvas_height
+  1600} (mobile:mobile 644) and restarted backboardd on 0191d: backboardd rendered at 720 wide (A8 uploads 720x79), then
+  SIGSEGV far 0x18 (pc outside the shared cache, likely our SweetNativeMetal bundle), crash loop.
+- Revert: plist moved to /var/local/IOMobileGraphicsFamily.plist.720x1600; it kept crashing until cfprefsd was killed (cached
+  value), then backboardd + SpringBoard stable. Lesson: after editing a preferences plist by hand, restart cfprefsd first.
+- Making a lower render size work needs code in the Metal backend/present path (a build); not done.
+
+## 2026-11-04 18:15 IST: sound track started (USER: "lets try to fix the sound"); ADSP first boot attempt
+- USER also asked whether iOS 26 can boot: answered no in practice: iOS 17+ ships only arm64e (pointer authentication, A12+);
+  the SM7150's A76/A55 are ARMv8.2 without PAC, so arm64e system code would trap on non-HINT PAC instructions. iOS 16.7 (iPhone X,
+  arm64) is the ceiling.
+- wland 0006 (userspace/wifi/patches/0006-sweet-adsp-boot.patch, CI 41828902686): generic pas_load(); `wland adsp` boots the ADSP
+  (PAS 1, pil_adsp_region 0x95700000+0x2600000, QMP load_state adsp, SMP2P host 2 item 443 out / 429 in, IPC bit 26) and waits for
+  slave-kernel ready; `wland adsp-shutdown` = PAS shutdown 1. Installed as /var/local/bin/wland-0006 (boot wland unchanged).
+  ADSP firmware copied to /var/local/fw/adsp (28 files, sha256 readback OK). Root fs 97% full (585 MiB free).
+- Run on 0191d: PAS 1 init 0/0, mem setup 0/0, 19586305 bytes loaded, QMP acked, auth+reset 0/0, but no SMP2P item 429 in 30 s
+  (SMEM host 0-2 partition: 443 478 480 606 611). Kernel refused lcx.lvl/lmx.lvl ("not a Wi-Fi/modem resource").
+- **xnu 0195** (on top of 0194; CI 41829326191, branch claude/audio-0195): sweet_rpmh_write allows lcx.lvl/lmx.lvl. Package
+  research/audio-0195/package.py, cmdline WITHOUT sweetipa (sweetbuild=195). xnu 0194 CI 41828548344 (codex/cellular, with the
+  BearSSL GitHub-mirror fallback in 0020-stage-bearssl.sh) is the IPA retest (sweetipa=1).
+
+## 2026-11-04 17:45 IST: 0193: SMMU fixed, IPA setup COMPLETE, pdp_ip0..3 exist; INIT_DRIVER -> panic; 0194 building
+- Image shim/out/shim-boot-0193.img 2573725a (kernel 0edeae2f; first CI run failed fetching BearSSL, 502; rerun OK). Boot 17:26:45,
+  logs/boot-0193.txt. SMMU: "IPA stream 0x520 -> CB5 via SMR7", "0x522 -> CB5 via SMR8", 0 refused -> ok (so 0192's failure was
+  the mask-2 SMR, not SMR7 itself). GSI setup, "endpoints programmed, command channel up, memory and tables set", "LAN RX endpoint 8
+  up with 251 buffers queued ... setup complete". pdp_ip0..3 registered (iOS asks SIOCGIFMEDIA on them constantly).
+- Modem side: QMI INDICATION_REGISTER (0x20) from 0:0x31 answered; modem announces IPA service 0x31 QRTR instance word 0x201 at
+  0:0x2e; the modem's SMP2P in-item has no "ipa" entry (only smp2p, slave-kernel): no clock query on this firmware.
+- BUG (ours): sweet_ipa_new_server passed version_instance >> 8 to ci_is_modem_service (wants the word, 0x201) -> INIT_DRIVER
+  never sent. Injected a corrected NEW_SERVER record via printf > /dev/sweet-bb: "modem IPA service at 0:0x2e", "INIT_DRIVER 108
+  bytes ... queued 0" -> the kernel PANICKED (USER: "panic (CPU 3 Caller 0xfffffe0..."; rest not captured; the persistent log
+  pulled via OrangeFox to logs/persist-0193.txt ends earlier, flush #21). Cause unknown.
+- Earlier: SpringBoard restart on 0191c left the lock screen unusable (USER); likely the CPU stalled by the sweet-pmemrw SMMU read
+  holding sweet_pmem_lock. Phone back on 0191 (17:38, logs/boot-0191d.txt).
+- **xnu 0194** (CI 41826953507): instance word fix; prints new pending IPA/GSI interrupt sets (64 max), each QMI arrival, each
+  modem-start step; SIOCGIFMEDIA on pdp_ip quiet. Package research/ipa-0194/package.py (sweetbuild=194 sweetipa=1).
+  Ask the USER for a photo of any panic screen.
+
+## 2026-11-04 16:40 IST: 0192 booted (first IPA run): config + GSI firmware OK, commands time out, SoC reset; 0193 building
+- Image shim/out/shim-boot-0192.img 6328378c (kernel c9dc2195, sweetipa=1), boot 16:22:01, log logs/boot-0192.txt.
+- Observed: "BCM IP0 addr=0x500a4 unit 40 width 8: 100000000 Hz -> level 2500 vote 0x600009c4 -> 0"; SN11/SN0/CN0 votes 0;
+  IPA registers readable (no bus hang): SHARED_MEM_SIZE 0x415 (mem_offset 0, size 0x2000), FLAVOR_0 0x8090811 (8 TX, 9 RX from 8),
+  configured. wland: PAS 15 init/mem-setup/auth all 0/0, 12488 bytes at 0x97f00000. GSI: HW_PARAM_2 0xe4046b59, 11 channels/
+  rings, setup done. Then "4 commands (first opcode 0x9) not completed; channel state 0x10f0010a" -> setup failed -60.
+  SMMU: "IPA 0x520/0x2 -> CB5 via SMR7: SMR 0 S2CR 0x5 ... sCR0 0x250406 -> NOT as written" (sCR0.USFCFG=1: unmatched streams
+  fault). WLAN on the same boot: SMR6 0x80010240 ok. Modem then booted normally (cellular up); ~70 s later the SoC reset with no
+  log line (no panic text); phone came back through ABL to fastboot. Guess: the IPA DMA blocked by the SMMU tripped a secure
+  watchdog. Not verified.
+- Userland apps-SMMU reads through /dev/pmem (new tool userspace/tools/sweet-pmemrw.c, CI 41817644973) stalled a CPU on 0191c
+  (process stuck in R, unkillable), as 0141 did for wland: do not read 0x15000000 from userland.
+- **xnu 0193** (CI 41818191058): one SMR per DT stream (0x520/0, 0x522/0), write+readback per candidate SMR, refused ones cleared;
+  the IPA is not touched unless both streams are in place. Package: research/ipa-0193/package.py (sweetbuild=193 sweetipa=1).
+
+## 2026-11-04 16:10 IST: phone battery ran flat on 0191 (USER); 0191 rebooted with wland 0005 installed
+- wland 0005 (CI 41764334978, bfb1477b...) INSTALLED at /var/local/bin/wland; previous 0004 ef9a6d24 kept as
+  /var/local/bin/wland.before-0005 and research/cell-install-0192/wland.before-0005.
+- Boot 0191b (16:08:22, logs/boot-0191b.txt): on a kernel without 0192, wland logs "ipa: no answer from the kernel for step 7",
+  data path off, modem ready after 100 ms, bb READY; SIM ready, registered home. So 0005 is safe on older kernels.
+- USER: battery ran out ("we need to figure out proper sleep, and power management later") -> TODO list: sleep/idle power,
+  charger configuration (battery drained even though connected).
+- NEXT: boot shim/out/shim-boot-0192.img (6328378c..., kernel CI 41764330464 c9dc2195..., cmdline + sweetipa=1, sweetbuild=192).
+
+## 2026-11-04 09:05 IST: 0191 booted: binds held + answered, no ATCS reset
+- Kernel CI 41763340271 -> xnu/out-0191 8770fc0d...; image shim/out/shim-boot-0191.img 716767a7... (0190 shim/ADT/cmdline,
+  sweetbuild=191); fastboot boot 09:00:10, log logs/boot-0191.txt. DPM open 0 / WDA 0 (raw IP, QMAPv4 both ways), "21 held
+  bind(s) sent, 0 dropped"; 11/11 WDS 0xa2 answered; 0 ATCS_TIMEOUT; SIM ready; registered home. "context is not assigned"
+  remains (no pdp_ip in 0191). xnu 0192 CI 41764330464 SUCCESS (compiled first try); wland 0005 CI 41764334978 success.
+- /var/local/fw/ipa/ipa_fws.{mdt,b00-b04,elf} copied to the phone (sha256 readback OK; new directory).
+
+## 2026-11-04 08:30 IST: no-service-after-reset root cause (xnu 0191) + IPA data path written (xnu 0192, wland 0005)
+- 0190c boot (08:09, logs/boot-0190c.txt; MobileGestalt cache rebuilt by iOS, cellular-data=true): CommCenter now sets up data
+  contexts. Its first 11 WDS Bind Mux Data Port (0xa2) requests reached the modem before the bridge's DPM Open Port / WDA Set Data
+  Format were answered; 10 were never answered -> ATCS_TIMEOUT -> played-back reset -> "Baseband did not allocate client for svc
+  type: UIM, error 0x5 QMI_ERR_CLIENT_IDS_EXHAUSTED" (the bridge's 64 QMUX slots still held the pre-reset clients; the modem never
+  really resets) -> SIM state Unknown, display EmergencyOnly ("No Service") until reboot. Same as the first 0190 boot after its reset.
+- **xnu 0191** (commit 0191 patch, CI 41763340271 on codex/cellular): holds WDS 0xa2 / QOS 0x2b until the data-port setup is done
+  (3 s cap), frees every host QMUX client when sahara restarts (new baseband session). Packaging: research/cellular-0191/package.py.
+- Mobile data, observed: CommCenter never sends WDS Start Network; "kDataNotSupported {context is not assigned}" because pdp_ip0..3
+  do not exist (bridge stubbed coachz_bb_pdp.cpp). IPA facts (stock DTB): qcom,ipa-hw-ver 16 = v4.2 (same as upstream SC7180
+  code), regs 0x1e40000 / GSI 0x1e04000 (same), SMMU SIDs 0x520/0x521/0x522, AP-loaded GSI firmware ipa_fws (PAS 15,
+  ips_fw_region 0x97f00000+0x10000; 3 relocatable segments 0..0x41c0), SMP2P "ipa" entries both ways, bus BCMs IP0 (clock),
+  SN11+SN0 (to DDR), CN0 (config).
+- Firmware/config pulled read-only via OrangeFox (user approved; vendor mounted ro, unmounted after) to git-ignored
+  research/vendor-0190: firmware/ipa_fws.{mdt,b00-b04,elf}, awinic/ aw882xx files, etc/ mixer_paths*, audio_platform_info*,
+  acdbdata/, modules/audio_*.ko. Not yet copied to the phone (needs /var/local/fw/ipa/).
+- **xnu 0192 + wland 0005** (commit after 0191; CI xnu 41764330464 and sweet-wifi 41764334978 on branch claude/ipa-0192 because
+  the xnu workflow cancels in-progress runs per ref): see the commit message. Off unless boot-arg sweetipa=1 (pdp_ip interfaces
+  exist regardless). wland order: smp2p_create -> record 7 (kernel: votes, SMMU stream, ipa_config) -> PAS 15 ipa_fws ->
+  record 8 (kernel: gsi/cmd/LAN RX setup) -> SMP2P "ipa" entry -> record 9 -> boot_modem; after link up, NEW_SERVER 0x31 v1 inst1
+  at port 0x4002 (client port 0x4003). Not booted yet. Risk: a wrong IPA clock/bus vote can hang the bus (temporary boot only).
+- Audio track (background agent, branch claude/audio-plan e291ea3, not merged): docs/audio-plan.md + userspace/adsp APR library.
+  Key finding: iOS call audio control is Apple-private QMI 0xe1 (answered unsupported today); on sweet voice goes modem->ADSP.
+
+## 2026-11-04 07:40 IST: Settings Cellular / SOS root cause = stale MobileGestalt cache (HasBaseband false)
+- New tool userspace/tools/sweet-mgquery.c (CI sweet-tools 41758213153, artifact in research/tools-41758213153,
+  installed /var/local/bin/sweet-mgquery 7a407b6d...). Read-only MGCopyAnswer printer; never pass identifier keys.
+- With the cached plist (built ~0163/0165, before the 0185 baseband ADT): cellular-data=false, HasBaseband=false,
+  contains-cellular-radio=false, BasebandStatus "NoTelephonyCapabilty" (telephony/sms=true). Settings hides
+  Cellular on cellular-data=false.
+- Moved the cache aside on the phone (backup .pre-0190, same SHA256 e10fda01... as research/mg-reset-0190/
+  MobileGestalt.plist.pre-0190; live file renamed .moved-0190). A fresh process then answers cellular-data=true,
+  HasBaseband=true, contains-cellular-radio=true, BasebandStatus "BBNotAnswering". MobileGestaltHelper did not
+  rewrite the cache immediately. Killed Preferences + SpringBoard (respring 07:39, SpringBoard 703 up, no crash).
+- USER (after the respring): **Settings shows the Cellular section; status bar shows signal bars + the SIM/carrier
+  name (no more SOS).** Both were caused by the stale cache. Not yet checked: whether MobileGestaltHelper rewrites
+  the cache by the next boot (verify with sweet-mgquery after reboot), whether calls are allowed again.
+- Still open for cellular: mobile data (PDP/IPA path stubbed in the kernel), call audio, soft reset / RFS sync,
+  IMSI_SWITCH/MULTI_PDN pushes (BSP 0xe00d unsupported), BasebandStatus "BBNotAnswering".
+- Restore if needed: mv .moved-0190 back to com.apple.MobileGestalt.plist (or copy .pre-0190).
+- Earlier this session: USB dropped 07:15:55 and came back ~07:22 (user replugged; phone kept running). Calls:
+  first outgoing call reached Alerting and later ended ("CS call not active"); user then reported new calls "not allowed".
+
+## 2026-11-04 07:20 IST: 0190 second boot (0190b) -> carrier-file push loop GONE, registered home, no resets
+- Analysis of the first 0190 boot (logs/boot-0190.txt, never reviewed by the previous agent): the PRI file
+  (overrides_D22.der.pri, 9 segments) transferred with every segment acked and the 0xa001 indication sent ->
+  CommCenter "File transfer complete: success", "PRI was pushed", AttachAPN push succeeded. GRI (43 segments)
+  was sent; IMSI_SWITCH and MULTI_PDN failed (each preceded by BSP 0xe00d answered not supported). Then ONE
+  "Resetting baseband after pushing files" -> soft reset failed ("never started filesystem sync",
+  subtype RemoteFSSyncError) -> hard-reset fallback -> "Baseband is Online!" again; no further push rounds.
+- 0190b (same image shim/out/shim-boot-0190.img 7c0edb73, fastboot boot 07:11, log logs/boot-0190b.txt,
+  receiver logs/receiver-0190b.err): SIM Ready -> EmergencyOnly -> kRegisteredHome. The push check now says
+  "Candidate and writtenCache match => nothing to do", "No files to push after all" (state cached by the
+  successful round of the previous boot). 0 ATCS_TIMEOUT, 0 glink jams, 0 baseband resets so far.
+- Remaining (observed in logs): "Baseband activation result is unexpected!" x4, "Operator name change aborted:
+  not provisioned", PDP/data path still stubbed in the kernel (no IPA hooks). Soft reset (Mav RFS sync over the
+  BBUFS/refs channel, ABM FSModule::requestFSSync) is still unimplemented; now only matters when a push happens.
+- USER (0190b): OUTGOING CALL WORKS (the other phone shows this phone's caller ID screen). Status bar still shows
+  "SOS"; Settings has no Cellular section. CommCenter meanwhile sends kRegistrationDisplayStatusNotification
+  kRegisteredHome (GSM, later UTRAN) and displayStatusChanged RegisteredHome to 4 clients, so the SOS/hidden
+  Cellular section is on the client side (SpringBoard SystemStatus telephony provider, 'com.apple.systemstatus.
+  telephonystate', registered via NSXPC for 17 notifications; strings in subcache .01: showsSOSWhenDisabled,
+  _shouldShowEmergencyOnlyStatusForInfo:, suppressSOSOnlyWithLimitedService). Guess (unverified): the slot is
+  considered disabled/not provisioned on the client side, or MobileGestalt lacks the cellular-data capability.
+  CommCenter also logs "Could not get cellular plan device Info" for that client.
+- USB link to the host DROPPED at 07:15:55 (host: descriptor read error -71, unable to enumerate); log ends there.
+  Cause unknown (unplugged vs phone hang/reboot).
+- Next: SpringBoard os_log (sweetoslog=CommCenter,SpringBoard + OS_ACTIVITY_DT_MODE for SpringBoard in launchd.plist)
+  to see why STTelephony shows SOS; check MobileGestalt cellular-data/telephony answers for the Settings section.
+
+## 2026-11-04: 0190 built and temporarily booted
+- Source commit bd63bfe; Intel CI run 41693973899 succeeded, including the BSP acknowledgement regression check.
+- Downloaded kernel CRC and SHA256 verified. Packaged shim/out/shim-boot-0190.img with the unchanged
+  0189 shim, DTB, ADT and boot options except sweetbuild=190. Kernel SHA256 starts 777419ce; image starts 7c0edb73.
+- Started tools/sweet-usb-log.py with ignored logs/boot-0190.txt before fastboot boot; command returned success.
+  No partitions flashed. Hardware cellular result remains pending; boot-command success alone is not radio stability.
+- Receiver diagnostics: logs/receiver-0190.err; private fastboot output: logs/fastboot-0190.txt.
+
+## 2026-11-02: public README status refresh
+
+- Updated the default-branch README to reflect user-confirmed touch/buttons,
+  Metal GPU acceleration, Wi-Fi, Bluetooth, live USB debugging and charging state.
+- Documented the native AIR/NIR/freedreno path, kernel bring-up, WLAN/BT integration,
+  input/battery changes and remaining performance/graphics limitations.
+- Linked implementation and current engineering notes on codex/native-adreno-metal;
+  this documentation update does not merge experimental source into main.
+- Documentation only; no builds, tests, device writes or reboots performed.
+
+# iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
+
+## 2026-11-03: 0190 prepared — BSP SendFile missing next-segment acknowledgement
+- Continued from the 0189 handoff on the cleaned codex/cellular history. No device write or reboot yet.
+- Static inspection of the local iOS 16 command-driver binary found the concrete response mismatch:
+  SendFile's success handler reads ExpectedSegmentInfo TLV 0x40 as a little-endian u16, then requires
+  it to equal the current segment plus one. A missing TLV defaults to zero, so the generic success
+  response in 0188/0189 fails the first non-final segment. This matches the segment-zero-only symptom.
+- Patch 0190 adds the expected-segment TLV, preserves service/client/transaction/channel routing,
+  rejects malformed file headers/counts, and retains the final transfer indication. It continues the
+  existing compatibility sink; Apple modem configuration is not written into the Qualcomm modem.
+- Added a synthetic host regression check covering multi-segment and single-segment transfers,
+  both channels, client/transaction routing, repeated requests, u16 boundary and malformed headers.
+  Checks pass with 0190 and reproduce the missing-TLV failure with 0189. CI now runs this check.
+- Hardware behavior is not yet established. If successful transfers still trigger the reset loop,
+  the separate Mav filesystem-sync/reset handshake remains the next lead. No claim of stable cellular yet.
+- Raw logs and local reverse-engineering material stay in ignored logs/ and research/. Public notes
+  record only protocol behavior; no subscriber, operator, location or call records are included.
+
+## 2026-11-03: public-history privacy cleanup
+
+- Audited all six published branch histories for device/SIM identifiers and
+  private cellular observations. Removed network/location and call-test prose
+  from historical notes; sanitized a personal SSID reference.
+- Rechecked 476 rewritten notes blobs: flagged records absent. Driver/build
+  source hashes at the branch tips are unchanged. Added PRIVACY.md and agent
+  rules against publishing sensitive device data or restoring old history.
+- Full decimal IMEI/IMSI/ICCID-length values and international phone-number
+  patterns were not found; this pattern scan is not a guarantee of no secrets.
+- GitHub issues/PRs and releases were empty at audit time. Build workflows
+  package source/binaries, not runtime device captures. Downloads of older CI
+  logs timed out; those logs have not been certified clean by this audit.
+- Existing local clones and GitHub cached/unreachable commits require separate
+  handling. Reclone before further pushes. GitHub Support may need to purge
+  cached commit views; rewriting branches cannot erase external copies.
+- No device writes, boots, or driver changes performed.
+
+## 2026-11-03 23:50 IST: HANDOFF (to Codex) - 0189 booted twice; cellular still loops on the carrier-file push
+- Current phone state: kernel 0189 (xnu/out-0189 fc7c348a..., image shim/out/shim-boot-0189.img bd57ec8e..., second boot
+  23:40:56, log logs/boot-0189b.txt; first boot log logs/boot-0189.txt), wland 0004 (ef9a6d24, /var/local/bin/wland),
+  launchd.plist with CommCenter + OS_ACTIVITY_DT_MODE (90a99987), unzipped Mav17 bbfw folder in /private/preboot/<HASH>/...
+  (+ symlink /usr/standalone/firmware/Baseband/Mav17). Wi-Fi works on the second boot (USER).
+- 0189 result: the reset storm is gone (no "baseband crash detected"). TLV 0x40 PRI version did NOT stop the push: each
+  SIM-ready round still pushes PRI, GRI, IMSI_SWITCH, MULTI_PDN (all "Pushing ... failed", "File transfer complete:
+  failure" within ~90 ms of starting, only segment 0 of a file reaches 0xa000), then "Resetting baseband after pushing
+  files (kCarrierBundleChange)" -> soft reset = DMS mode 4 (answered by the bridge since 0188b) -> ABM "Soft reset failed:
+  Baseband never started filesystem sync" -> fallback -> Reset -> Online -> SIM Ready again -> push again. USER: no SOS,
+  no Cellular section during this loop.
+- First 0189 boot: wland's GLINK TX jammed ~13 s in during a large modem tftp read (1060-byte sends), "glink: cannot send
+  N bytes (intents 47..119)" x86, all remote intents busy and none returned -> Wi-Fi (same modem link) also dead until
+  reboot. Second boot did not jam (so far). Unresolved: whether wland leaks intents (nested link_send from rx handlers,
+  e.g. tftp) or the modem stalls.
+- OPEN LEADS for the push loop (pick one):
+  (a) why the push fails: BSP queries in the push window answered not supported by the bridge (0xe010, 0xe012
+      bootstrap, 0xe014 GetCDRXInfo, 0xe009, 0xe018, 0xb001 GetChipIdSerialNumber/ChipInformation, 0xb004, 0xb008,
+      0xe000/0xe001/0xe020, 0xd005/0xd009); and CommCenter logs neither "QMI BSP Send file ... successful" nor "...
+      returned error" for our 0xa000 answers. Check the 0xa000 answer reaches the right client (qmi trace budget 6000
+      lines ran out: raise it or trace 0xe2 always), and what prepareFilePushTransaction_sync (0x1f19aba40,
+      libCommCenterMCommandDrivers in subcache .31) needs.
+  (b) why it pushes at all: CommCenter 0x10066e72c "Checking if any of the files need an update on baseband" -> for file
+      types 0,6,7,5,8,2 0x100c791b4 -> 0x100c78ffc -> per-slot model object vtable+0x48 (not followed). Keys:
+      InstalledPRIVersion, DerPriFileVersion/GRIVersion (D22 overlay: 0.1.144 / 9.2.1).
+  (c) make the soft reset succeed: emulate the Mav RFS sync (libBasebandManager "rfs sync", BBUFSServerFlush, refs
+      channel) or find why ABM requires it.
+- Fallback image with SOS + incoming calls between push/reset cycles: shim/out/shim-boot-0186.img (kernel 0186).
+- Still to do after cellular: call audio (no audio route to the modem), incoming-call screen (InCallService runs, UI not
+  presented), haptics in iOS (kernel AW8624 test buzz works every boot: "SWEET HAPTIC ... after buzz"), Settings/About.
+- Static-RE helpers (git-ignored, local): research/re-tools/ abpdis.py (dsc disassembler: python3 abpdis.py SUBCACHE IMAGE_BASE), syms.py (local
+  symbols), macho.py (standalone Mach-O), cclog.py (joins |CommCenter| DT-mode lines), CommCenter.bin pulled from
+  /System/Library/Frameworks/CoreTelephony.framework/Support/CommCenter.
+
+## 2026-11-03 23:20 IST: 0188b boot -> reset storm; xnu 0189 (PRI version, no selector reset messages), CI 41687293245
+- 0188b (xnu/out-0188b d23c198e..., image shim/out/shim-boot-0188b.img 40a29869..., booted 22:52:57, log
+  logs/boot-0188b.txt): carrier file segments now parse ("type 9 segment 0 of 9", "type 8 segment 0 of 43"), but
+  CommCenter sends only segment 0 and reports "File transfer complete: failure" within ~90 ms (other BSP queries in the
+  push window, 0xe010/0xe012/0xe014/0xe009/0xe018/0xb001/0xb004/0xb008, are still answered not supported; the 0xa000
+  frames were past the trace budget). "DMS set operating mode 4 (reset): answered here" -> ABM: "Soft reset failed:
+  Baseband never started filesystem sync" (Mav soft reset = RFS sync over Apple's BBUFS server first, then reset; see
+  libBasebandManager strings "rfs sync", "BBUFSServerFlush"). Then 13x "baseband crash detected" resets ~1.5 s apart:
+  the delayed reset-detected message from the AppleBaseband selector (hard-reset fallback) arrived while ABM considered
+  the baseband up. USER: no SOS, no Cellular section.
+- Push decision (static RE, CommCenter binary): per file type 0x100c791b4 -> 0x100c78ffc -> model vtable+0x48 (virtual,
+  not followed). CFStrings InstalledPRIVersion/DerPriFileVersion/GRIVersion/PRIVersion_Major/_Minor/_ReleaseNo; the D22
+  overlay (/var/mobile/Library/Carrier Bundles/Overlay/device+carrier+Default.bundle+D22+54.0.1.plist, stock) has
+  DerPriFileVersion 0.1.144, DerPriFileName overrides_D22.der.pri, GRIVersion 9.2.1, GRIFileName global_setting_A.gri.
+- **xnu 0189** (`xnu/patches/0189-sweet-baseband-pri-version-no-reset-storm.patch`): activation indication + TLV 0x40
+  {0, 1, 144} (installed PRI = bundle version); AppleBaseband selector path no longer sends reset messages (DMS-reset
+  playback kept). Expectation (guess): PRI no longer pushed; GRI/IMSI_SWITCH/MULTI_PDN may still be.
+- Fallback if this does not settle: kernel 0186 image (shim/out/shim-boot-0186.img) + wland 0004 gave SOS and incoming
+  calls between push/reset cycles.
+
+## 2026-11-03 22:45 IST: first 0188 boot (0187+0188) -> two fixes, revised 0188 building (CI 41680017657)
+- CI 41667413318 FAILED to compile: the Python edits for 0187/0188 ran in an unquoted shell heredoc, so "\\n" in new
+  printf literals became real newlines (SweetBaseband.inc:470/1020 "expected expression", then the class cascade). Fixed
+  (commit after 36c0736); rebuilt CI 41674076383 -> xnu/out-0188 18f98251..., image shim/out/shim-boot-0188.img
+  495ee27b..., booted 22:19:39 (log logs/boot-0188.txt). Lesson: write such edits with quoted heredocs (<<'EOF').
+- Result: "carrier file type 0 segment 0 of 0" for every segment -> FileTransferInfo is TLV **0x01** (wrapper type byte 1
+  in sendSegmentWithData_sync; 0x10 = signature, 0x11 = a 2-byte TLV), so no completion indication was sent and every
+  push still failed. Reset messages: messageClients returned 0xe00002c7 (our own user clients answer message() with
+  unsupported; not a delivery failure), but they were only sent AFTER "Soft reset failed": ABM's soft reset never calls
+  AppleBaseband; it is DMS Set Operating Mode RESET ("Resetting Operating Mode: kReset_Mode"; 0xe4 = AWD metrics, not
+  reset). The only path into AppleBaseband was the hard-reset fallback.
+- Revised **0188**: TLV 0x01; bb_dms_reset answers DMS 0x2e with mode 4 itself (never reaches the modem, which belongs
+  to wland), then bb_qmi_soft_reset (sahara back to before SendImage) and reset-detected 50 ms / alive 150 ms after the
+  request via thread calls (also for the AppleBaseband selector path); AppleBaseband service pointer kept from
+  publication. Logs "DMS set operating mode N" (16 max).
+
+## 2026-11-03 21:05 IST: wland 0004 holds (no lost requests, no crash); new loop: carrier-file push + soft reset
+- Boot of shim-boot-0186.img with wland ef9a6d24 (20:43): wland alive, 0 `glink: cannot send`, no ATCS_TIMEOUT resets.
+  SIM Ready and registered after ABM boot, then CommCenter's carrier-file push (set.bb: 5 files, first
+  overrides_D22.der.pri FILETYPE_PRI) fails at once ("File transfer complete: failure ... soldiering on"), "All files
+  have been pushed" -> "Resetting baseband after pushing files (kCarrierBundleChange)" -> ABM "Soft reset failed; timeout
+  waiting for reset detection" -> fallback -> "Failed to get current operating mode: kCommandError" and the radio stays
+  down. A CommCenter restart repeats push + reset every ~12-25 s (the push never succeeds, so the check always says
+  the files need an update). Settings shows no Cellular section and no SOS while the radio is down.
+- Reset detection (static RE): libTelephonyBaseband registers IOGeneralInterest on AppleBaseband
+  (_TelephonyBasebandResetCallback handles 0xe3ff8007 wake, 0xe3ff800d coredump, forwards the rest);
+  libBasebandManager 0x1b7fa6dec: 0xe3ff8000 = "baseband reset detected", 0xe3ff8001 = "baseband alive detected".
+  "poll for reset detect" = AppleBaseband selector 3 (get reset). The bridge never sent these messages (upstream neither).
+  -> **xnu 0187** (`xnu/patches/0187-sweet-baseband-reset-detect-messages.patch`): after reset/powercycle/power-on the
+  user client does getProvider()->messageClients(0xe3ff8000), then 0xe3ff8001 100 ms later (thread call). CI 41663283500.
+- Carrier-file push protocol (static RE, libCommCenterMCommandDrivers .31 0x1f1919000 + CommCenter binary strings):
+  QMIBasebandSettingsDriver prepareFilePushTransaction/startFileTransfer/sendSegmentWithData over private service 0xe4
+  (0x1002 start, 0x1000 1500-byte segments; bridge answers 0x5e) and completion by indication
+  bsp::FileTransferStatus::Indication. The activation indication (QMIMav13ActivationCommandDriver bootstrap block_3)
+  parses TLVs 0x10 public key hash, 0x11 factory key hash, 0x12 IMEI, 0x13 MEID, 0x14 activation version, 0x15 mode,
+  0x16 factory debug, 0x52 manifest result, 0x40/0x41 ActivationPriVersionSlot1/2 ({u8,u8,u16}), 0x42/0x43 ICCID/IMSI
+  slot 1, 0x44/0x45 GID1/2, 0x50 card provisioned, 0x46-0x49 slot 2.
+- CORRECTION + push protocol (static RE): the carrier-file push is BSP (0xe2) SendFile **0xa000** (sendSegmentWithData_sync
+  `mov w1,#0xa000`), not 0xe4 (0xe4 = another private service, sft = Stewie). TLV 0x10 FileTransferInfo = {u8 type,
+  u8, u16 segment number (first = 0, startFileTransfer passes 0), u16 total, data}; signature on the last segment.
+  Completion = indication **0xa001** FileTransferStatus, TLV 0x01 {u8 file type, u8 result}. Results: 0 SUCCESS,
+  1 FAILED, 2 FS WRITE FAILED, 3 MEMORY, 4 TIMEOUT, 5 PROCESSING TIMEOUT, 6 SIGNATURE MISMATCH, 7 PROCESSING ERROR.
+  Types: 0 unknown, 1 EFS, 2 PRL, 3 PRI, 4 DMU, 5 DM, 6 GRI, 7 DER_PRI, 8 DER_GRI. Pushed files per round: PRI
+  (overrides_D22.der.pri), GRI (global_setting_A.gri), IMSI_SWITCH, MULTI_PDN, +1 (29 failed rounds in one boot).
+- **xnu 0188** (`xnu/patches/0188-sweet-baseband-carrier-file-push.patch`, on top of 0187): bb_send_file answers every
+  0xa000 with success and, after the last segment, sends 0xa001 {type, 0}; logs "carrier file type T segment S of N
+  accepted" (first/last, 24 lines max). CI 41667413318 (macos-15-intel) builds 0187+0188. Open question for the boot:
+  whether CommCenter stops pushing after a successful round or re-checks against the baseband (activation TLV 0x40).
+- Between resets SOS appears and incoming calls reach the call UI; the incoming-call screen itself does not show
+  (InCallService runs, no crash; UI/presentation issue, later). `SWEET Sandbox: callservicesd privilege 1002 denied`.
+
+## 2026-11-03 20:45 IST: kernel 0186 booted: CommCenter sees the SIM, then a reset loop -> wland fix 0004
+- xnu 0186 (`xnu/patches/0186-sweet-baseband-sim-activation.patch`, commit b4dd285; CI 41655332168 macos-15-intel ->
+  xnu/out-0186 a66a56af...): SweetBaseband.inc = UniXNU/QcomBaseband 43d85fb08d + the Sweet delta (header, sweetbb
+  boot-arg, SWEET BB prefixes, /dev/sweet-bb glue; bb_esim_step called from sweet_bb_wland_read), PDP interfaces stubbed
+  (no IPA data hooks); new coachz_bb_data.h/esim.h/pdp.h, qmux.h updated. Upstream host model test passes locally
+  (gcc needs -Wno-type-limits). Image shim/out/shim-boot-0186.img 2e9e2c54... (payload 55c9f975...; 0185-oslog
+  cmdline with sweetbuild=186). Log logs/boot-0186.txt (local only; contains identifiers).
+- Result (technical): full ABM boot exchange (pbl register reads, sendImage dropped, sahara image 0x15 read and
+  finished, qmux1/qmux2/refs opened), BSP activation register answered, eSIM slot discovery event, DPM open + WDA data
+  format OK, activation indication re-sent once the card identity was read (values never logged), CommCenter reports a
+  present SIM in state Ready. Then a reset loop: CommCenter `ATCS_TIMEOUT` resets every ~26 s on NAS 0x34/0x45 and
+  WDS 0xa2 requests that were never answered; registration and voice unusable during the loop.
+- Bridge QMI trace (WDS/UIM traced on every message): WDS 0xa2 142 requests / 91 answers, 0x4d 135/120, UIM 0x20 37/31;
+  losses in bursts (10 WDS binds within 5 ms, ~4 never answered). wland.log also had `cell: bb record type 0 ignored`.
+- ROOT CAUSE (code reading, donor link.c): link_send waits for a modem GLINK intent with link_poll(1), whose idle hook
+  runs cell_poll -> bb_poll -> qrtr_send again (nested). qrtr_send built every packet in ONE static 64 KiB buffer, so the
+  nested packet overwrote the waiting one (that request never reached the modem), and the nested bb_poll read new kernel
+  records into the bb_buf the outer loop was still parsing (the "type 0" record, more lost requests).
+- FIX: wland patch `userspace/wifi/patches/0004-sweet-reentrant-qrtr-send.patch`: qrtr_send uses a per-call buffer
+  (2 KiB stack, malloc above), cell_poll has a reentrancy guard. Chain 0001-0004 verified on a fresh donor checkout.
+- Later in that boot wland CRASHED (kernel log: `CRASH wland sig 11`, far just below the stack bottom = stack
+  overflow; backtrace the same three frames repeated = the link_send -> link_poll -> cell_poll -> qrtr_send ->
+  link_send recursion while all 256 remote intents were busy; wland.log ends with 43x `glink: cannot send N bytes
+  (intents 256)`). After that the modem link was dead (every CommCenter request timed out). wland refuses a second
+  start in the same boot (/var/local/wland.boot), so it needs a reboot.
+- wland 0004 built: CI 41660951350 (push, commit 6801938) -> research/cell-install-0184/wifi-41660951350/wland
+  ef9a6d24... INSTALLED as /var/local/bin/wland (755, sync, readback OK). Previous: 784faed6, backup
+  research/cell-install-0184/wland.before-0004. Kernel/image unchanged: boot shim/out/shim-boot-0186.img again.
+  NEXT: reboot via fastboot, check that the ATCS_TIMEOUT resets and the intent exhaustion stop. Later: call audio,
+  haptics, the incoming-call UI.
+
+## 2026-11-03 19:45 IST: **ABM BOOTS THE BASEBAND -> status bar "SOS"**; next: "No SIM" (private QMI activation)
+- Device-specific cellular/location/call observations omitted for privacy.
+
+## 2026-11-03 19:05 IST: logging reboot prepared (user: "go ahead with the logging reboot")
+- **OS_ACTIVITY_DT_MODE alone cannot work on our kernel (static RE, libsystem_trace .09, _libtrace_init ~0x19c9c2ac8):**
+  ACTIVITY_LOG_STDERR / CFLOG_FORCE_STDERR (byte +0x1e) and OS_ACTIVITY_DT_MODE (byte +0x1f, 0x1e1d3a000 page) are
+  honoured only if gate byte 0x1dd444850 != 0. The gate (dispatch_once block 0x19c9cc400) =
+  `__mac_syscall("AMFI", 0x5a, {in 0, &out}) == 0 && (out & 0x100)` (fn 0x19c9cae50 = amfi_check_dyld_policy_self).
+  Also skipped entirely when not P_TRACED and an arg-less libsystem_kernel call (0x1c26144c0, subcache .19 not local;
+  presumably issetugid) returns non-zero, and when commpage 0xfffffc104 bit 8 (ATM trace disable) is set. Our AMFI
+  policy (0115) answered 0x5a only for backboardd with sweetgles=1, and with 0x7b (no 0x100) -> this is also why the
+  0048n backboardd test printed no NSException reason.
+- **xnu 0185** (`xnu/patches/0185-sweet-oslog-to-stderr-policy.patch`, commit 0d75254, applies on the 0178 buildtree
+  sweet_amfi.c; no later patch touches it; not compiled locally): boot-arg `sweetoslog=NAME,...` -> those processes get
+  0x5a flags 0x7b|0x100; the backboardd/sweetgles case is unchanged; everything else still ENOPOLICY. CI xnu
+  **41644550073** (dispatched on codex/cellular). Fetch script research/gpu/fetch-kernel-0185.py (needs
+  research/gpu/0185-kernel-artifact.json from the run's artifact list).
+- launchd.plist on the phone NOW = research/cell-install-0184/launchd/launchd.plist.commcenter-oslog 90a99987... (CommCenter
+  job + EnvironmentVariables {OS_ACTIVITY_DT_MODE: YES}; round-trip checked, nothing else changed). On-phone backup
+  /System/Library/xpc/launchd.plist.pre-oslog = c65c3a90 (with-commcenter). Harmless on the 0184 kernel (gate stays 0).
+- Planned image 0185-oslog: 0185 kernel + sweet-0185-baseband.adt + 0184-bbadt cmdline with sweetnull=backboardd,CommCenter,
+  sweetoslog=CommCenter, sweetbuild=185. Then: receiver first, fastboot boot, read `|CommCenter|` lines for BBUpdater.
+
+## 2026-11-03 17:07 IST: boot 0184-bbadt -> CommCenter (cellular) RUNS, opens AppleBaseband; ABM: "Baseband Firmware Path Not Found"
+- Device-specific cellular/location/call observations omitted for privacy.
+
+## 2026-11-03 (evening): CELLULAR phase 2 iOS side in progress (user: "go ahead with the iOS side")
+- wland (5d30286, patch 0003 regenerated + verified): RAT retry (ecc1fd3) + /dev/sweet-bb bridge in cell.c:
+  open O_RDWR|O_NONBLOCK in cell_init (off: /var/local/cell.nobb), all NEW/DEL_SERVER forwarded (bb_srv[128]
+  table replayed on open, since the first servers arrive during link_up before cell_init), modem DATA for ports
+  0x4100..0x413f -> record 3, READY (6) once DMS/NAS/UIM/VOICE are up, kernel records read every poll round:
+  1 -> qrtr_send(DATA, port, node, port), 2 -> QRTR ctrl DEL_CLIENT {6, node 1, port} to 0:ctrl. cell_port() widened.
+  wifi.yml now runs on macos-15-intel (arm64 run 41623670424 "not acquired by Runner ... capacity"); CI 41625995638.
+- ADT: tools/adt-add-baseband.py (identity props checked against research/ipsw-x/d22ap.adt: name, device_type,
+  compatible baseband,n41, class 3, imeisv "9", config; device-imei 32 zero bytes, region-sku 0x40 zero bytes; no
+  function-* GPIO refs) -> shim/out/sweet-0185-baseband.adt cd496b6a.... Image shim/out/shim-boot-0184-bbadt.img
+  65cb1d6a... (payload fe6388c8...; 0184 kernel, 0184-bb cmdline incl. sweetbb=1; kernel/dtb == 0184-bb). NOT booted.
+- launchd: phone /System/Library/LaunchDaemons/com.apple.CommCenter.plist (59fb2d07..., _LimitLoadToDeviceTree baseband,
+  UserName _wireless, KeepAlive) + -noncellular (_LimitLoadFromDeviceTree). Backup of the live launchd.plist:
+  research/cell-install-0184/launchd/launchd.plist.before-commcenter 1bd48aa1... (531 jobs, no com.apple.CommCenter
+  label); prepared launchd.plist.with-commcenter c65c3a90... (532 jobs, binary). NOT installed (needs user OK).
+  Risk (history): image v13 removed CommCenter because Setup blocked in CoreTelephony getSubscriptionInfo.
+- Firmware: phone has /usr/standalone/update/Mav17.Release.bbfw (34132850) + ICE17; /usr/local/standalone/firmware/
+  Baseband does not exist. /private/var/wireless/baseband_data exists (empty).
+- dyld map (stub images vs subcache vmoffsets): libPCITransport, libIOABP, libTelephonyIOKitDynamic,
+  libTelephonyBasebandDynamic, libQMIParserDynamic, libARI = subcache .29; AppleBasebandManager + libBasebandManager
+  = .17; libCommCenterBase/AppleBasebandServices = .31; CoreTelephony = .03. .29/.30 now in research/dsc.
+- **iOS 16 ABI VERIFIED (static, libIOABP in .29, capstone; scratch script re/abpdis.py)**: class names AppleBaseband,
+  AppleBasebandPCIControl, AppleBasebandPCIInterface, ABPInterfaceProtocol, AppleBasebandPCIPDPManagerBase present.
+  libPCITransport channel table = iPadOS 17's minus "at" (pbl sahara diag refs qmux1 qmux2 rom boot ari trace dpl
+  mediactl vcom gnss qdss virtual_timesync boot_logger); kernel matches by name only (cbh_channel_id unused) -> OK.
+  IOKit calls (0x1ecc58ab4 IOConnectCallAsyncScalarMethod, ..acc CallScalarMethod, ..ac0 CallMethod): interface
+  open 0/1 scalar, close 1/0, write 2/2, read 3/2 (sync and async), sendImage 4/2, readRegister 5/1, abort 6/1,
+  start 7/1, timeSync 8/3, mapMemory 9/3, unmap 10/1, 11/1, 12/1; async ref words 3; control open 0/1, close 1/0,
+  readLogs 2/3 async, loggerTune 3/4 -> all equal to coachz_bb_channels.h. Not published by the kernel:
+  AppleBasebandPCITraceBackendRaw (trace client: readLogs 0/4, flush 1/2, dumpRegistry 2) - watch whether ABM needs it.
+- wland 784faed6 (CI sweet-wifi 41625995638 on macos-15-intel, patch 0003 7f855318...) INSTALLED 17:0x IST (readback
+  OK). Takes effect next boot. Previous: 2bf85d06 (research/cell-install-0184/wifi-41570373592/wland).
+- launchd.plist WITH com.apple.CommCenter INSTALLED (user chose "both in one boot"): phone file was 1bd48aa1 (= local
+  backup), now c65c3a90 (532 jobs, readback OK); on-phone backup /System/Library/xpc/launchd.plist.pre-commcenter
+  (1bd48aa1). ROLLBACK: sweet-files rm + put research/cell-install-0184/launchd/launchd.plist.before-commcenter
+  /System/Library/xpc/launchd.plist 644, sync, reboot. NEXT: fastboot boot shim/out/shim-boot-0184-bbadt.img (watcher),
+  then check: SpringBoard alive, "cell: bb READY", "SWEET BB: N of 22 services published", CommCenter pid / crashes,
+  SWEET BB channel opens (report every N s), Settings > Cellular / status bar.
+
+## 2026-11-03 16:17 IST: kernel 0184 (baseband bridge) BOOTED; wland 2bf85d06 (GSM+UMTS) INSTALLED, needs one more boot
+- Device-specific cellular/location/call observations omitted for privacy.
+
+## 2026-11-03: BRANCH codex/cellular (from myfork/codex/native-adreno-metal c27b1a9 = kernel 0183)
+Cellular work continues here so kernel patches stack on the 0183 kernel the phone runs. Wi-Fi/shim
+changes came over from codex/adreno-power-audit (commits 099bf34..0d12f38 there).
+
+## 2026-11-03 (later): HANDOFF - cellular phase 2 (iOS side) started; phone ran out of charge
+- Device-specific cellular/location/call observations omitted for privacy.
+
+## 2026-11-03: CELLULAR phase 1 - wland QMI client + serial number (image 0184)
+
+- Device-specific cellular/location/call observations omitted for privacy.
+
+## 2026-11-02: 0183 booted (user approved): App Library FIXED; search pull-down status bar still black "sometimes"
+- 0183 (shim/out/shim-boot-0183-rows.img 6e14e250d464..., kernel c74c894f4751..., 0183-boot-start.json log_offset 49451505): only LA08 surfaces keep rows (224/480/736), no "texture is written" refusals. USER: "the library issue is now fixed. the search pull down status bar is still black (sometimes)".
+- Capture shots/search.png: black band = top ~135 px (status bar) over an otherwise correct blurred backdrop. No refusals in the log. Draw log (20000, scratch draws3.txt) search backdrop chain (e.g. draws 18713-18722): TimgA2Xhf_Isrc n=54 (9 quads) 1125x2436 -> 565x1220; two PBGRAXm_A2Xhf n=24 solid fills into 565x1220 (margins?); Tds8 -> 146x310; Tn23 blur -> 569x1224 -> 565x1220; TimgA2Xhfn_IsrcCcl full-screen composite WITHOUT blending from 565x1220; Bsov tint. Black band = top rows of that blurred texture: either the captured strip is black (source not yet drawn, timing -> "sometimes") or a margin fill covers it. Next: extend the draw log with vertex positions/colours (first vertices of A2Xhf/Timg draws into 565x1220) to decide.
+- Phone: kernel 0183, bundle d109a1a (f16/RGBA16F diagnostics + draw log + 1-byte log; functionally = f20a99d), env FD_MESA_DEBUG=sysmem.
+
+## 2026-11-02: App Library background / search status bar BLACK = regression from kernel 0182 -> kernel 0183 (CI pending)
+- USER: "app librarby's background turns black (blur is till there), while openign search (from home screen pull down), the status bar area becomes black".
+- Draw log (8000 draws, scratch draws2.txt) + capture lib.png: background exactly (0,0,0). Frame: 7932 full-screen TimgA2Xhf_Isrc of a 1127x2438 BGRA texture, 7933 TimgBdsoA2Xhfn_Isrc with a 256x1 RGBA16F LUT. A/Bs: FD_MESA_DEBUG=sysmem,noubwc,notile -> still black; GMEM (no sysmem) -> still black. d109a1a (installed live): logs RGBA16F uploads (LUTs arrive valid: gradients, 0.05-alpha black ramp) and RGBA16F IOSurface imports.
+- CAUSE (from the log): "no drawable: interface: IOSurface N 1125x2436 pitch 4512 is not 64-byte aligned and the texture is written (usage 0x5)". SpringBoard's three 1125x2436 BGRA snapshot surfaces ask for 4512-byte rows; 0182 kept them (before: rounded), and backboardd imports them as RENDER TARGETS -> refused -> never drawn -> black. (15 read-only imports of the same surfaces went through the 4544-byte shadow.)
+- Fix: xnu/patches/0183-sweet-keep-rows-small-texels-only.patch: keep asked rows only when bytesPerElement < 4 (LA08/A8 glyph masks); 4/8-byte surfaces rounded as before 0182. Kernel CI xnu 41400466387 (head c27b1a9). Boot needs user approval. Env restored to FD_MESA_DEBUG=sysmem (backboardd restarted).
+
+## 2026-11-02: FIXED Control Centre vector glyphs / battery outline / widget ring: Metal lines had line_width 0
+- Draw log (b1c5db0, frontend/SweetNativeDrawLog.inc, installed live; arm with: ssh ... 'printf "12000\n" > /var/local/sweet-native-drawlog', file mtime polled 1/s, file present at process start does not arm). 6537 draws captured while opening CC (scratch draws.txt). All coverage-mask pipelines com.apple.coreanimation.draw.*Tcma*Lln* (fixed_vert_lph_spc|fixed_frag_lph_cph) draw prim 1 = MTLPrimitiveTypeLine (line lists, 22-1536 vertices) into two BGRA attachments (64x64 / 192x197 / 207x459 / 1125x2436), = CA draws vector shape edges as lines into coverage masks.
+- Cause: donor rwa_render_create rasterizer state never set line_width (0); fd6_rasterizer.cc linehalfwidth = line_width/2 -> zero-width lines -> no fragments. Fix f20a99d (prepare script): .line_width = 1.0f, .point_size = 1.0f. Installed live (install-live-f20a99d.py, backup sweet-native-stable-pre-f20a99d).
+- USER: "its fixefd". Capture shots/fixed.png (mid app-open animation): Batteries widget ring + red arc and status-bar battery outline now render. Same capture still shows stair-stepped app-open mask edges (open issue) and horizontal band artifacts at the top (probably the capture racing the present copy; not confirmed on screen).
+- Also in the bundle chain now: 3514d70 primitive restart (correct, not the cause), 1bdc4d7 one-byte upload log (first 48 uploads per backboardd start), b1c5db0 draw log (idle unless armed). Bundle history on phone: backups /private/var/db/sweet-native-stable-pre-{de18b22,1bdc4d7,3514d70,b1c5db0,f20a99d}.
+- Current phone state: kernel 0182 (shim-boot-0182-rows.img, sweetpresentcpu=4), bundle f20a99d, env FD_MESA_DEBUG=sysmem.
+
+## 2026-11-02: CC vector glyphs still missing after primitive-restart fix; sysmem/GMEM A/B no difference
+- USER: "try to fix that" (CC Wi-Fi/BT/flashlight/orientation/mirroring glyphs) + "status bar icons aren't fully rendered either especially the battery icon, same happens in homescreen battery widget".
+- 1bdc4d7 (diagnostic, installed live): first 48 one-byte texture uploads. Observed: A8 coverage masks DO arrive with content (lock-screen clock/date: A8 540x358 / 566x79, re-uploaded continuously while the lock screen shows - also a CPU cost worth checking later); cap filled before CC opened.
+- 3514d70 (installed live, install-live-3514d70.py, backup sweet-native-stable-pre-3514d70): donor backend turned Metal primitive restart off and counted 0xFFFF as an index -> vertex-stream bounds check refused such draws. Fixed in prepare script (index_range skips restart values for strips; pipe_draw_info.primitive_restart + restart_index). Correct per Metal semantics, but capture cc4: CC vector glyphs UNCHANGED (so not the cause here). No "the draw failed" lines and MTLCommandBufferStatus error 0 => draws are not refused.
+- Lock-screen capture (after2): status-bar battery = red fill only + a stray horizontal line under it; CC header battery renders fully. Separate issue, open.
+- Pipeline blend log over the session: many CA pipelines bind TWO colour attachments (format 80) and write only attachment 1 (att0 writeMask 0) = CA's coverage/scratch target; framebuffer fetch is implemented in air_to_nir.c (load_output fb_fetch_output) and Mesa fd6 patches fb-read descriptors per cbuf (gmem+sysmem). FD_MESA_DEBUG= (GMEM) A/B capture cc5: identical -> not sysmem-specific. Env restored to FD_MESA_DEBUG=sysmem, backboardd restarted.
+- Next (planned): flag-file draw capture in the frontend/backend: for N command buffers after /var/local/sweet-native-drawlog appears, log per draw pipeline label, attachments (format/size), vertex/index counts, primitive, bound textures (format/size), fbfetch targets; identify the CC glyph draws and what they read.
+
+## 2026-11-02: 0182 + de18b22 FIXES the sheared CC image glyphs; vector (CAPackage) glyphs still missing
+- 0182 booted with user approval (0182-boot-start.json, log_offset 40864628). Observed: "SWEET SURF: SpringBoard keeps its 480-byte rows for 230x186", "224-byte rows for 105x144 / 102x144", "736-byte rows for 360x246" (all LA08) = the asked rows predicted; backboardd: "shadow BO .. 230x186 rows 480 -> 512", "IOSurface 55 .. 102x144 pitch 224 read through a 256-byte-row shadow", "shadow surfaces refilled=3 bytes=236736 gpu_waits=0". No import refusals.
+- Capture cc2 (shots/cc2.png): airplane, AirDrop/cellular, camera, NFC glyphs render correctly now. Still wrong: Wi-Fi and Bluetooth buttons are plain blue circles (no glyph), screen-mirroring tile shows a small white rectangle, orientation-lock and flashlight tiles empty. Those are the animated CAPackage glyphs (vector/shape layers), a different rendering path - next to investigate. Battery ring in the home-screen widget and stair-stepped app-open mask edges also still open.
+
+## 2026-11-02: Control Centre glyph shear diagnosed; fix = kernel 0182 + bundle de18b22 (installed live); 0182 boot pending approval
+- New screen capture: userspace/tools/sweet-fbgrab.c (reads /dev/pmem 0x9c000000, 1080x2400 BGRA) built by .github/workflows/tools.yml (push trigger on userspace/tools/**; workflow_dispatch needs the file on the default branch). CI 41390823247; binary a5820cd8... installed at /var/root/sweet-fbgrab on the phone. Use: ssh ... '/var/root/sweet-fbgrab /var/tmp/fb.raw; cat /var/tmp/fb.raw' > X.raw, PIL frombuffer BGRA. Captures in research/native-resume-20261031/shots (git-ignored).
+- Observed (capture cc1): CC glyphs (airplane, cellular, wifi, bt, rotation, flashlight, timer, calculator, camera) are rectangles of slanted streaks = rows read at the wrong pitch. Home capture: app-open mask edges stair-stepped (~30 px), Batteries widget ring missing (not yet analysed).
+- FD_MESA_DEBUG=sysmem,notile A/B: no change (env restored to FD_MESA_DEBUG=sysmem afterwards; backup /var/local/sweet-native-env.pre-notile).
+- Cause: SpringBoard creates LA08 (Metal RG8, format 30) glyph IOSurfaces 102x144, 105x144, 230x186, 312x202, 360x246 ("keys 6", so it passes IOSurfaceBytesPerRow) and writes them at its own row length (e.g. 210/224), but SweetSurface (sweetmtl=2 block, "Metal owned rows align 64; caller layouts preserved" - not true for asked rows) rounded every caller's rows to 64 -> reported 256/512/640/768 -> backboardd samples sheared. Before that rounding existed the frontend refused (pitch&63) -> icons missing (the original symptom). A618 TEX_CONST_2 PITCHALIGN = log2(pitchalign/64): 64-byte pitch minimum, so unaligned rows cannot be sampled directly. (Asked row values are inferred, not yet logged; 0182 logs them.)
+- Fix: kernel xnu/patches/0182-sweet-keep-caller-surface-rows.patch (only backboardd's own surfaces rounded; others keep asked rows; "SWEET SURF: <proc> keeps its N-byte rows for WxH fmt"; sweetsurfalignall=1 = old rule). Native Metal de18b22: SweetNativeDrawable.m imports read-only textures over unaligned surfaces at the 64-rounded pitch (refuses usage ShaderWrite/RenderTarget); transport surface_description reports the rounded layout, drmPrimeFDToHandle backs such a surface with an owned shadow BO, submit() refills it (CPU row copy under best-effort IOSurfaceLock) when IOSurfaceGetSeed changes, waiting the shadow's last GPU use first; log lines "IOSurface N ... read through a 256-byte-row shadow", "shadow BO", "shadow surfaces refilled=".
+- de18b22: CI sweet-native-metal 41391760200 success, artifact research/native-metal-artifact-de18b22; install-live-de18b22.py (3e2cc01 hashes checked, backup /private/var/db/sweet-native-stable-pre-de18b22), BackBoard restarted OK. On the current 0180 kernel it changes nothing (surfaces still rounded).
+- Kernel 0182: CI xnu 41391804228 success (head de18b22), artifact 13117798822 -> /home/dan/ios-sweet/xnu/out-0182 (kernel bbe5e49c299d...). Payload shim/out/payload-0182-rows.bin a87fc0e2c322..., image shim/out/shim-boot-0182-rows.img 7d17cf84c1b9... (0180 cmdline, sweetbuild=182, sweetpresentcpu=4, no flip). Boot needs user approval.
+
+## 2026-11-02: 0181 page flip -> "extreme flickering" (BLACK FLASHES); reverted to 0180; GPU-copy work PARKED; next: Control Centre glitches
+- 0181 booted (0181-boot-start.json, log_offset 39286621): "SWEET FLIP: on: buffers 0x9c000000 0x9c9f0000 (0x9f0000 bytes), vig0 -> ctl0 flush 0x20041". Busy window: flips=391 = presents 391, latch wait avg 1.4 ms max 8.3 ms, timeouts 0; copy_avg 7.6 ms, beam 0.
+- USER: "extreme flickering happening" -> asked: "Black flashes". So the flush latches (bits clear within a frame) but the screen blanks. Guesses, untested: flushing LM0 (bit 6) + CTL (bit 17) each frame re-latches/restarts the mixer/ctl path (ABL may have different pending values) or causes an underrun frame (border colour black); or SSPP prefetch (programmable fetch starts in VBP) reads the new address mid-setup. Next attempt when resumed: make the flush mask a boot-arg (try VIG0 bit 0 only), read MDP INTR_STATUS underrun bits around a flip, compare SSPP SRC_ADDR_SW_STATUS.
+- USER: "boot back to the previous image and now lets focus on fixing control centre graphic glitches." Booting shim-boot-0180-dpudump.img (flip off). GPU copy step 3 not started.
+
+## 2026-11-02: kernel 0181 (page-flip present, sweetfbflip=1) built; user approved boot; waiting for fastboot
+- Patch xnu/patches/0181-sweet-page-flip-present.patch (commit 5ddf2d6, on 0180). CI xnu 41388281059 success, artifact 13116870607 -> /home/dan/ios-sweet/xnu/out-0181, kernel 06eadfe0b833....
+- Payload shim/out/payload-0181-flip.bin feaa79bd282b... (0180 cmdline + sweetfbflip=1, sweetbuild=181, sweetpresentcpu=4), image shim/out/shim-boot-0181-flip.img c88e8d0b4086... (ramdisk == payload). 0181-boot-start.json written at boot.
+- Expected log: "SWEET FLIP: on: buffers 0x9c000000 0x9c9f0000 ..." then every 10 s "SWEET FLIP: flips= wait_avg_us= wait_max_us= timeouts= scan= on=". Failure modes: "SWEET FLIP: off: ..." (falls back to single buffer). Fallback image without flip: shim-boot-0180-dpudump.img (same kernel family, flip default off) or shim-boot-0179-present4.img.
+
+## 2026-11-02: 0180 booted (user approved); display pipeline dumped; lock-screen stuck again -> SpringBoard restarted
+- 0180 `fastboot boot` OKAY (0180-boot-start.json, log_offset 38636498). Dump (observed):
+  - MDSS stream: SMR5 0x84400800 S2CR 0x3 -> CB3, CBAR 0x1f000, SCTLR 0xe0 (M=0: no translation) => scanout addresses are PHYSICAL. FSR 0x400 (format field only, no fault).
+  - VIG0 is the only active pipe: src_size 0x9600438 (2400x1080), SRC0_ADDR 0x9c000000 (= fb_phys), stride 0x10e0 (4320), fmt 0x237ff, unpack 0x3020001, qseed op 0 (scaler off). vig1/dma0-2 empty. CTL0 layer0 0x1000005, intf_active 0x2 (INTF_1), flush 0; CTL1-5 top 0x1f00 idle. LM0 out_size 0x9600438. MDP hw_rev 0x50020000. Panel 120 Hz (beam probe: 2432 lines, 8331 us frame).
+  - DT cont_splash_region@9c000000 is 0x1700000 bytes (dfps_data_region follows at 0x9d700000): room for a second 1080x2400x4 buffer at 0x9c9f0000 (64 KiB aligned). XNU RAM is all above 4 GiB (highmem), so a 32-bit SRC0_ADDR buffer must come from this region.
+  - CA swaps: always layer 0 only, full 1125x2436 frames, alternating surfaces 2/3 (bpr 4608).
+- USER: "restart the springboard, can't get past lockscreen" (2nd present4 boot in a row where the FIRST SpringBoard after boot (pid 26) is stuck at the lock screen; plain 0179 boot did not show it). Sent TERM to pid 26 over SSH -> new SpringBoard 330. Correlation with sweetpresentcpu=4 is a guess (2 of 2 present4 boots vs 0 of 1 without).
+
+## 2026-11-02: GPU-copy present started (user: "go ahead with the GPU copy") -> step 1 kernel 0180 read-only display dump, packaged
+- Design (planned, nothing implemented yet): replace the CPU copyScaled with an A6xx 2D-engine scaled blit (BLIT_OP_SCALE, separate GRAS_2D_SRC/DST rects + SP_PS_2D_SRC_INFO.filter, as Mesa 25.0.7 fd6_blitter.cc emit_blit_texture/emit_blit_setup/emit_blit_fini) submitted on the kernel ring (NativeAdrenoRing trusted kernel submissions; one shared kernel-owned GPU VM, so CA's imported IOSurface IOVAs are valid) into a BACK buffer, then flip the scanout address at vsync (DPU SSPP SRC0_ADDR + CTL flush) instead of writing the visible buffer (the GPU ring is shared with CA work, so a direct blit into the scanned buffer cannot be beam-raced -> tearing).
+- Unknowns step 1 answers: which SSPP/CTL/LM ABL's splash uses, its address/stride/format, whether MDSS (SID 0x800 mask 0x440, DT iommus) is bypass / SCTLR.M=0 (physical scanout addresses) or translated.
+- DT facts (dtb/boot_unpacked/dtb, qcom,mdss_mdp@ae00000): SSPP vig0 0x5000 vig1 0x7000 dma0 0x25000 dma1 0x27000 dma2 0x29000 (vig = qseedv3lite scaler); CTL0-5 0x2000+0x200n (size 0x1e0); LM0-3 0x45000+0x1000n; INTF 0x6b000.. (dp,dsi,dsi,dp); PP 0x71000..; DSC 0x81000/0x81400.
+- Patch xnu/patches/0180-sweet-dump-display-pipeline.patch (commit 3d1b968, on top of 0179; git apply --check OK): SweetFramebuffer beamProbe() first logs "SWEET DPU:" lines (5 SSPPs, 2 qseed blocks, CTL0-5, LM0-3; boot-arg sweetfbdpudump=0 skips); sweet_rpmh.c SMMU probe logs "SWEET SMMU: MDSS SMR.. S2CR.. -> CB.. SCTLR TTBR0 TCR MAIR FSR FAR" for SMRs overlapping 0x800/0x440. Reads only.
+- CI xnu 41385731960 success; artifact 13114983311 -> /home/dan/ios-sweet/xnu/out-0180 (kernel 1975cd640df0...). Payload shim/out/payload-0180-dpudump.bin de6b52bb2e43... (0179 cmdline + sweetpresentcpu=4, sweetbuild=180), image shim/out/shim-boot-0180-dpudump.img f8c551bd3b29... (ramdisk == payload). Boot needs user approval.
+- Mesa 25.0.7 (sha256 OK) register XML + fd6_blitter.cc + tu_clear_blit.cc extracted in the session scratchpad mesa-dl/ (re-download from archive.mesa3d.org if gone).
+
+## 2026-11-02: A/B result 0179 vs 0179+sweetpresentcpu=4 -> present on A55 measurably shortens SpringBoard tap work
+- USER (present4, after SB restart): "gestures work now. the app opening delay is random now, sometimes its fast some times its slow" (= better than "almost all slow" on plain 0179).
+- SWEET TAP stats (all windows of each boot; scratch tap-base.txt / tap-p4.txt): plain 0179 n=183: SpringBoard per 600 ms window median a55 305 ms + a76 211 ms = 556 ms, A76 share 39%, wait median 55 ms, 75/183 (41%) windows >= 600 ms SB CPU. present4 n=142: a55 134 + a76 256 = 420 ms median, A76 share 55%, wait median 33 ms, 32/142 (23%) windows >= 600 ms. Remaining slow windows (e.g. n=43/44/53/64/65/80) have SB a55 530-770 ms and summed wait 250-765 ms (max 27-149 ms) = all cores contended, typically while an app launches.
+- Cost of present4 (FB windows, busy): copy_avg 7.1-8.4 ms on cpu4 (cpu6 on 0178: 5.8-6.5), gate 4.5-8.2 ms, present_avg 14-17 ms, max 34-42 ms, beam_skips 280-480 per 10 s (0178: 160-360), coalesced 0-13; presents 290-490 per 10 s (similar). Light windows before load: copy 3.8 ms, 630-885 presents/10 s.
+- Recommendation: keep sweetpresentcpu=4 in future cmdlines. Biggest remaining CPU+bandwidth consumer in the display path is the CPU panel copy (present thread 20.8 s / 60 s on 0179); next structural candidate = GPU-side scaled blit into the panel buffer (not started; needs design: panel memory GPU mapping via SMMU, beam race/tearing rules, 1125x2436 -> 1080x2400 scale).
+
+## 2026-11-02: A/B 0179 + sweetpresentcpu=4 BOOTED (user approved); SpringBoard restarted on request
+- Payload shim/out/payload-0179-present4.bin ad48338fd159..., image shim/out/shim-boot-0179-present4.img 419d0c9f7aec... (0179 cmdline + sweetpresentcpu=4). `fastboot boot` OKAY; research/native-resume-20261031/0179-present4-boot-start.json (log_offset 36835928). Boot args confirmed, touch bound cpu 5, crash set so far driverkitd 1.
+- USER: "do a springboard restart. the lockscreen swipe up isn't working nor swipign down control centre (touch is working fine)". Sent TERM to SpringBoard pid 26 over SSH (user-requested); launchd relaunched it as pid 312 (log "exec SpringBoard"). Cause of the stuck edge gestures UNKNOWN (not seen on 0179 without present4; could be unrelated).
+
+## 2026-11-02: SpringBoard spindump during taps on 0179 -> SB main thread = diffuse UIKit work; A76 capacity is the lever
+- spindump SpringBoard 60 s 10 ms during user app opens (files research/native-resume-20261031/spin-tap-0179/{raw.spindump,heavy.txt,sb.txt,main.txt,bb.txt,kt.txt}, git-ignored; phone copies /var/tmp/sb179*.spindump/txt). Scratch tools: leaves.py (leaf samples by library), kleaves.py (kernel leaves by calling user frame), ksym.py (kernel symbols: __TEXT_EXEC vmaddr 0xfffffe00072f8000 + offset, LC_SYMTAB).
+- CPU in 60 s: SpringBoard 53.0 s, backboardd 48.2 s, kernel_task 38.2 s, spindump 15.9 s, runningboardd 7.0, contextstored 6.7, biomed 5.7, launched apps 3-6 s each.
+  - SpringBoard main thread 26.9 s (45% of a core for the whole minute). Non-idle samples ~1335 of 2590: touch event delivery (__eventFetcherSourceCallback) ~507 (of which _handleTap -> launchFromIconView ~134, ~half before SBToAppsWorkspaceTransaction _beginAnimation), main queue 292, display link 236, CA commit ~94. Leaves are diffuse: objc_msgSend 136, CA collect_animations 19, malloc/retain/release; no hotspot, no lock wait (psynch 5), kernel time in syscalls small. => It is ordinary UIKit/SpringBoard work that is slow on these cores.
+  - Other SB threads: UIKit inProcessAnimationManager (pri 53) 6.5 s, XBApplicationSnapshot* generation ~3 s (snapshot image generation/JPEG decode via AppleJPEG), RBS/ATX/analytics queues <1 s each.
+  - backboardd: display.primary (render, bound cpu7) 38.2 s = 64% of cpu7; SweetNativeMetal completion 2.9 s; render-server 2.1 s.
+  - kernel_task: present thread 0x9b 20.8 s = 35% of cpu6 (copy ~6 ms/frame); touch thread 0xcf 9.5 s = 16% of cpu5 (touch_msg spin delays, sweetdelayspin); 0xcc 2.0 s; VM_compressor 2.3 s.
+- Interpretation: demand ~3 cores of UI-priority work; the two A76s are taken by render (cpu7 64%) and the present copy (cpu6 35%), so SpringBoard's main thread runs ~60-75% on A55 (0179 probe). Next A/B (payload only, 0179 kernel): sweetpresentcpu=4 frees cpu6 for SB main; compare SWEET TAP sb_run a55/a76 and first-swap offsets with the 21 baseline windows above.
+
+## 2026-11-02: 0179 per-tap result -> SpringBoard itself burns 0.4-1.2 s CPU per 600 ms after a tap (mostly A55)
+- USER (0179): "almost all apps felt slow like the touch registers and the app logo becomes slightly dark then after half a second the app openes".
+- Observed 21 SWEET TAP windows (600 ms each, from the last-finger release): SpringBoard on-core a55 120-923 ms + a76 102-395 ms (= 0.6-2 cores busy for the whole window; sb_last_off ~593-599 ms in every window = still running at the end); sb_switches 1.2k-8.5k per window (2-14k/s; slices avg ~100-150 us); SB dispatch wait sum 26-586 ms, max 0-45 ms. All UI threads a55 86-1694 ms, a76 192-687 ms. Swaps/presents mostly continuous every ~25-30 ms (~35-40 fps) from the start; tap n=2 had its first swap only at 486 ms.
+- ps -M on SpringBoard (pid 272) after the test: process time 41.5 s, but live threads sum ~20 s (main thread 2.48 s sys + 12.90 s user; a pri 53 thread 3.0 s) -> ~21 s were spent in threads that have since exited (short-lived GCD workers) = thread churn (guess, consistent with the switch counts).
+- Interpretation: the half-second delay is SpringBoard CPU work after the tap (not GPU, not scheduler wait: wait is 5-40% of run). Next: SpringBoard-targeted spindump during taps to see what the worker threads do. SSH: ssh -F /dev/null -i /home/dan/ios-sweet/research/ssh/id_ed25519 -o UserKnownHostsFile=/home/dan/ios-sweet/research/ssh/known_hosts root@192.168.7.2. PosterBoard (pid 273) also had 20.9 s CPU at that point.
+
+## 2026-11-02: kernel 0179 (per-tap probe) BOOTED with user approval, awaiting interaction
+- CI xnu 41381020045 success (head 743c5a6), artifact xnu-kernel 13113850006 -> /home/dan/ios-sweet/xnu/out-0179, SHA256SUMS OK, kernel 9aa34c4382ea...; strings contain "SWEET TAP: n=".
+- Payload shim/out/payload-0179-tap.bin 1596ef2335a1... (0178 cmdline, sweetbuild=179), image shim/out/shim-boot-0179-tap.img fb22b6cec774... (ramdisk == payload). `fastboot boot` OKAY (no flash); research/native-resume-20261031/0179-boot-start.json (log_offset 35922449).
+- Observed: sweetbuild=179, SpringBoard exec'd, touch bound to cpu 5; crash set so far assetsd 3, bluetoothd 3, driverkitd 1. Read results with: tail -c +35922450 logs/live-0172-membus.txt | grep -a "SWEET TAP".
+- Suggested to the user (not verified): AegirPoster (believed to be the Astronomy poster extension) crash-loops and each relaunch makes PosterBoard create 2-3 new 11 MB 1125x2436 surfaces; a plain wallpaper may remove that churn.
+
+## 2026-11-02: 0178 result "still delay while opening apps" -> kernel 0179 per-tap probe (CI pending)
+- USER (0178): "still delay while opening apps, check the logs".
+- Observed 0178 busy 10 s windows (log from 0178-boot-start offset 34969185): UI threads (unbound user pri 46-63) a55 4.8-9.2 s vs a76 2.8-7.2 s per window = still ~60% on A55; big_pulls 15-29k / 10 s (~2.7k IPIs/s), big_leaves 28-54k. Render thread all on cpu7: encode 2.2-3.1 s per 5 s + transport submit_cpu 1.5-1.7 s per 5 s (fence 0.85-1.16 s, ioctl 0.33-0.55 s; 680-984 submits) -> cpu7 ~90% busy. draw_vbo 1.6-2.3 s / 5 s for 16-23k draws (~100 us/draw, includes submits). gpu_busy 72-83%, async completion latency avg 18-21 ms, max 47-72 ms. Present: 380-520 per 10 s, copy_avg 5.8-6.5 ms, gate 5.2-8.0 ms, present max 31-42 ms, beam_skips 160-360 (no tearing reported).
+- Interpretation (guess): the A76s are nearly full with the graphics pipeline itself (cpu7 render, cpu6 present copy + pulled threads), so pulling UI threads mostly ping-pongs them. CPU placement alone has not changed the user's perceived delay across 0176/0177/present4/0178.
+- Crash loops (counts of "CRASH name[pid] sig" per boot segment): 0175 assetsd 46; 0176 parsecd 19, assetsd 8; 0177 AegirPoster 62; 0177-present4 AegirPoster 62, assetsd 13; 0178 AegirPoster 20, assetsd 10, PhotosFileProvider/fileproviderd 1 each. All sig 6 at the same pc 0x1fe893198 / far 0x21b0eee28 (abort path). Respawn CPU cost not measured; not the cause of a 0176-vs-0178 difference.
+- Kernel 0179 (xnu/patches/0179-sweet-per-tap-latency-probe.patch, against the 0178 CI buildtree artifact 13106526768 at /home/dan/ios-sweet/xnu/out-0178/xnu-buildtree; git apply --check OK; no local compiler): last-finger release in sweet_touch touch_report -> sweet_sched_tap_mark() opens a 600 ms window; thread_dispatch sums SpringBoard (proc_name_address == "SpringBoard") on-core time per core type, switch count, dispatch latency (sum/max), last off-core offset, plus all UI-thread time per core type; SweetFramebuffer swap()/present completion record the first 8 offsets; rearmVsync prints one line per window: "SWEET TAP: n= window_ms=600 sb_run_ms a55= a76= sb_switches= on_a76= sb_wait_ms= max= sb_last_off_ms= ui_run_ms a55= a76= swaps= at_ms= presents= at_ms=". 0178 pull stays on (sweetbigpull=1).
+- Plan: boot 0179 with the 0178 cmdline (sweetbuild=179), user taps a few app icons; read SWEET TAP lines. Then A/B by payload only (no CI): sweetpresentcpu=4, sweetbigbind=0, sweetbigpull=0, comparing the same per-tap numbers.
+- Kernel CI: 41380314767 built the OLD head fda4a27 (push went to a nonexistent "origin"; the remote is `myfork`) - ignore it. Real 0179 run: xnu 41381020045 (head 743c5a6). Note: an extra xnu run 41329913367 (2026-11-01 17:08, success) exists from the previous session; not used.
+
+## 2026-11-02: kernel 0178 (pull UI threads to idle A76) BOOTED with user approval, awaiting interaction
+- Kernel d241763db594... (SHA256SUMS OK; strings have "SWEET SCHED:" and sweetbigpull). Payload /home/dan/ios-sweet/shim/out/payload-0178-bigpull.bin 62645d3c6cd6..., image shim/out/shim-boot-0178-bigpull.img 04e92c6a99f7... (ramdisk == payload). User approved; `fastboot boot` OKAY (no flash). research/native-resume-20261031/0178-boot-start.json (log_offset 34969185).
+- Observed: boot-args sweetbuild=178, SpringBoard exec'd, "SWEET TOUCH: thread bound to cpu 5", bluetoothd crashes (known set). SWEET SCHED windows (no user input yet): boot 10 s a55=8.66 s a76=5.02 s pulls 1596 leaves 3585; idle windows a55 11-47 ms a76 69-138 ms (UI threads mostly on A76 when light); window right after touch start a55=8.93 s a76=6.57 s pulls 1447. ui_run_us sums all unbound pri 46-63 user threads, so >10 s of A55 per window = several UI-priority threads at once (which ones is unknown). Guess: with the render thread bound to cpu7 and present on cpu6, an idle A76 is rare under load, so the pull can only help in gaps.
+- Fallbacks: shim-boot-0177-pollers.img, shim-boot-0176-bigbind.img; sweetbigpull=0 disables the pull (needs a new payload).
+
+### kernel 0178 CI / packaging (2026-11-02)
+- xnu 41328511819 first attempt failed after 15 min with "job was not acquired by Runner" (macOS arm64 capacity, nothing compiled). `gh run rerun --failed` -> build SUCCESS. Artifact xnu-kernel 13106561838 (61.8 MB) -> /home/dan/ios-sweet/xnu/out-0178 (slow Azure download; stalls, so curl --speed-limit 20000 --speed-time 30 with a fresh redirect URL per retry).
+- Re-reviewed 0178 against the 0177 buildtree (not compiled locally, CI compiled it): clutch avoid_processor_enabled = TRUE, so thread_select (still_running path) and csw_check both consult sched_clutch_thread_avoid_processor; thread_select sets the idle A76 to PROCESSOR_IDLE before SCHED(processor_balance), so the cpu_state_map test in should_leave matches choose_big (state IDLE + is_recommended) -> no A55<->A55 ping-pong when no A76 is idle. big_leaves counts every true return (thread_select and csw_check), so it overcounts moves; big_pulls counts IPIs sent.
+- Packaging recipe re-verified this session: mkpayload(out-0177 kernel, sweet-0152-haptics.adt, cmdline from payload-0177-pollers) == 82242212...; scratch shim build.sh == 73efd75f.... 0178 cmdline = 0177 with sweetbuild=178 (no sweetpresentcpu, so present thread on cpu6).
+- USB receiver was not running (no UDP 5140 listener); restarted with nohup setsid tools/sweet-usb-log.py appending to /home/dan/ios-sweet/logs/live-0172-membus.txt (stderr logs/receiver-20261102.err).
+- Device: in fastboot (user, 2026-11-02).
+
+## 2026-11-01: sweetpresentcpu=4 result "still delay while opening apps, no tearing" -> kernel 0178 (pull UI threads to idle A76) CI pending
+- USER (0177 + sweetpresentcpu=4): "still delay while opening apps, no tearing". So present thread on an A55 is fine visually; freeing cpu6 did not fix the delay.
+- Re-read the 0176 spindump timeline per sample (scratch tool tlthreads.py: per-sample state of chosen threads from `-timeline`; sampling is continuous 10 ms during activity, ~110 ms gaps only when idle). One icon tap (samples 1144-1177, no gaps): touch event in SpringBoard 1144-45; SpringBoard main RUNNING 1148-1166 (tap handling, SBUIAnimationController _begin, layout, CA commit at 1161); backboardd display.primary BLOCKED (idle) 1148-1160, renders the first animation frame from 1161. => ~150-170 ms of SpringBoard CPU before anything can be drawn, with cpu7 idle meanwhile.
+- Cause (code reading, not measured): XNU places a thread only at setrun; clutch config's processor_balance = sched_SMT_balance returns at once on non-SMT; clutch thread_avoid_processor only handles SMT. A UI thread that wakes while both A76s are busy stays on its A55 for the whole burst.
+- Patch xnu/patches/0178-sweet-pull-ui-threads-to-idle-a76.patch (commit 52ad3d5; against 0177 buildtree artifact 13090418796, kept at /home/dan/ios-sweet/xnu/out-0177/xnu-buildtree; git apply --check OK; no local compile):
+  - sched_prim.c: sweet_big_init() (adds boot-arg sweetbigpull, default 1); sweet_big_should_leave() (A55 + unbound user thread pri sweetbigpri..63 + any recommended A76 idle in cpu_state_map) called from sched_clutch_thread_avoid_processor -> thread_select/csw_check re-dispatch -> 0167 choose_big picks the idle A76; sweet_big_balance() at the top of sched_SMT_balance: an A76 going idle IPIs (SCHED_IPI_EVENT_REBALANCE) the A55 with the highest such current_pri; accounting in thread_dispatch (computation slice) of unbound user UI-thread time per core type.
+  - SweetFramebuffer: every 10 s "SWEET SCHED: window_ms= ui_run_us a55= a76= big_pulls= big_leaves=" (answers directly which cores the UI threads use).
+  - Workflow: xnu.yml default runner macos-15 (Xcode 16.0 picked; 0177 built with it and runs normally despite the old iig comment).
+- sweetpresentcpu=4 measured (0177-present4 offset): copy_avg 5.8-8.6 ms (cpu6 on 0177: 4.2-6.7), beam_skips on most frames (no tearing seen by user), one early window present_max 1.4 s / coalesced 165 (unexplained). => A55 copy is slower; 0178 goes back to the default present cpu 6.
+- Kernel CI xnu 41328511819 dispatched. Next: package with the 0177 cmdline + sweetbuild=178 (keep sweetpresentcpu=4? user saw no tearing; decide by measurement), boot needs user approval.
+
+## 2026-11-01: 0177 result "still delay while opening apps" -> A/B sweetpresentcpu=4 BOOTED (user approved), awaiting interaction
+- USER (0177): "there are still delay while opening apps."
+- Observed 0177 busy 10 s windows (l177 from 0177-boot-start offset): presents 393-512 per 10 s (0176: 210-419), copy_avg 4.2-6.7 ms, beam_skips 59-420 per window (still high), gate 3-6.3 ms, present max 31-41 ms. Render thread all on cpu7, encode 1.1-2.5 s / 5 s (cpu7 ~50%+ busy).
+- Hypothesis (unverified): SpringBoard main thread (pri 47, ~80-100 ms of work per tap/swipe) gets little A76 time: cpu7 = render thread (54-63), cpu6 = present thread (81) which copies 4-7 ms per frame AND polls the GPU gate with IODelay(50) (~120 block/wake cycles per frame, each preempting cpu6).
+- A/B (no rebuild): same 0177 kernel + `sweetpresentcpu=4` (present thread on an A55). shim/out/payload-0177-present4.bin 3f2b18baa1ae..., shim/out/shim-boot-0177-present4.img 7d6e0734d88a... `fastboot boot` OKAY; 0177-present4-boot-start.json. Boot args show sweetpresentcpu=4, touch bound to cpu 5, BackBoard up. Watch: copy_avg/beam_skips (tearing risk) and the user's open-delay feel.
+
+## 2026-11-01: kernel 0177 (kernel pollers off the A76s) BOOTED with user approval, awaiting interaction
+- macos-14 runner brownout (images retired 2026-11-02) cancelled xnu 41322845287 after 1 s; re-dispatched with `-f runner=macos-15`: xnu 41322973942 SUCCESS (head a1dbd21 = 6118d7c + notes). Use runner=macos-15 from now on (or change the workflow default).
+- Artifact xnu-kernel 13090688379 (API redirect + curl -C - resumes) -> /home/dan/ios-sweet/xnu/out-0177, SHA256SUMS OK, kernel b32d92e32b10...; strings contain the 0177 log lines and boot-args.
+- Packaging recipe verified first: mkpayload of out-0176 + sweet-0152-haptics.adt + the cmdline embedded in payload-0176 reproduces payload-0176 (6e451f5a...) byte-for-byte, and shim build.sh (scratch copy of shim/ + dtb/boot_unpacked) reproduces shim-boot-0176 (f38368c8...). 0177 = same cmdline with sweetbuild=177: shim/out/payload-0177-pollers.bin 82242212afbc..., shim/out/shim-boot-0177-pollers.img 73efd75fdcba... (ramdisk == payload). `fastboot boot` OKAY (no flash); research/native-resume-20261031/0177-boot-start.json (log offset).
+- Observed: sweetbuild=177, "SWEET TOUCH: thread bound to cpu 5", big-core binding on, BackBoard 268 / SpringBoard 270, render commands on cpu7, startup present copy 2.2-2.4 ms. ("delays below" / "present thread cpu" lines print before USB logging starts; not seen.) Boot crashes: assetsd x6, bluetoothd x3, driverkitd x1 (as 0176) + AegirPoster x6 (also seen on older 0172/0173 boots, so not new).
+- Fallbacks: shim-boot-0176-bigbind.img, shim-boot-0175-beam.img. Boot-args to undo parts without a rebuild: sweetdelayspin=0, sweetbigkernel=1, sweettouchcpu=-1, sweetpresentcpu=-1 (unbound).
+
+## 2026-11-01: 0176 result + launch-delay profile -> kernel 0177 (kernel pollers off the A76s) CI pending
+- USER (0176): "animation are much smoother than earlier...current issue is that when opening app there is a slight delay (touch is instant). fix quicklaunch of application, same happens while closing application as well. there are still slight jitters and slow down here and there."
+- USB receiver had died ~20:22 (no process on UDP 5140); restarted 20:33 appending to /home/dan/ios-sweet/logs/live-0172-membus.txt. The user's first 0176 test was NOT captured.
+- **Spontaneous respring ~20:33** (user: "the restart happened itself"): backboardd 260 -> 816, SpringBoard 818, launchd up (same boot). Cause UNKNOWN (log lost; toybox has no dd, od on /dev/rufsroot0 fails EINVAL, /dev/ufsroot0 EBUSY, so the on-disk console ring could not be read live). Next time: keep the receiver alive (check `ss -uanp | grep 5140`).
+- spindump 120 s (`spindump -noTarget 120 10 -noProcessingWhileSampling -noText`, then `-i ... -heavy/-timeline` on the phone; files research/native-resume-20261031/spin-launch-0176/{raw2.spindump,heavy2.txt,tl2.txt}, git-ignored) during user opens/closes of Settings + AppStore. Only 3164 steps in 120 s: stackshots come in bursts of 2-6 then ~110 ms gaps, so timeline durations are rough.
+  - CPU: SpringBoard 23.8 s, kernel_task 20.5 s, backboardd 19.1 s (display.primary 15.3 s), spindump 12.4 s.
+  - SpringBoard main thread does ~8 consecutive samples (~80 ms) of synchronous work per icon tap (_handleTap -> SBToAppsWorkspaceTransaction _beginAnimation) and ~10 (~100 ms) per home-swipe end (_handleSwitcherPanGestureEnded); self time is diffuse UIKit/objc (no hotspot); runnable-not-running only 6 samples. = the "slight delay" is SpringBoard CPU work before the animation commit (observation; which core it ran on is not measurable here).
+  - backboardd display.primary (bound to cpu7 by 0176): running 678, **runnable 123** samples (15% of its active time waiting for cpu7).
+  - kernel_task: touch_thread (tid 0xd0, pri 81) 8.3 s / 120 s and 2.98 s / 45 s idle (~7% of a core always), busy in touch_msg+0x254 and delay_for_interval -> thread_block (249 runnable samples); present thread (0x9b) 7.6 s (copyScaled, present_begin IODelay(50) polls); wl_xport_run 1.7 s. Kernel symbols: tool scratch ksym.py (Mach-O LC_SYMTAB, base = __TEXT_EXEC 0xfffffe00072f8000, same as 0175).
+  - Cause found: SweetCPU never set ml_processor_info.powergate_latency -> cpu_idle_latency 0 -> ml_delay_should_spin() always false -> every delay(1)/IODelay(1) (touch I2C, UFS, GPU power, haptics) blocks on a timer + context switch + wakeup. With 0167 the pri-81 touch thread chases the A76s and preempts the cpu7-bound render thread.
+- FB present windows on 0176 busy (no spindump): copy_avg 6.1-6.6 ms, beam_skips 165-305 per 210-419 presents (0175: copy 3.67 ms, 17.8 skips/1000). Presents up to 42/s. Startup (light) windows copy 2.2 ms on cpu6. Why the copy is slower under load is NOT explained (guess: cpu6 contention or memory traffic).
+- Patch xnu/patches/0177-sweet-keep-kernel-pollers-off-a76.patch (commit 6118d7c, written against the 0176 CI buildtree artifact 13080945545; git apply --check OK; no local clang, not compiled locally):
+  - SweetCPU: info.powergate_latency = 5000 ns (boot-arg sweetdelayspin=<ns>, 0 = old). Log "SWEET CPU: delays below N ns spin". Also makes idle wake 5 us before a timer (SetIdlePop), harmless.
+  - sched_prim 0167 hook: skips kernel_task threads (sweetbigkernel=1 restores).
+  - sweet_touch: touch thread thread_bind to cpu5 (A55) after its 45 s start delay (sweettouchcpu, negative = unbound). Log "SWEET TOUCH: thread bound to cpu 5".
+  - SweetFramebuffer: present thread core from sweetpresentcpu (default 6 = 0176; negative = unbound like 0175). Log "SWEET FB: present thread cpu N". A/B needs only a new payload.
+- Kernel CI xnu 41322845287 dispatched (head 6118d7c). Booting 0177 needs user approval.
+
+## 2026-11-01: kernel 0176 (A76 binding) BOOTED with user approval, awaiting interaction
+- Artifact xnu-kernel 13080851092 fetched via API redirect + curl -C - (6 resumes) -> /home/dan/ios-sweet/xnu/out-0176, SHA256SUMS OK, kernel 4ffac75aff86573d...
+- Payload shim/out/payload-0176-bigbind.bin 6e451f5a6bc2... (0172 cmdline, only sweetbuild=176; sweet-0152-haptics.adt), image shim/out/shim-boot-0176-bigbind.img f38368c8aa854b8a... (ramdisk == payload). `fastboot boot` OKAY (no flash). research/native-resume-20261031/0176-boot-start.json.
+- Observed: sweetbuild=176, "SWEET CPU: big-core binding on", BackBoard 260 with bundle 3e2cc01. Startup render cpu commands=0,0,0,0,0,0,0,150 (all on cpu7; on 0175 startup was 3,7,13,5,5,5,52,50). Boot crash set (assetsd x4, bluetoothd x3, driverkitd x1) identical to the 0175 boot, so not caused by 0176.
+- Fallbacks: shim-boot-0175-beam.img (1035c296...), shim-boot-0174-imports.img; boot-arg sweetbigbind=0 disables binding.
+- Open risk (guess): every SubmitResources caller is bound to cpu7, so if several processes render at once they share one core; watch for that in the interaction run.
+
+## 2026-11-01: 3e2cc01 interaction measured -> render thread 57% on A55; kernel 0176 approved for boot
+- User ran first-time opens / repeat opens / CC / Recents on 3e2cc01 (BackBoard 1111, log offset 31220902..), then "approved boot 0176". Device in fastboot.
+- Observed (sum of all `render cpu` windows): commands 570,264,130,76,42,31,440,516; encode_ms 5730,3135,1414,860,458,333,4131,4826 (cpu0-7). A55 (cpu0-5) = 57% of encode time, 54% of commands. Busy windows during launches put 30-60% of commands on cpu0-2. Per-draw encode A55 171 us vs A76 142 us averaged; in lighter windows cpu0 235 us/draw vs cpu6/7 75-100 us/draw (content differs per window, so this is indicative only).
+- Kernel CI xnu 41298690546 success (head 7d1ee98), artifact xnu-kernel 13080851092.
+
+## 2026-11-01: 3e2cc01 (per-CPU accounting) installed live; kernel 0176 (A76 binding) building
+- Bundle CI 41298294772 success; install-live-3e2cc01.py (ae71977 hashes checked; backup sweet-native-stable-pre-3e2cc01); BackBoard 1111. Startup window already shows the render thread on every core: commands=3,7,13,5,5,5,52,50 (cpu0-7).
+- Kernel patch xnu/patches/0176-sweet-bind-render-threads-to-a76.patch (written against the exact 0175 CI xnu-buildtree, artifact 13077654281): SubmitResources callers thread_bind to cpu7, framebuffer present thread to cpu6 once processor_avail_count==8; same thread_bind/thread_block pattern as SweetCPU.cpp; boot-arg sweetbigbind=0 disables. Kernel CI xnu 41298690546 dispatched. Booting it needs user approval.
+
+## 2026-11-01: ae71977 result: first opens still stutter; CPU topology suspect (instrumentation CI pending)
+- USER (ae71977): "the first opens are still stuttering heavily. but after opening it one or two time its smooth,same with control centre."
+- spin-first.txt process CPU over 240 s: spindump itself 209 s (sampler distorts!), backboardd 153 s, SpringBoard 109 s, kernel_task 63 s, apps ~3 s each.
+- Found: tools/mkadt.py (/home/dan/ios-sweet) describes cpu0-7 as ONE homogeneous cluster ("cluster-type 0 ... homogeneous CLUSTER_TYPE_SMP, not AMP"); board_config SWEET has MAX_CPU_CLUSTERS 1 and no __AMP__. cpu0-5 = Cortex-A55 1.8 GHz, cpu6-7 = Cortex-A76 2.3 GHz. Hypothesis (unverified): CA's render thread runs on A55s much of the time, worst when SpringBoard/app launch work competes (first opens).
+- This commit (backend only): per-CPU render accounting from TPIDR_EL0 bits 0-11 (cpu number on this kernel): "SweetNativeMetal: render cpu commands=... encode_ms=... draws=..." per 5 s window.
+- Candidate fix (kernel, needs boot): bind the render (submitting) thread and the kernel present thread to the A76 cores.
+
+## 2026-11-01: bundle ae71977 (lazy retire) INSTALLED live on 0175, awaiting interaction
+- CI 41296936734 success; install-live-ae71977.py (f206bc5 hashes checked, backup sweet-native-stable-pre-ae71977); BackBoard 869. Startup window cache_us 3.7 ms (was ~190 ms). Strict publish + sysmem + seed-gated cleans unchanged. Interaction offset in ae71977-trial-start.json.
+
+## 2026-11-01: tearing GONE on 0175; first-open stutter profiled -> lazy surface retire (CI pending)
+- USER (0175 + non-strict A/B): "tearing is no longer present. animation feels the same.. opening an app for the first time shows extreme stuttering, but opening andd closing it mutliple times make it knda smooth".
+- Non-strict publish with sysmem again dropped frames (coalesced 20-61/10 s, present max 65 ms) -> strict restored (/var/local/sweet-native-strict-publish back), BackBoard 478.
+- spindump 240 s of first-time app opens (research/native-resume-20261031/spin-first.txt; kernel frames symbolize with base = __TEXT_EXEC 0xfffffe00072f8000 of out-0175): display.primary 112.9 s CPU; ir3q compiler threads only ~1.2 s total; pipeline creation 1.8% -> compilation is NOT the first-open stutter. Render thread: commit 36% (draws reading a texture another batch writes -> fd_batch_resource_read_slowpath -> fd_batch_flush -> kernel submit 16%), blocked on pthread mutex 6.4% (incl. trivial msm_bo_madvise). Completion thread: cache_clean_invalidate 742 samples (~10% of the window) inside retire_dirty under the transport mutex = the lock the render thread waits on.
+- Change (this commit): retire_dirty is a no-op by default (lazy): GPU-dirty IOSurfaces are cleaned on CPU_PREP (existing dirty path) or free; kernel present acquire cleans swap surfaces itself. Kill switch /var/local/sweet-native-eager-retire. Risk: an out-of-process CPU reader of a GPU-written surface could read stale lines if its cache holds lines for those pages (unverified, believed rare).
+
+## 2026-11-01: 0175 result "it still feels the ssme"; non-strict publish A/B started
+- Observed (live-0175.log, BackBoard 260, only 2 busy FB windows): presents 33.8/s, beam_skips still 17.8 per 1000 presents (0174+f206bc5: 16.4) although no "gave up" lines (log limit already used at boot) -> remaining skips come from another beamWait exit (slow-copy check on EMA spikes, or the 2-refresh timeout); unverified which. copy 3.67 ms, beam wait 1.8 ms avg. Render thread: encode 2.41 s/5 s, submit path 0.94 s (fence 0.35, cache 0.30, ioctl 0.42).
+- A/B now (no rebuild): /var/local/sweet-native-strict-publish -> .strict-publish.off, BackBoard 420 = non-strict publication with sysmem (6bddd96's pacing regression was with GMEM). Offset research/native-resume-20261031/0175-nonstrict-offset.txt. Asked user whether tearing persists.
+
+## 2026-11-01: kernel 0175 (beam-race tear fix) BOOTED with user approval, awaiting interaction
+- Kernel CI xnu 41292268733 success; artifact xnu-kernel (gh run download timed out 4x; fetched via artifacts API zip with curl -C - resume + fresh signed URL) -> /home/dan/ios-sweet/xnu/out-0175, SHA256SUMS OK, kernel ea5319541e5a2deb...; beamWait 908 -> 576 bytes vs 0174.
+- Payload shim/out/payload-0175-beam.bin 4b7af6fa60c4... (0172 cmdline, only sweetbuild=175; tools/mkpayload.py + sweet-0152-haptics.adt), image shim/out/shim-boot-0175-beam.img 1035c296f57c4c05... (scratch shim build.sh; ramdisk == payload). fastboot product sweetin; `fastboot boot` OKAY (no flash). research/native-resume-20261031/0175-boot-start.json.
+- Observed: sweetbuild=175, BackBoard 260 with bundle f206bc5 (sysmem env, seed-gated cleans, strict publish, async completion all carried over). Beam windows now start ~1764-1979 (0145: ~1311-1517), all logged waits "ok", some waits 6-7 ms (expected: start window is later).
+- Fallback image: shim/out/shim-boot-0174-imports.img (e4418c38...).
+
+## 2026-11-01: f206bc5 result: "feels better" but TEARING -> kernel 0175 beam-race fix (CI pending)
+- USER (f206bc5): "it feel better. but there are tearing happening in recent menu and while app opening and closiing animation".
+- Observed (live-f206bc5.log, BackBoard 2626): presents 29.2/s, present max 26-33 ms (was 22-39), cache walks 2.25 GB/5 s (was 4.1; surface_cleans 0-8 vs skips 95-454 per window), completion polls 1066/5 s (was 3657). beam_skips 48 in 10 busy windows = 16.4 per 1000 presents (0.3-1.3 before); copy_avg 3.56 ms (2.6-3.1 before). Every logged "gave up" read line 2432 = total lines (vertical blanking) and broke out at once.
+- Cause (analysis of 0145 beamWait, panel 2432 lines, active 12-2412, line 3426 ns, copy ~0.85-1.6 us/row): a copy begun at scan row b crosses the scan at b/(1-c/s); rows below that show the new frame in the current refresh -> tear unless b >= rows*(1-c/s). 0145 inflated c by 1.5x, which LOWERS that bound: starts at ~1311-1517 cross the scan around row ~1900-2000 at real copy speed = tear in the lower fifth on every motion frame. Plus the vblank give-up = unsynchronised copies.
+- Fix: xnu/patches/0175-sweet-beam-race-tear-fix.patch: start row for a copy 1.5x FASTER than average (window ~1943-2396), slow-copy check unchanged, vblank reading waits from the wrap, loop bounded by two refreshes. Applies on the series (reconstructed SweetFramebuffer.cpp from 0119-buildtree + repo patches = earlier reconstruction, md5 8774028195e8...). Needs a NEW KERNEL IMAGE = user approval before boot.
+
+## 2026-11-01: bundle f206bc5 INSTALLED live (CI 41291238000), awaiting interaction
+- install-live-f206bc5.py (3016190 hashes checked; backup sweet-native-stable-pre-f206bc5); BackBoard 2626. Markers: seed-gated clean + strict publish + sysmem env. First window: surface_cleans=2 vs skips=144 (cache walk remaining 1.5 GB/6 s is retire/CPU_PREP side). Interaction offset in f206bc5-trial-start.json.
+
+## 2026-11-01: 3016190 measured (+46% presents); next: seed-gated surface cleans + completion poll backoff (CI pending)
+- Observed 3016190 busy windows (live-3016190.log, BackBoard 2443, sysmem+strict): presents 29.3/s (was 20.1), more commands/draws per 5 s, failures 0, present max 22-39 ms (still hitches). BO pool 41-181 hits per 5 s, pool 32-63 MiB; kernel alloc calls 18-297/10 s (was ~376), free 1-194 (was ~381). User feel: not yet reported.
+- Remaining render-thread submit path ~1.2 s/5 s: cache walks 0.51 s (4.1 GB), ioctl 0.45 s (~750 us each, kernel scoped submit ~5 us/BO), publication wait 0.37 s. Kernel WaitFence 3300-3500 calls/10 s at ~176 us (completion-thread polls contending for the kernel GPU lock).
+- Change (this commit): (1) pre-submit IOSurface clean skipped while IOSurfaceGetSeed is unchanged since this handle's last clean (CPU writers bump the seed on unlock; CPU_PREP through this driver invalidates; first publication always cleans; kill switch /var/local/sweet-native-always-clean); transport line gains surface_cleans/surface_clean_skips. (2) completion thread poll back-off 250 us -> 2 ms.
+
+## 2026-11-01: bundle 3016190 (VA fix + BO pool) INSTALLED live on 0174, awaiting interaction
+- CI 41290677888 success (62000b6 alone: CI 41290540871 success, not installed). install-live-3016190.py: efbea0e hashes checked, backup /private/var/db/sweet-native-stable-pre-3016190. Old BackBoard 2037 took ~2 min to exit; new BackBoard 2443. Env still FD_MESA_DEBUG=sysmem + strict publish. Interaction offset in 3016190-trial-start.json.
+
+## 2026-11-01: sysmem A/B + render-thread CPU profile -> quadratic GPU-VA search fixed (CI pending)
+- USER (FD_MESA_DEBUG=sysmem): "still feels very stuttery.. also icons are missing from control centre (it was like that since the biginning of nativbe driver build). lets focus on fixing the performance".
+- Observed sysmem vs GMEM-strict (live-sysmem.log): GPU completion latency 16 vs 22 ms, present gate 1.6-5.8 vs 6-12 ms, present max 21-36 vs 25-58 ms, coalesced 0; presents 20/s (content-dependent). GPU no longer the main limit. sysmem env still active on the phone (/var/local/sweet-native-env = FD_MESA_DEBUG=sysmem); trace env parked at /var/local/sweet-native-env.trace-off.
+- spindump backboardd 300 s during interaction (research/native-resume-20261031/spin-sysmem.txt; profiler tools/sweet-spindump-profile.py symbolizes with the artifact's native-metal-symbols): rendering is on CA thread "com.apple.coreanimation.display.primary" (21.5 s CPU; render-server 1.1 s; completion 2.5 s). Of 925 busy samples: commit 453, drmCommandWriteRead 379, texture creation newTextureWithDescriptor->fd_resource_create->msm_bo_new->transport allocate 208 (**163 self in allocate = inlined reserve()**), flush_deferred_submits 195, fd_draw_vbo 260, CA itself ~470.
+- Cause: transport reserve() restarted a scan of all 4096 slots after each VA collision (O(n^2) in live buffers; freedreno's BO cache keeps thousands). CA allocates textures in bursts when animations start (app open/close, Control Center) -> CPU spikes = stutter candidates.
+- Fix (this commit): ordered std::map iova->size of live/quarantined buffers, one first-fit pass with the identical 64 KiB alignment and guard rule. Host simulation: identical addresses to the old search over 4000 random alloc/free steps.
+- Control Centre icons missing since the first native build: known rendering bug, deferred at the user's request (performance first).
+- Second fix (next commit): owned-buffer recycle pool in the transport. Kernel stats per busy 10 s: alloc ~376 x 213 us, map ~392 x 560 us, free ~381 x 1.3 ms (BoFree waits for the GPU). Retired non-IOSurface BOs (last fence waited, still CPU+GPU mapped at their VA) are kept up to 64 MiB (<=16 MiB each) and reused for an exact-size allocation with no kernel calls; transport line gains bo_pool_hits/misses/MiB. Host syntax check with stub headers: no errors in the new code.
+
+
+## 2026-11-01: per-pass GPU trace (efbea0e) -> GMEM load/store dominates; FD_MESA_DEBUG=sysmem A/B live
+- USER (strict publish restored): "feels about the same as 3ed81f4 now, tho slightly worse. go ahead and fix all the stutters".
+- efbea0e (CI 41288327280) installed live (install-live-efbea0e.py; backup sweet-native-stable-pre-efbea0e). /var/local/sweet-native-env works (marker "env file sets ..."). Strict publish flag still set.
+- GPU TRACE (MESA_GPU_TRACES=print, ~190 s incl. user interaction, BackBoard 1797; local research/native-resume-20261031/gputrace/efbea0e-trace.txt, git-ignored; summariser tools/sweet-gputrace-sum.py): 93771 passes, pass GPU time 80.2 s = 42% of span. Phases: draw_ib 45.2 s, tile_stores 16.8 s, tile_loads 14.6 s, binning 0.4 s.
+  - 1125x2436 mrts=2 GMEM 54 bins (192x288): 14135 passes, 64.0 s = **80% of GPU time**, 4.53 ms/pass = draw 2.15 + stores 1.16 (store 0xc = COLOR0+COLOR1) + loads 1.01 (load 0xc mostly).
+  - 1125x2436 mrts=2 SYSMEM (autotune bypass): 4815 passes, 1.36 ms/pass (content may differ: selection bias).
+  - Nearly every CA pass binds a 2nd colour attachment (RGBA16F per pipeline logs, often writeMask 0); freedreno loads+stores every bound valid cbuf regardless of colormask; the frontend ignores Metal load/store actions (setColorStoreAction: is a no-op).
+- A/B started: /var/local/sweet-native-env = FD_MESA_DEBUG=sysmem (tracing off; trace env saved as /var/local/sweet-native-env.trace-off), BackBoard 2037. Offset research/native-resume-20261031/sysmem-offset.txt.
+- Planned fix if GMEM must stay: honour MTLStoreActionDontCare/MTLLoadActionDontCare via pipe->invalidate_resource (freedreno clears resolve/restore bits).
+
+## 2026-11-01: 6bddd96 interaction result: worse pacing -> strict publish restored; GPU is the limit
+- USER (6bddd96): "its slightly worse than earlier.. tho some parts of the UI feels smooth. still very stuttery."
+- Observed (9-12 busy windows, live-6bddd96.log, BackBoard 1546, no replay): render-thread fence 0.05 s/5 s (was 0.63), encode 2.08 s (was 2.50), but GPU busy 62-67% (was 54), present gate 7-12 ms, present avg 12-17 ms / max 39-90 ms, coalesced (dropped) swaps 2-67 per 10 s (was 0), presents 23.5/s. Cache walks unchanged ~3.5 GB/5 s (the in-flight-write skip rarely applied).
+- Interpretation: removing the drain let the CPU queue more GPU work; the GPU (~20 ms GPU per command, ~28 ms per frame) is now the cap and the deeper queue made pacing uneven. ACTION: touched /var/local/sweet-native-strict-publish on the phone and restarted BackBoard (strict marker confirmed) = 3ed81f4 publication + async completion + oldest-job EBUSY wait. 6bddd96 binary remains installed.
+- Next (this commit, transport only): /var/local/sweet-native-env (KEY=VALUE, FD_/IR3_/MESA_/GALLIUM_ only) applied in drmOpenWithType before freedreno reads its options, for per-pass GPU timing (MESA_GPU_TRACES=print + MESA_GPU_TRACEFILE) and FD_MESA_DEBUG sysmem/nobypass A/B without rebuilds. Not yet built.
+
+## 2026-11-01: bundle 6bddd96 (no publication drain) INSTALLED live on 0174, awaiting interaction
+- CI 41287261092 success; artifact research/native-metal-artifact-6bddd96 (source 6bddd965358..., not hardware-qualified). install-live-6bddd96.py: 3ed81f4 hashes checked, backup /private/var/db/sweet-native-stable-pre-6bddd96, files read back; BackBoard restarted -> PID 1546, SpringBoard 1548. No image boot.
+- Observed markers: "IOSurface publication without GPU drain" + async completion thread; first window failures=0, transport fence_us=0.
+- Interaction offset 26443442 (6bddd96-trial-start.json).
+
+## 2026-11-01: 3ed81f4 interaction result; next: no publication drain (CI pending)
+- USER (3ed81f4 on 0174): "feels smoother now (sub 50fps and stutters here and ther)". BackBoard 741 up 49 min, no graphics crash, completion failures=0. (assetsd crash loop sig 6 is pre-existing/unrelated. USB replayed an old boot log block of BackBoard 261 mid-trace; trace research/native-resume-20261031/live-3ed81f4.log, analysis excluded lines ~3316-11800.)
+- Observed, 3 busy 5 s windows (mean): commands 149, draws 13.8k, encode 2.50 s (draw_vbo ~2.0 s), finish 0.25 s (was 1.90 s), completion latency avg 23 ms / max 111 ms, wait_until_completed 4.7. Transport: 616 submits, submit_cpu 1.31 s = fence 0.63 + cache 0.45 (4.2 GB) + ioctl 0.35. Presents 146-225 per 10 s; present gate now 6-7 ms (present thread waits the GPU, expected), present max 24-33 ms. gpu_busy 54%.
+- Interpretation: the commit wait is gone, but the transport's submit (called from draw_vbo mid-command) still drains ALL earlier GPU work at the first publication of an imported surface every command, and cache-walks ~22 MB/command (two framebuffer-sized walks: pre-submit clean + retire).
+- Change (this commit, transport only): default publication no longer drains the GPU; a surface whose GPU write is still in flight is not cleaned (no CPU data to publish; a clean then cannot be both correct and useful); CPU-written surfaces are still cleaned every time. Stale lines are dropped lazily (retire_dirty when idle, CPU_PREP, kernel sweet_fb_acquire does its own physical CIVAC before the present copy). EBUSY (8 kernel jobs) now waits the oldest outstanding fence, not the newest. Kill switch: touch /var/local/sweet-native-strict-publish + restart backboardd.
+
+## 2026-11-01: bundle 3ed81f4 (async command completion) INSTALLED live on 0174, awaiting interaction
+- c8eae3b CI 41282865117 FAILED (backend header used bool without stdbool.h); fix 3ed81f4, CI 41283247403 success. Artifact research/native-metal-artifact-3ed81f4 (source 3ed81f416a3c..., not hardware-qualified).
+- Installed with research/native-resume-20261031/install-live-3ed81f4.py (prior bundle 1df4ee1 hashes checked, backup /private/var/db/sweet-native-stable-pre-3ed81f4, staged files read back and hash-verified), BackBoard restarted: new PID 741, SpringBoard 743. No image boot.
+- Observed: marker "command buffers complete asynchronously on a completion thread"; first busy window: 145 commands completed, latency avg 2.3 ms / max 17.8 ms, 1 handler per command, failures=0, **wait_until_completed=0** (CoreAnimation does not block on completion), transport fence_us=2 ms (was hundreds of ms per window).
+- Interaction offset: 24936980 (3ed81f4-trial-start.json). Rollback: touch /var/local/sweet-native-sync-commit + restart backboardd, or restore the backup bundle.
+
+## 2026-11-01: 0174 interaction measured; async command completion implemented (CI pending)
+- USER (0174 + bundle 1df4ee1): "scrolling in recent menu feels like 50fps, settings page: 40fps. everything else (app opening and closing, control centre drag down, up, app centre) is still under 30fps. but still better than earlier".
+- Observed busy-window means (trace from offset 24367286; BackBoard 261, no crash):
+  | metric | 1a6b5dd/0172 | 1df4ee1/0172 | 1df4ee1/0174 |
+  |---|---|---|---|
+  | us per submit ioctl | 2199 | 2409 | **605** |
+  | submit ioctl ms /5 s | 1530 | 1128 | 277 |
+  | transport fence ms /5 s | 646 | 956 | **1577** |
+  | frontend encode / finish ms /5 s | 2333/977 | 2065/1391 | 1462/1897 |
+  | presents/s (10 s windows >=100) | 17.0 | 16.7 | **23.7** (21-31) |
+  Kernel: gpu_busy_pct 27-46, RBBM idle=0% while a fence is out; present thread avg 6.5-7.0 ms (gate ~0.05, acquire 0.8, copy 2.5, beam 3.0).
+- Conclusion: 0174 removed the kernel import walks (4x cheaper ioctl). The largest remaining item on BackBoard's render thread is the synchronous GPU wait inside every -commit (rwa_command_end -> fence_finish, ~1.6-1.9 s per 5 s), serialized with encode (~1.5 s) under one global object lock: CPU and GPU take turns. The kernel present already runs on its own thread (0128; swap only records), so the commit wait is pure render-thread loss.
+- Change (this commit): asynchronous command completion.
+  - backend: rwa_command_submit flushes and forces freedreno's deferred submits into the kernel (fence_finish timeout 0 = flush, no wait) and returns the newest kernel fence; rwa_command_poll.
+  - transport: sweet_transport_poll_fence does the WaitFence(timeout 0) IOKit call WITHOUT the transport mutex, then retires GPU-written imports. New retire_dirty() skips a surface while any alias handle is still in flight (used by wait/command_end/poll).
+  - frontend: commit stays SCHEDULED; a QoS user-interactive completion thread polls (200 us) in commit order, sets COMPLETED, delivers completed handlers OUTSIDE the object lock (dispatch_async to the queue's completion queue if set). 2 s timeout -> error + device lost, as before. Stats line "SweetNativeMetal: async completion ... wait_until_completed=N".
+  - In-flight bound is the existing transport rule: the first submit of a command that publishes an imported IOSurface waits all earlier GPU work. So encode of N+1 overlaps GPU N, ~1 command in flight.
+  - Rollback without reinstall: `touch /var/local/sweet-native-sync-commit` + restart backboardd = old synchronous commit.
+- Known risks (unverified): app-owned IOSurfaces are not marked GPU-in-use by this driver, so an app could redraw a surface the render server's GPU is still sampling (one-frame artifact). In-flight BO frees now wait in release() (transport) instead of never waiting.
+
+## 2026-11-01: kernel 0174 BOOTED (fastboot boot, no flash), awaiting interaction
+- 12:05 IST: fastboot product sweetin, image shim-boot-0174-imports.img sha e4418c38...a53c1c verified, `fastboot boot` OK (research/native-resume-20261031/fastboot-0174-boot.log; start offset in 0174-boot-start.json).
+- Observed: launchd boot-args include sweetbuild=174 (no sweetimportsync => 0, client maintains imports); BackBoard PID 261 loaded bundle 1df4ee1 (merge marker present), compiling CA pipelines, no crash seen so far.
+- First idle/startup transport window: submits=140 submit_ioctl_us=36089 (~258 us/ioctl vs ~2400 us on 0172+1df4ee1). Not an interaction measurement yet.
+- Interaction trial start offset: research/native-resume-20261031/0174-trial-start.json (24367286). Next: same interaction test, compare vs 1df4ee1/0172 table below. Fallback: boot shim-boot-0172-rbbm.img (b988abd8...).
+
+## 2026-11-01: 0174 image packaged; user APPROVED boot of 0174
+
+Kernel CI41270082742 PASSED; /home/dan/ios-sweet/xnu/out-0174 SHA256SUMS OK
+(kernel 02fb74b2...). Mach-O symtab: publishHandle 180->244 and acquireHandle
+168->232 bytes vs out-0172 (+16 insns each), symbol count equal (71881).
+Packaging in scratch copy of shim/ reproduced shim-boot-0172-rbbm.img
+byte-identically (b988abd8...) first. Payload shim/out/payload-0174-imports.bin
+(c0851d36...) = 0172 cmdline with only sweetbuild=174. Image
+/home/dan/ios-sweet/shim/out/shim-boot-0174-imports.img SHA256
+e4418c38acb4d11ff7d54e5e7d0afc101e4e0b1c890da2b00429f73b0ba53c1c; ramdisk ==
+payload verified. User said "approved, boot 0174 when it's ready". Phone must be
+put in FASTBOOT manually (no recorded iOS->fastboot path). Bundle stays 1df4ee1.
+Fallback: fastboot boot shim-boot-0172-rbbm.img (or sweetimportsync=1 image).
+First fastboot watcher (product sweetin + image hash check, then fastboot boot)
+timed out 10:19 IST with no fastboot device; NO boot. Phone still iOS 0172,
+BackBoard13337/1df4ee1. Watcher re-armed; still waiting for user FASTBOOT.
+Second watcher also timed out 11:09 IST; NO boot; phone still iOS 0172,
+BackBoard13337. Not re-armed; resume when user reports FASTBOOT (approval for
+this exact image e4418c38... stands; re-verify product/hash before boot).
+
+## 2026-11-01: kernel 0174 (scoped submits skip client-maintained imports) building
+
+xnu/patches/0174-sweet-scoped-submit-client-imports.patch: publishHandle and
+acquireHandle return early for imports where !kernelMaintainsImport (same rule
+as publishMapped/acquireImported; <sweetimportmin 2MiB still kernel-maintained).
+Counts in native_adreno_coherent_skips[2]/[3]. Rollback without new image:
+boot-arg sweetimportsync=1. GLES client (userspace/gles) relies on kernel
+maintenance -> GLES boots MUST use sweetimportsync=1 with 0174+.
+Verified: patches 0000-0172 byte-identical to running kernel source
+(adreno-power-audit 4593b00, CI40990286076); only extra inputs 0173 (plugin
+choice only when sweetnative=1; cmdline lacks it -> still SweetMetal2) + 0174.
+Patch applies to post-0172 reference tree. NOTE /home/dan/ios-sweet branch has
+a DIFFERENT 0173 (bus votes, no help); numbering diverges across branches.
+Kernel CI xnu.yml run 41270082742 dispatched on codex/native-adreno-metal.
+(41090044142 earlier failed only for runner capacity.) Payload recipe checked
+byte-identical: tools/mkpayload.py xnu/out-0172/kernel.development.sweet
+shim/out/sweet-0152-haptics.adt OUT --cmdline "<payload-0172 cmdline>"; for 0174
+change only sweetbuild=172 -> 174; then bash shim/build.sh <payload>.
+NOT booted. Boot requires explicit user approval of the specific image.
+
+## 2026-11-01: 1df4ee1 interaction result: slightly smoother, still under 30fps
+
+User: "slightly smoother but still under 30fps". PID13337, no BackBoard crash,
+no submit failure. Saved live-1df4ee1.log. Busy 5s windows (draws>=5000) mean,
+1a6b5dd (52 windows) -> 1df4ee1 (6): submits/command 6.9 -> 3.8; submit ioctl
+1530 -> 1128ms; commands 107 -> 123; encode 2333 -> 2065ms; finish 977 -> 1391ms;
+fence 646 -> 956ms; us/ioctl 2199 -> 2409; presents/s 17.0 -> 16.7 (FB 10s).
+Per command encode+finish ~30.9 -> ~28.1ms. Interpretation: per-ioctl cost
+ROSE with merged lists, consistent with kernel cost scaling with imported bytes
+listed per call (IOSurface walks), not per call. Deferring every batch to the
+end also removed in-command CPU/GPU overlap, so the final wait grew. Merged
+submits cluster at IBs=8-9: fd_ringbuffer_cmd_count overcounts (+1 each) so the
+16-IB cap closes early; not changed. Boot log: sweetimportsync=0, sweetgpuwb=0,
+native_adreno_io_coherent never set -> SubmitResources walks imports each call.
+Remaining evidenced costs: kernel per-submit import walks ~1.1s/5s, GPU fence
+wait ~1.0s/5s (frontend completes each command synchronously).
+Next: kernel 0174 so publishHandle/acquireHandle skip imports the client
+maintains (kernelMaintainsImport), keeping <2MiB kernel-maintained imports.
+Build allowed; BOOT NEEDS USER APPROVAL. New kernel would also include 0173
+(opt-in sweetnative=1). Then consider asynchronous command completion.
+
+## 2026-11-01: 1a6b5dd active trace -> submit ioctl bottleneck; 1df4ee1 merges submits, installed
+
+MEASURED 1a6b5dd busy 5s windows (live-1a6b5dd-active.log, PID13033, no BackBoard
+crash; only pre-existing assetsd abort): 446-888 submits for 85-150 commands
+(5-9 ioctls/command), submit_ioctl_us 0.9-2.0s/5s (~2.2ms each), encode 2.0-3.1s,
+draw_vbo 1.6-2.6s (contains batch flushes/submits; overlapping), finish 0.6-1.5s.
+Kernel scoped submit total_us 0.7-3.3ms, NOT correlated with IB count.
+Cause (code reading of 0117/0132/0140): SubmitResources -> publishHandle ->
+publishForDevice walks EVERY imported IOSurface's physical pages on EVERY call;
+kernelMaintainsImport/sweetimportsync only gate legacy publishMapped. Release
+also acquireHandle-walks written imports. Upstream freedreno never merged CA
+submits: should_defer refuses shared BOs (implicit-sync rule) and >30 BOs.
+Kernel also: SubmitMaxJobs=8 (EBUSY -> transport waits latest fence), BoFree
+drains GPU (~1.25ms avg). Kernel 10s method line truncates at 320 chars before
+submit-res; not visible there.
+Presentation: vsync timer 120 callbacks/s, missed_deadlines=0, but only 11-22
+presents/s in use; present path ~5-6ms kernel CPU copy (copy~2.5ms, beam
+1.2-2.4ms, acquire~0.85ms). Panel INTF_1 earlier MEASURED 8.333ms (120Hz).
+Frame rate limited by rendering, not vsync; present copy matters for 120Hz later.
+1df4ee1 (tools/build-sweet-native-metal.py adapt_submit_merging, exact-context
+Mesa edit of freedreno_ringbuffer_sp.c): shared BOs no longer block deferral;
+30-BO cutoff replaced by merged caps 16 IBs (one ABI request, no resent lists)
+and 1024 BOs; pending list flushed first if a submit would overflow.
+no_implicit_sync stays false so shared-BO cpu_prep still reaches transport
+CPU_PREP; bo_flush/fd_fence_flush flush deferred work before CPU access/waits;
+deferred submits hold BO refs. Host -Wall syntax compile clean
+(submit-merge-host-compile.log). CI41268911551 PASSED; artifact
+research/native-metal-artifact-1df4ee1, six hashes/arm64/marker/symbols checked.
+Installer matched 1a6b5dd manifest, saved host pre-hotfix-1df4ee1 and phone
+/private/var/db/sweet-native-stable-pre-1df4ee1, readbacks+SYNC, swap, restarted
+BackBoard13033 -> 13337. No image boot. Offset 1df4ee1-trial-start.json.
+First startup window: 147 commands -> 147 submits/331 IBs (was ~5-9/command).
+Startup only, NOT interaction result. Pending: same active interaction compare
+(submits/command, submit_ioctl_us, encode/finish, presents/10s) + user feel.
+Possible next (needs boot approval): kernel publishHandle/acquireHandle honor
+kernelMaintainsImport for client-maintained imports; method line buffer size.
+Not prepared. Longer term: CPU/GPU overlap (frontend waits each command).
+
+## 2026-11-01:1a6b5dd static UBO upload bounds installed live
+
+CI41267543131 PASSED. Source commit, six hashes/arm64/static-bound counters/VPC
+marker and native symbols verified. Installer checked0741b70 manifest, saved host
+pre-hotfix-1a6b5dd and phone sweet-native-stable-pre-1a6b5dd, verified readbacks,
+SYNC and swapped; restarted BackBoard12691. No boot image/partition change.
+Current phone1a6b5dd. User interaction/performance/stability question explicitly
+names1a6b5dd; pending. Snapshot live-1a6b5dd.log and trial-start offset saved.
+Do not claim FPS solved. Need actual avoided_bytes,copy_us and active result.
+Possible future direction for dynamic unaligned UBOs: GPU-side aligned copies or
+read-only SSBO lowering with per-binding byte bias. IMPORTANT both A6xx UBO and
+SSBO offset alignment caps are64, so naïvely changing UBO to SSBO will NOT solve
+unaligned Metal offsets. Such a redesign needs checked reserved-slot availability,
+NIR resource collision handling, bias table and retained fence/resource semantics;
+not implemented. Current static-only proof deliberately avoids those changes.
+
+## 2026-11-01: user confirms751e784 and0741b70 still slow, stable
+
+Both pending answers received: still slow; stable for texture-state reuse and
+constant-upload cache. Current phone0741b70; no performance success claimed.
+Saved live-0741b70-still-slow-stable.log. Prepare conservative static UBO upload
+extents: optimized NIR scanned for direct load_ubo constant byte offsets, maximum
+exclusive read rounded64. Any dynamic offset, indirect UBO index, unknown UBO op,
+vec4 offset semantics or arithmetic overflow disables trimming for affected slot
+(or all slots when binding unknown). Argument-buffer members keep original range.
+New internal air_resource.native_read_bytes is appended, reset for each scan;
+AIR declared size validation unchanged. Only unaligned CPU upload length may
+shrink, only if proven bound is smaller than existing want. No arbitrary cap,
+shader edits, dynamic vertex guesses, or resource removal. Counts actual avoided
+bytes. Sampler-view reference fix, symbol artifacts and cache invalidations kept.
+Pristine source preparation and host C syntax compilation passed. Current session
+restricted network/approval-never again. No new build/install yet; next push CI
+and qualify byte/time savings on hardware. Dynamic captured vertex accesses with
+range=-1 intentionally retain old full upload length.
+
+## 2026-11-01:0741b70 first sample exposes oversized constant copy ranges
+
+First startup sample: upload hits160,misses470,copy305463us,77459660 bytes.
+Driver constant calls376us versus copy305ms; do NOT call this a total cost fix
+just because driver_us fell: work now appears in explicit copy_us. Reuse helps
+only repeated source/length within a command. Actual animation result pending.
+Potential next optimization: tighten uploaded UBO bytes to shader-proven ranges,
+keeping full spans for dynamic/unknown access. Captured runtime-vertex0.nir
+load_ubo offsets are dynamic with range=-1; cannot safely trim these based on a
+constant-only guess. Do not cap uniform uploads arbitrarily or alter shader
+semantics for FPS. Need binding source/size ranges and proven NIR/draw bounds
+before implementing trimming. No trimming code has been added yet.
+Snapshot live-0741b70.log updated; user feedback question explicitly targets0741.
+Previous pending751 question must not be mistaken for0741 result. Current0741.
+
+## 2026-11-01:0741b70 upload cache installed live, interaction pending
+
+CI41266007772 PASSED; source commit, six hashes/arm64/VPC/upload-cache marker
+and symbols verified. Installer checked751e784 active manifest, saved host
+pre-hotfix-0741b70 and phone sweet-native-stable-pre-0741b70, staged/readback
+verified and SYNC, then swapped/restarted BackBoard12536. No image boot.
+Current phone0741b70. Previous751e784 trial had no matching crash record for
+PID12536 but no user active performance report yet. New async question explicitly
+names0741b70 to avoid mixing pending751 feedback. Need check upload hit/miss and
+copy_us plus driver_us; then interaction/stability result. No FPS claim.
+Snapshot live-0741b70.log and trial-start byte offset retained. Preserve lifetime
+fix, symbols, command cache ownership, real final fences and resource retention.
+
+## 2026-11-01: binding counters identify constants; cache repeated aligned uploads
+
+751e784 is installed. Startup/early-use binding driver counters: constants208344us,
+views494us,images10us,samplers46us; constant path dominates measured driver binding
+cost. Not evidence of achieved FPS. User interaction result still pending.
+Prepared bounded per-command256-entry cache for unaligned constant user-buffer
+uploads. Reuses freedreno's same stream_uploader (alignment64), retains returned
+GPU resource/range and keys by source pointer/size/invalidation generation. Shares
+copies across binding slots/stages/nonadjacent draws. Invalidates generations at
+barriers,compute entry and GPU buffer writes, retaining old allocations through
+real command completion. Releases cached own resource references after final
+fence; overflow/allocation failure uses original driver binding path. Existing
+last-binding cache and sampler-view reference fix retained. Counts upload hits,
+misses,copy time and bytes separately from driver binding time to avoid hiding cost.
+Pristine source prep and host C syntax compilation passed. No installation of
+this follow-up yet; current phone751e784. Need validate reuse/performance/glitches.
+
+## 2026-11-01:751e784 texture-state reuse installed live
+
+Full access restored by user. Push succeeded. CI41264954930 PASSED for751e784.
+Six hashes/arm64/VPC/binding marker verified; pre-strip symbol artifacts present.
+Installer matched9dff3a6 active manifest, saved host pre-hotfix-751e784 and phone
+sweet-native-stable-pre-751e784, staged/readback verified and SYNC, then swapped
+and restarted BackBoard6202. No boot image/partition changes. Current751e784.
+User interaction feedback requested asynchronously (performance and stability);
+pending. No FPS improvement claimed. Snapshot live-751e784.log; trial-start
+contains initial byte offset. Keep sampler-view reference correction, inspect
+binding driver_us breakdown to choose next measured optimization.
+
+## 2026-11-01: continue performance work on stable9dff3a6 baseline
+
+Filtered live-9dff3a6-current.log by new build load-base records: PID6202 only;
+no CRASH backboardd[6202] line. Prior unfiltered stability snapshot contained
+replayed older crash PIDs5715-5918: do NOT call those new-build crashes.
+User earlier reports no restart so far. Main rendering/performance still slow.
+Reapplied deferredcd9c9e9 texture/image/sampler state reuse onto current source,
+preserving sampler-view reference release, surface cleanup, image base logging
+and pre-strip symbols. Cache lives within command retention scope; final cleanup
+and next-command invalidation retained. Adds per-binding driver call time/reuse
+counts. Pristine pinned donor generation succeeded, host C syntax compile passed,
+explicit sampler/surface release checks passed. No hardware qualification or
+new installation yet. Current phone9dff3a6. Latest session restricted network.
+Next push CI, verify symbols/hash/source, install reversibly against9dff manifest,
+then compare active driver binding categories without mixing startup/idle windows.
+
+## 2026-10-31:9dff3a6 user reports no restart so far
+
+User used launcher/apps after lifetime fix and reports "No restart so far".
+This is a short positive stability observation, not proof of indefinite stability.
+Saved live-9dff3a6-stability.log for comparison. Keep this build as current
+stability baseline. Resume performance work while preserving reference-counted
+sampler-view release and native symbols. Pendingcd9c9e9 texture state reuse was
+never installed and is deferred in local snapshots, not in current source.
+Current session again restricted network/approval-never; no phone mutation made
+in this turn. Do not claim performance improved based on stability response.
+
+## 2026-10-31: sampler-view correction9dff3a6 installed live
+
+CI41226882019 PASSED. Six artifact hashes, arm64/load-base markers and backend/
+legacy pre-strip symbol files verified. Activeb46ada7 manifest matched; host
+pre-hotfix-9dff3a6 and phone sweet-native-stable-pre-9dff3a6 saved; stage readback,
+SYNC and directory swap completed; restarted BackBoard5987. No image boot.
+Current phone9dff3a6. User asked to use launcher/apps for about1min and report
+whether restart persists; pending. Crash root writer is still unproven; API
+reference-release defect corrected, not yet established as sole root cause.
+Snapshot live-9dff3a6.log and offset9dff3a6-trial-start.json. New backend/frontend
+base log lines plus native-metal-artifact-9dff3a6/native-metal-symbols/*.symbols.txt
+allow symbolicate-native-images.py to resolve FUTURE native crashes for this build.
+Oldb46 crash native base unknown; shared-cache symbols prove malloc corruption.
+Do not claim crash/performance fixed before active result. No pending texture-
+binding experiment included; cd9c9e9 saved locally and deferred for stability.
+
+## 2026-10-31: BackBoard heap corruption; sampler-view reference correction
+
+User reports launcher restarting; slight animation improvement but under20fps.
+Phone remainsb46ada7; active backendSHA f41c491189c2b4a1f22c5dc8c4a2738ce4e64710388ed65a3a9ef36bdcdded4f.
+Saved live-b46ada7-launcher-restarts.log. Crashes5715/5746/5831 SIGABRT;
+shared-cache local-symbol scan identifies malloc_vreport, malloc_zone_error,
+free_list_checksum_botch, tiny freelist allocation/free. Crash5891 SIGSEGV
+PC0x10608f664 FAR0x100000007 with backend-like frames; load base unknown.
+No fresh crash reports in phone CrashReporter. launcher-cache-symbols.txt and
+symbolicate-launcher.py in local research. Heap corruption is observed, exact
+writer not yet identified. Do not claim a proved root cause from malloc abort.
+Concrete API bug: donor texture_destroy directly invokes sampler_view_destroy,
+bypassing Gallium reference counting. Correct to pipe_sampler_view_reference
+(&texture->view,NULL). This preserves retained context/cache references. Add
+runtime backend/frontend load bases and CI pre-strip symbols for future frames.
+Hold uninstalledcd9c9e9 performance experiment: saved snapshots in research;
+source adaptation/extension reset to installedb46ada7 baseline before lifetime fix.
+Other performance fixes and correct rendering remain. Host C syntax compile
+passed; pinned source generation passed. No device update yet.
+User reference oosexgang/hakios-metal reviewed README,plugin,command,transport via
+GitHub API. README explicitly says shaders NOT YET joined; current supports CP
+blits, BOs/fences/command lifetimes. Not a finished CA renderer to drop in.
+Use its retained-command resources/fence discipline as reference, not its foreign
+HakiosGPU selectors on NativeAdreno ABI1. Do not disable crash signals.
+
+## 2026-10-31: b46ada7 still slow; measured coarse utilization15-20%; binding reuse extended
+
+User asks actual GPU utilization and fix underutilization. Saved interaction trace
+live-b46ada7-still-slow.log. Kernel gpu_busy_pct is a SAMPLING estimate of latest
+GPU fence outstanding, excludes lock-held samples; NOT a cycle counter. Active
+windows report15-20%, with193-295 lock-held samples/10s. While fence outstanding,
+SP active in65-75% samples, UCHE85-95%, CP100%. Presentation94-115/10s ~=9-12fps.
+This supports substantial CPU starvation, not a saturated GPU; no GPU clock claim.
+Active5s frontend bindings reach2340022us; other window5517draws/5s bindings
+1834788us,VBO1482463us. Command ownership reduced client cache walks from busiest
+~10761MiB/5s to1393-1672MiB/5s in busy windows, but UX remains slow.
+Next code caches identical texture-view, image-view and sampler state per shader
+stage within a command (resources retained, clear at final fence, invalidate state
+cache at next command start). Skips redundant freedreno validation and binding
+state updates. Adds driver-call timing categories constants/views/images/samplers
+and reuse counts to determine exact remaining binding cost. Host C syntax compile
+passed; pristine pinned source preparation passed. No device update yet. Current
+phone remainsb46ada7. Current session sandbox switched back to restricted network
+with approvals never, so GitHub/phone reachability must be checked before claiming
+CI or install. User explicitly says no rollback; keep moving forward.
+
+## 2026-10-31: command ownershipb46ada7 installed live, interaction pending
+
+CI41224777059 PASSED for b46ada7 (includes alias CPU_PREP correction), earlier
+4f64faf run41224645249 canceled as superseded. Six hashes/arm64/ownership/VPC
+markers verified. Active028a491 manifest matched; host pre-hotfix-b46ada7 and
+phone sweet-native-stable-pre-b46ada7 saved; stage readbacks and SYNC verified;
+BackBoard5515 restarted after live directory swap. No new image boot/rollback.
+Current phoneb46ada7. User interaction result requested asynchronously; pending.
+Snapshot live-b46ada7.log and b46ada7-trial-start.json offset. Need compare
+cache_MiB/cache_us per active submit and phase timings, not startup/idle FPS.
+Do not claim performance solved. Last user result028a491 still slow; actual
+constant reuse alone insufficient. All prior bundles/backups retained.
+
+## 2026-10-31:028a491 installed; still slow; scope surface cache ownership to command
+
+CI41223793542 PASSED. Six hashes/arm64/constant marker verified; active2263e39
+manifest matched; pre-028a491 host/phone backups saved, staged/readback/SYNC and
+BackBoard5350 restart completed. User still slow. Constant reuse is real:825/1558
+in one sample; active busiest window4857draws/5s,1276134us bindings,2124643us
+VBO,2125790us transport submit. Cache maintenance walked10761MiB in5s.
+Preparing command-scoped imported cache ownership: publish each imported surface
+once per transaction; defer CPU acquire until real final fence; explicit CPU_PREP
+still waits/acquires and revokes publication, free still waits/acquires. First
+publication conservatively waits latest GPU fence to include alternate handles;
+IOSurface ID aliases share publication state. New imports inherit published
+alias state. No unfinished buffer is acquired on timeout. No device update yet.
+All CPU clients must honor Metal command ownership; existing frontend retains
+resources and serializes object access throughout execution. Current028a491.
+
+## 2026-10-31:2263e39 installed; constant binding follow-up
+
+CI41223001204 PASSED; six hashes, arm64 binaries, phase and VPC markers verified.
+Installed live against339f9ba manifest, host/phone pre-2263e39 backups saved,
+staged readbacks/SYNC verified and BackBoard5167 restarted. User: still slow,
+rendering unchanged. Phase window5035ms:4250 draws,3813919us draw CPU,
+2080123us bindings,1692994us draw_vbo; validation28231us/fixedstate10301us.
+Binding/unbinding change has not solved frame rate. No rollback.
+Follow-up caches identical Gallium constant bindings within a command, avoiding
+repeated set_constant_buffer and unaligned user-buffer uploads. Cache keys cover
+resource, CPU pointer, offset and size; invalidate at command begin, barriers,
+compute entry and before/after GPU buffer-write draws. Existing resource lifetime
+retention remains. Reports constant binding calls/reuse. Host C syntax compile
+passed; runtime reuse/hit rate and performance unverified. Current phone2263e39.
+
+## 2026-10-31:339f9ba unchanged; draw processing dominates measured active window
+
+User reports unchanged performance. Saved live-339f9ba-unchanged.log.
+Active window5187ms:51 commands3454 draws,encode3774586us,draw3728517us,
+finish416672us. Corresponding transport window5031ms:357 submits,1511372us
+submit CPU,544673us cache,704981us fence (overlap; not additive). Draw processing
+is now measured as a substantial bottleneck, not just idle GPU guesswork.
+Next change defers per-draw sampler/view/image unbinding to command completion,
+while frontend work objects retain resources. Clears trailing bindings when a
+new shader uses fewer slots, then clears union of touched slots after the fence
+before resources can be released. Adds draw phase timing (validation/surface,
+fixed state, bindings, draw_vbo) to narrow residual costs. Existing shader,
+IOSurface cache ownership and completion semantics retained. Host Mesa C syntax
+compilation passed; source generation from pristine pinned donor succeeded.
+No device update yet; current phone339f9ba remains running. No rollback requested.
+
+## 2026-10-31: full access restored; surface cache339f9ba installed live
+
+User restored full access. CI41204242223 PASSED for339f9ba; all six hashes,
+arm64 binaries, frontend timing marker and previous half-export fix verified.
+Live installer verified activeb70ea81 manifest, saved host pre-hotfix-339f9ba
+and phone sweet-native-stable-pre-339f9ba, staged/readback verified, SYNC,
+swapped directories and restarted BackBoard1870. No new image boot; no rollback.
+User interaction feedback requested asynchronously; pending. Do not claim FPS
+improvement until observed. Fresh log snapshot live-339f9ba.log and offset in
+339f9ba-trial-start.json. Next compare frontend encode/draw/finish timings with
+transport counters during interactions. Retain current bundle unless directed.
+
+## 2026-10-31: user says NO rollback; continue forward performance fixes
+
+Latest instruction overrides rollback plan below: leave current b70ea81 active.
+No rollback happened. Main rendering correction0c298b7 remains in current code.
+Implemented reuse of a texture-owned level-zero pipe_surface for repeated draws
+and clear calls, retaining transient references for existing cleanup. Textures
+are immutable in this API, so the cached view is released before texture storage.
+Added per-device five-second frontend counters: commands, draws, encode wall time,
+draw wall time (subset of encode), and command finalization/fence wall time.
+These complement transport counters to isolate remaining delay; no FPS claim.
+Source preparation from pinned donor succeeded. Host C syntax compilation against
+existing Mesa25 generated headers passed (no renderer/runtime tests run).
+Host compile lacks GALLIUM_FREEDRENO screen setup; iOS macOS CI still required.
+Local diagnostics: research/native-resume-20261031/surface-cache-host-compile.log;
+disposable prepared source: research/native-perf-surface-source (gitignored).
+GitHub API still fails connection under restricted network/approval-never session.
+Do not claim new bundle built/installed. Current phone still b70ea81.
+
+## 2026-10-31: b70ea81 user reports WORSE; rollback blocked by session sandbox
+
+Saved live-b70ea81-regression.log. Interaction transport windows show roughly
+0.60-1.04s submit CPU per5s,0.21-0.36s cache maintenance and0.31-0.58s fence
+calls (categories overlap; fence totals include calls outside submit). This
+still does not explain the entire UI frame budget. Do not call trial successful.
+Attempted rollback to0c298b7 from phone sweet-native-stable-pre-6194c4f,
+retaining active b70ea81 as sweet-native-regressed-b70ea81. SSH NEVER CONNECTED:
+first system ssh config permissions error, then explicit -F /dev/null attempt
+failed socket Operation not permitted. Current session reverted to restricted
+network with approval policy never. NO phone mutations happened; b70ea81 is
+still active. Must restore access before claiming rollback or restarting UI.
+Next rollback safely with directory swap rollback-on-failure, file-server SYNC,
+restart BackBoard, verify0c298b7 manifest. Native0c was main rendering correct
+but slow; original pre0c stable renderer remains a separate backup.
+
+## 2026-10-31: scoped-wait performance trial b70ea81 installed live
+
+CI41201550845 PASSED; all six hashes, arm64 and correction/timing markers
+verified. Live installer matched6194c4f active manifest and saved it on host
+pre-hotfix-b70ea81 and phone sweet-native-stable-pre-b70ea81; staged readbacks,
+SYNC, directory swap and BackBoard1673 restart completed. No image boot.
+USB timed out during investigation; user reconnected and access/logs resumed.
+Fresh startup transport window6294ms:138 submits/312IBs,275157us inside submit,
+192254us fence calls (also outside submits),199124us cache ops,2947MiB cache
+walked,150225us submit ioctl. Categories overlap, not additive. Transport alone
+is a small share of that startup wall interval; cannot establish interaction FPS
+or claim CPU frontend is proved without active-use sample. User asked via async
+to unlock/swipe/open-close for20sec; feedback pending. Current source isb70ea81.
+Saved research/native-resume-20261031/live-b70ea81.log and trial-start offset.
+Next use interaction timings to decide between cache/submit and frontend work.
+Potential CPU overhead: donor scans mapped index buffers per indexed draw and
+creates/releases pipe_surfaces per draw; hypotheses, not measured bottlenecks.
+Keep half-export fix and shared-surface ownership; no return to broad guesses.
+
+## 2026-10-31: private BO trial installed; user still reports under15fps
+
+6194c4f CI41200530247 PASSED. Six artifact hashes, arm64 binaries and prior
+half-export fix verified. Live installation checked old0c298b7 manifest,
+saved all old files at research/native-install-0172/pre-hotfix-6194c4f and phone
+/private/var/db/sweet-native-stable-pre-6194c4f, verified staged readbacks and
+restarted BackBoard1224 ->1673. Logs confirm kernel-owned private BO mode,
+38MiB pool usage and113 owned allocations averaging64us in startup window.
+User reports still very sluggish, under15fps. Not a successful performance fix.
+Next change scopes the pre-submit ownership wait to referenced imported
+surfaces' last fences rather than the globally latest job. Private-only batches
+can proceed without an unnecessary global wait; real completion and IOSurface
+cache maintenance stay intact. Add five-second transport timing windows for
+submit CPU time, fence time, cache bytes/time and submit ioctl time to identify
+remaining costs. Build/live qualification pending. No new image boot.
+
+## 2026-10-31: performance priority after corrected main rendering
+
+User confirms 0c298b7 main rendering now looks correct, but performance is
+horrible. Battery outline, widget details and Control Center icons still have
+faults; user explicitly prioritizes performance over these defects.
+Private native BOs previously used cached vm_allocate/BoImport, causing full
+client cache-line walks before submissions and after GPU writes. Switch private
+BOs to existing ABI BoAlloc + BoCpuMap + IOConnectMapMemory64, preserving the
+kernel descriptor cache policy (0172 sweetwc=1). Only imported IOSurfaces retain
+client cache maintenance. Preserve serial ownership waits and a submission DSB.
+Cleanup waits, unmaps CPU mapping, releases mapping lease, then frees BO;
+failures quarantine storage. Build/runtime qualification pending. Current phone
+still runs 0c298b7; no performance improvement claimed yet.
+
+## 2026-10-31: vertex export correction0c298b7 installed live, visuals pending
+
+CI41196402093 PASSED source0c298b7. Artifact six hashes, arm64 headers and VPC
+marker verified. Live installer checked original12-file stable manifest,
+backed up host pre-hotfix-0c298b7 and phone sweet-native-stable-pre-0c298b7,
+staged/readback verified six files, SYNC and restarted BackBoard400 ->1224.
+Live trace confirms "widened 1 half vertex exports to full VPC registers"
+eight bounded messages, native FD618 and successful scoped submissions.
+No observed pipeline/draw/import error in sampled fresh trace. User screen
+observation requested; not yet received. DO NOT mark rendering fixed yet.
+No image boot performed for this live update. Research live-0c298b7.log,
+install-0c298b7.log and0c298b7-trial-start.json preserve evidence.
+If reverting, working ORIGINAL is sweet-native-stable-pre-0c298b7; preserve
+current trial under a unique path and restart BackBoard after file-server SYNC.
+User now explicitly says no further permission questions are needed for this
+ongoing work; proceed with reversible updates. Preserve backups/Android and
+handle sandbox authorization requirements normally.
+
+## 2026-10-31: user approved snapshots; captured half vertex export mismatch
+
+Explicit user consent received for local AIR/constant copy. SSH tar succeeded;
+64 files extracted safely under research/native-resume-20261031/live-shaders-323.
+Keep Apple AIR local, out of git/public CI. 13/16 first captured fragment states
+match Apple's pipelines.desc constant sets exactly; runtime capture includes58
+named constants per fragment and4 per fixed vertex specialization.
+Captured fixed_vert_lph_spc case0 has all four constants0, matching existing
+host air2nir default-zero inspection. NIR saved runtime-vertex0.nir shows
+color#2 shader_out f16vec4 receiving16-bit %39, while texture coordinates are32.
+Mesa25 ir3_compiler_nir.c setup_output preserves source register width;
+outputs[].half records it, but ir3_shader.h ir3_link_shaders passes only regid.
+A6xx SP_VS_OUT_REG A_REGID field is bits0..7, no half bit; FS color exports have
+separate half handling. Therefore direct half VS exports select full-register
+contents instead of half color values. Preparing post-IO-lowering vertex-only
+16->32 export conversion. Internal half arithmetic and fragment outputs stay
+as requested; actual rendered result still requires qualification.
+Phone remains on approved0172 with stable original graphics bundle restored;
+SHA verified b1f1e3d65e43371b58f4382cf4b31ec830ff4a19f86e067c0352b79f38d4dccc.
+Do not boot another image without user consent. Live bundle trial is reversible.
+
+## 2026-10-31: approved0172 boot done; live snapshots saved, transfer approval pending
+
+Phone detected after reconnect. User-authorized fastboot boot of verified0172
+returned send/boot OKAY. Existing UDP5140 receiver258634 retained. Active fa1b6d4
+executable readback matched artifact. Shader capture6ee0df7 CI41193556590 PASSED;
+six hashes/arm64 verified. Live install checked current fa1b6d4 six-file manifest
+(not original12), backed it up at sweet-native-stable-pre-6ee0df7, staged six
+capture files, readback verified, SYNC and restarted BackBoard259 ->323.
+Snapshots saved on phone /private/var/tmp/sweet-native-323-{0,1}-{0..15}.{air,json}.
+Capture enable flag removed afterward. No further image boot.
+Automatic approval review REJECTED copying snapshots locally: requires explicit
+user consent for private AIR/constant payload and local destination. Asked user
+via request_user_input_async; response still pending. Do NOT bypass rejection
+with a different transfer method. Planned host path is this checkout's
+research/native-resume-20261031/. No successful snapshot transfer yet.
+
+Restored ORIGINAL working frontend from sweet-native-stable-pre-fa1b6d4 to
+active, retained diagnostic bundle at sweet-native-trial-6ee0df7, SYNC and
+restarted BackBoard323. The pre-6ee backup contains fa1b6d4, NOT stable original.
+Avoid confusion during further rollbacks. Native rendering remains unqualified.
+Next: after explicit consent, copy snapshots locally, inspect actual constants/
+AIR and isolate rendering fault. /bin/launchctl does not exist on the phone.
+
+User reference janhurn9400/hackios-xnu-kernel read via GitHub API (redirected
+parent oosexgang/hakios-xnu-kernel). README explicitly lists Adreno Mesa/OpenGL
+ES working, Metal NOT YET (shader compiler, no Metal). Public kernel sources
+saved locally janhurn-adreno.c/janhurn-gpu.cpp; GPU is not a turnkey native Metal
+frontend. Do not repeat the unsupported claim of full Metal acceleration.
+
+## Continuation after DeepSeek fa1b6d4: boot requested, USB absent
+
+User explicitly authorized temporary image boot and driver work. Checked clean
+native branch at fa1b6d4 and installed manifest hotfix-fa1b6d4.json. Saved log
+confirms BackBoard2727 imports LA08 RG8 surfaces successfully (IDs1762/1765/
+1764/1763), but user reports rendering still broken. RG8 refusal is therefore
+resolved, not sufficient. No other kernel/frontend source change found in this
+checkout. Original /home/dan/ios-sweet remains51c71fb with unrelated --help file.
+0172-rbbm image SHA verified b988abd8a03ce5cd75667a6e3dfb38e9121daf51533cf734ec023f73f343c5e2.
+Host lsusb sees only hubs/webcam/internal Bluetooth; fastboot and ADB empty.
+Asked user to reconnect cable on FASTBOOT. NO BOOT performed yet this turn.
+Preparing opt-in fixed-shader AIR/function-constant capture to private/var/tmp
+for numerical compiler investigation. Captures must remain local, outside git.
+Next first boot approved0172 once detected, inspect active graphics hashes and
+fresh logs; verify current receiver before starting another UDP5140 listener.
+Potential fast runtime isolation: Mesa FD_MESA_DEBUG=sysmem, or nobin, via
+launchctl environment if available. These are diagnostic choices, not fixes;
+use one at a time and clear settings afterward. Do not promise visual repair.
+
+## 2026-10-31: b0fdd3f still corrupt; explicit RG8 import refusal identified
+
+Combined shader-finalization/semantic-link CI41169637835 PASSED. Bundle verified
+and installed live, all stable12 files backed up; BackBoard1150 restarted into
+native1671. User video VID_20261031_103721127.mp4 explicitly recorded AFTER this
+restart shows colored rectangles over glyphs/icons, black app regions; wallpaper
+largely intact. Extracted local frames research/native-resume-20261031/video.
+No shader-finalization or stage-link errors observed. Bounded actual pairs all
+remapped0: semantic linkage is valid but not shown to explain this visual bug.
+Trace includes backlog replay, so old PIDs/lines recur: do not count them as new
+crashes. No GPU timeout found (timeout=0 was backlight telemetry).
+Concrete repeated refusal in native1671: "no drawable: interface: Metal pixel
+format 30 is not a supported linear IOSurface format". Format30=RG8Unorm;
+backend supports it, frontend import whitelist omitted it. Preparing correct
+LA08 / two-byte row import plus A8 case1 and detailed format/layout refusals.
+Stable bridge log evidence: surface 'LA08' bpe2 230x186 bpr512 -> Metal format30,
+swizzle identity 2345 (live-0172-membus.txt).
+No format reinterpretation or pitch relaxation. Full rendering still unqualified.
+Restored stable bundle live after one automatic review timeout; retry succeeded,
+kept native trial in /private/var/db/sweet-native-trial-b0fdd3f and restarted1671.
+No image boot this turn.
+
+## 2026-10-31: screen NIR finalization callback was skipped
+
+Further source review: air_metal.c finalize_for_gallium never calls
+screen->finalize_nir. Mesa25 freedreno's ir3_screen_finalize_nir runs
+ir3_nir_lower_io_to_temporaries and ir3_finalize_nir; create shader state only
+runs ir3_nir_post_finalize later, not the missing callback. Native shader
+creation therefore bypasses the driver's required early lowering/optimization.
+Preparing explicit shader-info gathering and screen finalization before IO
+intrinsics lowering, with errors propagated for both render and compute paths.
+Semantic-link correction ec92d85 already pushed; combine finalizer correction
+before next live trial. Cache-fix trial still visually failed; stable renderer
+has been restored. No new image boot is authorized without asking.
+
+## 2026-10-31: cache correction runs but visuals still fail; stage linking missing
+
+01604ef CI41167149140 PASSED. Six hashes/arm64/cache marker verified. Live
+installation backed up stable12 files and verified six new files, restarted
+BackBoard903. New BackBoard1088 logs explicit cache ownership and renders, no
+observed fence/draw errors. User: same colorful flicker, black app windows,
+dock rectangle with little blur. Cache omission was real but not the sufficient
+visual fix. Restored stable bundle live, retained trial at
+/private/var/db/sweet-native-trial-01604ef, restarted1088; no reboot.
+
+Source inspection finds a separate missing link step: donor assigns vertex
+outputs and fragment inputs VARYING_SLOT_VAR0+declaration ordinal independently,
+but never links real stages by AIR semantic. Fragment info even recorded the
+argument's display name instead of air.fragment_input's generated semantic.
+Preparing semantic matching of live fragment inputs to vertex outputs before
+Gallium IO lowering, with type checks and a bounded record of actual pairings.
+This prevents declaration-order inputs from being fed a different varying.
+Concrete corpus interfaces saved in research/native-resume-20261031: VS uses
+"generated(5colorDv4_f)" etc; fragment metadata carries exact generated keys.
+Do not claim this is the hardware cause until actual paired-stage logs/visuals.
+Phone remains on approved0172 with stable frontend. New image boots need consent.
+
+## 2026-10-31: b824dcf renders but corrupts; missing import cache ownership found
+
+CI41166004454 PASSED b824dcf. Downloaded and verified six file hashes, arm64
+Mach-O and direct dependencies. Live installation backed up all12 stable files,
+staged+readback verified six native files, swapped and restarted BackBoard401.
+BackBoard841 ran native AIR/freedreno; buffer0 validation refusal gone, real
+frames and scoped GPU submissions completed without observed fence/draw errors.
+User confirms touch/UI works, but no blur, apps black, colorful flicker. Thus
+resource validation blocker fixed, rendering NOT qualified. Restored stable
+bundle live from sweet-native-stable-pre-b824dcf; retained failed trial in
+/private/var/db/sweet-native-trial-b824dcf and restarted BackBoard841. No reboot.
+Logs/install reports: research/native-resume-20261031/*b824dcf*.
+
+Concrete new defect: sweet_drm.cpp imports EVERY BO as CPU-cached task memory,
+but had no client cache operations. 0172 boot log says sweetimportsync=0 and
+kernel maintains only imports <2048KiB (0140). Working SweetMetal2 explicitly
+uses EL0 dc civac before/after surface GPU commands; native transport did not.
+Preparing per-submit clean/invalidate of referenced BOs, real-fence acquisition
+of GPU-written BOs, and serialization before maintenance so ownership cannot
+race a prior GPU job. This is correctness-first; runtime visuals still unproven.
+Phone stays on approved0172, stable frontend restored. Ask before any new boot.
+
+## 2026-10-31: native draw resource correction prepared
+
+The e8c7631 draw error is caused by validating every AIR resource declaration,
+even after specialization makes some inputs unused. Local QuartzCore entry4
+fixed_frag_lph_cph has zero live resource reads in both generic and Apple
+specialized NIR, despite its declared buffer arguments. Added pipeline-local
+optimization and live resource filtering in air_live_resources.inc for direct
+UBOs/SSBOs/textures/samplers/images. Binding numbers and NIR resource counts
+stay unchanged. Dynamic/unknown indexing conservatively keeps declarations;
+argument-buffer members retain their shared layout. Both validation and binding
+use this filtered pipeline metadata; genuinely required reads are not bypassed.
+Host comparison now includes live buffer slots as well as texture/sampler
+selection: all451 generic/specialized pipelines match, no translation failures.
+Synthetic cases check dead loads, side-effecting stores, dynamic resource
+indices and argument-buffer preservation. Reports are under
+research/native-resume-20261031/resource-*.log. This is offline evidence only;
+full pixel accuracy, iOS build and hardware trial remain required.
+Phone remains on approved0172 with stable original graphics bundle restored.
+Do not boot another image without asking. Live bundle trial can use retained
+backups; old raw userdata deltas are stale and must never be applied.
+
+## 2026-10-31: e8c7631 hardware trial passed compiler, failed draw binding; restored
+
+User approved temporary0172 boot from FASTBOOT. Exact image SHA verified;
+fastboot send+boot OKAY. Live installer checked all12 working bundle hashes,
+saved host pre-hotfix-e8c7631 and phone sweet-native-stable-pre-e8c7631,
+staged6 new files and readback verified, swapped, file-server SYNC and restarted
+BackBoard269. Native BackBoard284 stayed alive; no previous AIR pointer-store
+rejection/crash in observed trial. Real scoped submissions occurred (184 calls
+in first63s); not proof of correct draw output. User lockscreen froze then black.
+New repeatable error: "the draw failed: fixed_frag_lph_cph reads buffer 0 and
+2 buffers were bound". User requested SpringBoard restart; TERM286 succeeded,
+error persisted. Saved logs research/native-resume-20261031/live-e8c7631.log.
+Recovered live by moving trial bundle to /private/var/db/sweet-native-trial-e8c7631
+and restoring saved working bundle; file-server SYNC then restarted BackBoard284.
+Active restored executable SHA256 b1f1e3d65e43371b58f4382cf4b31ec830ff4a19f86e067c0352b79f38d4dccc
+readback verified. Frames resumed:151-167 presents/10s latest windows. User
+interaction confirmation still pending. No further image boot after approved0172.
+Next investigate check_bindings in donor air_metal.c: it requires every resource
+listed in air_shader_info, while specialized shaders can leave declared inputs
+unused. HYPOTHESIS only: slot0 may be inactive after function-constant pruning;
+alternatively frontend failed to retain/bind it. Prove live NIR buffer use and
+actual encoded bindings before changing validation. Do NOT fabricate buffer0 or
+skip required reads. Host checker currently compares texture/sampler bindings,
+not live buffer usage or pixel accuracy. Native frontend inactive after recovery.
+Current raw delta scripts remain stale; use live bundle backups, never old raw
+blocks against the now-mutated filesystem. Restore scripts must use current
+paths; sweet-native-stable-pre-e8c7631 was moved back to active during recovery.
+
+## 2026-10-31: native pointer-cell bundle built and verified; awaiting boot approval
+
+Source e8c7631; CI41163489105 PASSED. Artifact downloaded to
+research/native-metal-artifact-e8c7631/native-legacy/SweetMetal2.bundle.
+All six manifest hashes, both arm64 Mach-O headers and dependency list verified.
+Offline451 specialization resource-binding comparisons pass; hardware execution
+and pixel accuracy remain unqualified. No Vulkan/Turnip frontend dependency.
+Phone currently seen FASTBOOT. No phone modifications or boot this continuation.
+Existing0172 image rehashed unchanged: b988abd8a03ce5cd75667a6e3dfb38e9121daf51533cf734ec023f73f343c5e2.
+Trial plan research/native-resume-20261031/trial-plan.json. Prepared install-live.py
+there, NOT EXECUTED: checks stable original12-file manifest, preserves host and
+phone bundle backup, stages new files, verifies readback, switches directories,
+uses kernel file-server SYNC (toybox sync unavailable), restarts BackBoard.
+Ask user before temporarily booting existing0172 for the live frontend trial.
+Keep ios-sweet baseline and its working device features; UEFI migration adds
+unrelated bring-up work. Do not claim improved performance before measurement.
+
+## 2026-10-31: continued Claude native AIR work; offline reproduction PASSES
+
+Found Claude's uncommitted prepare script + air_pointer_cells.inc and
+host specialization check. Preserved and reviewed them. Claude scratchpad:
+/tmp/claude-1000/-home-dan-Documents-Codex-2026-10-19-https-github-com-dc28088-ios-sweet-native-metal-work/963822f7-47a1-423c-84e8-31ee825be375/scratchpad
+contains extracted local QuartzCore corpus and existing Mesa25 host build.
+Fresh pinned donor export /tmp/sweet-native-resume-20261031 prepared, copied
+into host Mesa AIR sources and rebuilt with ninja (exit0, not masked by grep).
+Reproduced c734767 pointer-store failure on generic fixed_frag_lph_cp{h,f};
+new compiler translates both. Ran full offline specialization comparison:
+451 entries /451 specialized modules, match451, mismatch0, genericfail0,
+referencefail0. It compares texture/sampler resource selection after folding;
+NOT numerical equivalence or hardware rendering. Fixed checker return status
+to fail on reference failures and empty corpus as well. Four imageblock compute
+shaders still refused. Reports research/native-resume-20261031/{baseline,current,
+specializations}.log and summary.json (Apple binaries kept out of git).
+Implementation handles one-store entry-block pointer cells across zero-offset
+aliases/selects; constant sampler wrappers and constant globals; static-init
+shadows + function-constant CFG pruning. Remaining dynamic pointers refused.
+Next: iOS CI build and qualify native frontend API/actual render output before
+claiming a GPU fix. No phone access/change/boot in this continuation yet.
+Recommendation to user: retain ios-sweet working hardware baseline; HakiOS UEFI
+migration does not address the compiler blocker. Ask before any image boot.
+
+## 2026-10-30: user confirms interaction RECOVERED
+
+After restoring the original graphics bundle live, user confirms "yeah its
+working normally now." Touch/buttons usable again; no image boot was needed.
+Native frontend is inactive and remains unqualified. Keep this working state.
+Next native work must first reproduce the exact AIR shader rejection offline;
+do not reinstall the same restricted pointer-local fix as if it were complete.
+
+## 2026-10-30: native hotfix still failed; ORIGINAL frontend restored live
+
+c734767 CI41095763883 PASSED; downloaded and verified legacy bundle. Used live
+file server to stage six files, readback-verified every hash, refused concurrent
+changes against5d3b2bb. Swapped bundle over SSH; toybox sync command unavailable,
+so kernel file-server SYNC used instead. Active corrected backend readback hash
+matched c734767 manifest. Restarted BackBoard. Same pointer-store rejection
+continued: restricted non-escaping-local promotion does NOT cover failing AIR.
+To recover user interaction, restored full original pre-native bundle LIVE from
+/private/var/db/sweet-native-backup-5d3b2bb to active SweetMetal2.bundle, saving
+c734767 in /private/var/db/sweet-native-trial-c734767. Original native5d3b2bb
+retained /private/var/db/sweet-native-trial-5d3b2bb. Kernel file server SYNC done;
+active original executable readback SHA256 b1f1e3d65e43371b58f4382cf4b31ec830ff4a19f86e067c0352b79f38d4dccc
+matches pre-native snapshot. Restarted BackBoard PID696 overSSH; live GPU methods
+resumed. User interaction confirmation pending. NO new image boot/reboot.
+Do not describe this rollback as a native acceleration fix. Native compiler
+needs exact failing shader dump + pointer-store destination/use graph analysis.
+Current raw delta restore scripts are stale after live filesystem changes;
+NEVER apply old block delta against the now-mutated filesystem. Use bundle-based
+rollback/installation and fresh read-only snapshots for future raw changes.
+
+## 2026-10-30: requested SpringBoard restart sent over USB SSH
+
+User explicitly asked to restart SpringBoard. USB SSH works with original
+research/ssh key/known_hosts (read only). Sent TERM only to the dynamically
+located /System/Library/CoreServices/SpringBoard.app/SpringBoard, PID447.
+Command succeeded; did not kill BackBoard, reboot or boot another image.
+Existing repeated BackBoard AIR pipeline failure remains unresolved; restarting
+SpringBoard is not evidence of a rendering fix. Compiler correction c734767
+committed, git push still pending session48772 at this handoff.
+
+## 2026-10-30: native trial FAILED compositor startup; input hardware alive
+
+User: reached lock screen, touch/buttons unresponsive. Fresh live USB logging
+resumed in existing original receiver. Saved snapshot to isolated
+research/native-install-0172/live-native-metal-observed.log. Repeated BackBoard
+crashes: "Metal failed to build render pipeline", immediately preceded by
+native AIR error "a store of a pointer into memory" at block0 instruction2
+opcode16. Kernel still logs fresh SWEET HID touch down/up; cannot classify this
+as a dead touch driver. GPU busy0/no presents during observed crash windows.
+Native plugin definitely loaded (SweetNativeMetal-prefixed pipeline logs).
+No recovery reboot or further image boot issued. Need permission before any
+additional image boot; original bundle/backing blocks remain available.
+Compiler change prepared: promote pointer locals only if count1 pointer alloca,
+all uses direct nonvolatile loads/stores in its allocation block; reject escapes,
+GEP/cast/call and cross-block state; reject uninitialized loads. Preserve pointer
+resolution and do not invent GPU pointer bytes. Fresh pinned source preparation
+passes; CI compilation/runtime still pending. This may cover the observed shape
+but actual offending module coverage is not yet established.
+
+## 2026-10-30: native frontend INSTALLED and temporary 0172 boot issued
+
+User explicitly approved: "yes write it and boot the image". Fresh preflight
+passed all24 original chunks. apply-delta.py completed: all24 written and fully
+readback verified, state installed-readback-verified. Data 9,895,936 bytes;
+complete original blocks and 12-file original bundle retained for rollback.
+Executed adb reboot bootloader, then fastboot boot exact existing image
+/home/dan/ios-sweet/shim/out/shim-boot-0172-rbbm.img, SHA256 b988abd8a03ce5cd75667a6e3dfb38e9121daf51533cf734ec023f73f343c5e2.
+Fastboot sending and booting both OKAY. No persistent boot/recovery flash.
+Screen outcome PENDING user response; do not claim successful iOS rendering.
+Own USB receiver could not bind UDP5140 because existing receiver PID258634
+(from original checkout, logs/live-0172-membus.txt) owns it. Left that process
+untouched. Existing log has not gained fresh boot output; host currently has
+no phone USB Ethernet interface. Need user screen report and fresh runtime logs.
+No additional image boot authorized by this approval without asking again.
+Local install workspace research/native-install-0172 has manifests, delta,
+apply-delta.log and backups. Installation.json records boot issued, not qualified.
+
+## 2026-10-30: native frontend installation READY; awaiting approval
+
+Corrected 16 GiB overlay passed full fsck; six native bundle hashes passed from
+read-only mount; cleanly unmounted. Final delta research/native-install-0172/delta.json:
+24 chunks, 9,895,936 bytes (9.4375 MiB), all within 17,179,869,184-byte iOS volume.
+Fresh preflight PASSED against every original phone block. No phone write or
+boot. Whole old bundle saved share/original-bundle (12 files, hash manifest),
+also retained in overlay private/var/db/sweet-native-backup-5d3b2bb; complete
+original block data saved in delta/*.before for raw rollback. Discarded earlier
+out-of-bounds delta is diagnostic only. Corrected overlay export session76039;
+read-only root export session90495. No VM running now.
+Await user approval for this raw userdata delta (AGENTS requirement) and temporary
+boot of existing shim-boot-0172-rbbm.img (user boot permission requirement).
+After approval rerun preflight immediately, apply-delta.py with full readback,
+then adb reboot bootloader and fastboot boot the exact manifest image. Preserve
+kernel/image SHA256 b988abd8a03ce5cd75667a6e3dfb38e9121daf51533cf734ec023f73f343c5e2.
+No speed or successful rendering claim; this is first native frontend trial.
+
+## 2026-10-30: staging boundary correction (no phone writes)
+
+Initial local VM filesystem verification passed and native files matched hashes,
+but delta preflight correctly rejected one chunk beyond the 16 GiB HFS volume.
+Cause: local qcow2 exposed the whole 114970046464-byte userdata partition;
+fsck wrote an alternate HFS header at its end. Old delta is retained ONLY as
+rejected diagnostics: research/native-install-0172/delta-unbounded{,.json}.
+Do NOT apply it. Local qcow2 was shrunk to 16 GiB; verification-only VM now
+session30207, guest-volume-check.log. Phone remains untouched in OrangeFox.
+Once verified, regenerate delta, require every chunk within volume_bytes and
+run preflight again. Complete original bundle is saved on host (12-file hash
+manifest) and retained inside overlay at private/var/db/sweet-native-backup-5d3b2bb.
+
+## 2026-10-30: native legacy bundle downloaded, recovery staging underway
+
+CI 41090364656 PASSED at 5d3b2bb. Artifact downloaded to
+research/native-metal-artifact-5d3b2bb; all six legacy bundle file hashes match
+native-legacy/build.json. Mach-O symbol table contains both SweetMTL2Device
+and SweetNativeMetalDevice. Read-only ADB sees recovery and iOS16.7.16/20H392.
+Original active executable SHA256 b1f1e3d65e43371b58f4382cf4b31ec830ff4a19f86e067c0352b79f38d4dccc.
+Staging workspace research/native-install-0172, read-only nbdkit session90495
+socket /tmp/sweet-native172-root.sock. Local TCG VM session75484 edits only
+root-overlay.qcow2. Guest init uses root-owned cpio entries (otherwise setuid
+mount drops to host uid). Initial fsck found minor volume-header repair, applied
+ONLY to overlay and is rechecking. No phone filesystem writes. Native bundle
+and original bundle backup are staged via VM share once check completes.
+Source image /home/dan/ios-sweet/shim/out/shim-boot-0172-rbbm.img SHA256
+b988abd8a03ce5cd75667a6e3dfb38e9121daf51533cf734ec023f73f343c5e2.
+Its embedded XNU arguments include sweetmtl=2 sweetgles=0; kernel unchanged.
+Phone remains OrangeFox. Do not apply a delta until fully staged/preflighted;
+confirm any raw partition write per AGENTS and ask before image boot per user.
+
+## 2026-10-30: older-kernel native compatibility build
+
+User requested using the older XNU artifact. Read-only inspection of original
+xnu/out-0172/kernel.development.sweet confirms SweetMetal2/SweetMTL2Device and
+scoped submission. Build now emits separate native-legacy/SweetMetal2.bundle
+with an actual Objective-C SweetMTL2Device subclass of SweetNativeMetalDevice,
+the same backend, matching plist, fresh signatures and hash report. This avoids
+kernel patching/rebuild; requires sweetmtl=2 sweetgles=0 and runtime ABI checks.
+Build pending. Do NOT use the existing fixed-Vulkan-file installer for it.
+No phone access or installation. User still requires permission before boot.
+
+## 2026-10-30: matching native kernel build queued
+
+User reports FASTBOOT; no device command was sent. Dispatched xnu.yml on
+codex/native-adreno-metal at 6c8f2b9: run 41090044142, macos-14,
+DEVELOPMENT/SWEET, iOS16-era XNU13.5; portable tests disabled for this build.
+Status at handoff: queued. Native bundle remains compiled/downloaded as below.
+No matching image is packaged and no root installation is staged. Do not boot
+until user grants permission for the specific prepared image. FASTBOOT readiness
+is not boot permission. Next inspect CI, download kernel if successful, package
+against the current known-good shim and preserve the original boot arguments
+plus sweetnative=1; reconcile Claude's active changes before any installation.
+
+## 2026-10-30: isolated native Metal frontend implementation
+
+User requested a native Metal frontend while Claude continues the active original
+checkout. Work is isolated at `native-metal-work`, branch
+`codex/native-adreno-metal`, based on `3c12309`. No device access or original
+checkout edits. Do not merge blindly over Claude's ongoing pass audit.
+
+Implemented direct Sweet ABI1 MSM transport, pinned HakiOS AIR/Gallium adaptation,
+shared frontend/backend ABI, native metallib/functions and specialization,
+command-buffer batching/lifetime, viewport/scissor and pass-clear corrections,
+separate build workflow and opt-in `sweetnative=1` plugin selection (0173).
+Keep `sweetmtl=2` for aligned owned rows; its existing meaning is preserved.
+User explicitly requires permission before booting any new image (latest instruction).
+See `userspace/native-metal/README.md` for actual capabilities and remaining gaps.
+
+Validation: pinned source export/preparation and Python compilation pass. Five
+host transport contract cases pass (split residency/fence mapping, whole-list
+validation, IOSurface offset/retention, timeout quarantine, partial-submit loss).
+These use mock IOKit/Mach and execute no GPU commands. GCC warning-clean syntax
+check also passed against Mesa DRM headers.
+
+Native userspace build PASSED: CI 41086252203, source
+`d1ee31905116aa08a94da296c93db317408e78ba`. Both Objective-C objects and
+Mesa AIR/freedreno backend compiled and linked for iOS 16 arm64. Earlier runs
+41084159383/41084956259 exposed unavailable iOS headers/Mach APIs; fixed using
+IOSurfaceRef.h and public vm_allocate/vm_region_64 APIs. Queue slot waits no
+longer hold the global context lock.
+Downloaded artifact: `research/native-metal-artifact-d1ee319/`.
+All six file SHA256 values match native-metal-build.json. Dependency report has
+no Vulkan/Turnip/metal2vulkan library; both binaries are arm64 Mach-O.
+Bundle SHA256: 9001bb76759f856f1bebad34090ec97096cb47d3eb7d55f45081e353fd85980f.
+Backend SHA256: 4ea65603211d141ef3411a8650e1538c0496184a63866576a62985c6677cde85.
+The kernel opt-in correction preserves existing sweetmtl=2 and separately uses
+sweetnative=1. A matching kernel/boot image is NOT built or staged yet.
+No installation, partition write, phone access or boot occurred. Ask the user
+before booting any new image. Next: fill remaining compositor API gaps, build
+the opt-in kernel, then stage a reversible root installation and request boot
+permission. The successfully compiled bundle alone is not a completed GPU fix.
+No hardware rendering/performance claim. Larger constants, texture views,
+blits/events/heaps/resolve and remaining CoreAnimation shader coverage need work.
+
+## 2026-10-30 (later): 0171 block profile, 0172 forced write-back: neither helps
+
+0171 (xnu/patches/0171-sweet-gpu-rbbm-status-profile.patch): while a fence is outstanding,
+RBBM_STATUS is sampled (~40/s) and the busy blocks printed per 10 s ("SWEET RENDER: rbbm ...").
+CI 40990286076 (macos-14), kernel xnu/out-0172, images shim/out/shim-boot-0172-rbbm.img
+(b988abd8...) and ...-gpuwb.img (3cccb7ba..., + sweetgpuwb=1). Logs logs/live-0172-rbbm.txt,
+logs/live-0172-gpuwb.txt.
+PROFILE (scroll, 0172-rbbm): idle=0% in every window (GPU never idle with a fence out);
+CP 100, CXM 92-96, VBIF 75-84, TSE/RAS/RB 87-93, LRZ 91-93, CCU 68-71, DCOM 76-78, DCALL 77-88.
+Busy bits mean "any work in flight", so they locate work, not efficiency. Presents 100-288 per
+10 s (very noisy window to window), gate 6-30 ms.
+0172 sweetgpuwb=1 (every BO mapped write-back, MAIR attr 1; CPU maintenance unchanged):
+WORSE - presents 18-174, gate 34-63 ms, VBIF 86-94%. Hypothesis rejected; default off.
+Both memory-attribute experiments (0170 walks, 0172 buffers) made it slower. GPU clock: 800 MHz
+is already used; pinned table only adds 825 MHz (TURBO_L1, speedbins 0x11): ~3%, not worth it.
+Remaining lever = less GPU work per frame (76% of GPU time in 1125x2436 passes, ~3.2 ms/Mpx):
+count/skip/shrink full-screen passes in the Metal frontend (userland; backboardd restart only).
+Kernel changes always need a reboot (fastboot boot); only the graphics bundle can be swapped
+live (tools/sweet-install-metal2.sh).
+
+## 2026-10-30: GPU fill-rate A/B on image 0159/0170 (returned to ios-sweet from the HackOS port)
+
+User's goal: >=30 fps like ios-sweet's best. HackiOS-based port (DC28088/hackios-sweet)
+abandoned for now at user's request (its A618 stage 9/10 results are in that repo's NOTES).
+Reference repo zeroninevibedslop/UniXNU-sweet has no GPU code (BSP only, GPU "in progress").
+BASELINE (image 0159-ddr = 0169 DRAM vote, scrolling 30 s, logs/live-0159-measure.txt,
+10 s windows): present_calls 154-260 (15-26/s), present_avg 25-37 ms of which gate (GPU fence)
+20-31 ms, GPU busy 50-56%. => GPU-bound; fill stayed ~300 Mpx/s whatever clock/tiling/
+shaders/DRAM vote (0169 did not change it).
+EXPERIMENT 0170 (xnu/patches/0170-sweet-gpu-smmu-cacheable-walk.patch, CI 40986191593 on
+macos-14; image shim/out/shim-boot-0170-smmuwalk.img 30bd6123...; cmdline = 0159 +
+sweetsmmuwalk=1, sweetbuild=170): CB0 table walks inner-WBWA (TCR 0x803520) instead of
+outer-NC (0x802020); default unchanged (boot-arg). Applied (TCR readback 0x803520), no
+faults. RESULT scrolling (logs/live-0170-smmuwalk.txt): presents 121-180 per 10 s, gate
+37-55 ms, busy 68-71% = NOT better, probably worse (different scroll content, so not a
+controlled A/B, but the GPU did more work per frame). Hypothesis "NC walks limit fill" is
+not supported; leave sweetsmmuwalk off.
+Workflow: xnu.yml now has a runner input (macos-14 had no capacity for ~1 h; a later
+re-dispatch got a runner). git push goes to myfork (origin dipa-studio returns 403).
+NEXT candidates (not started): (1) cached (writeback) buffer PTEs for Turnip BOs (ABI field
+writeback=1, MAIR attr1 = WB), (2) GPU perf counters per pass instead of guessing (UCHE/TP
+stalls), (3) GPU clock above ~800 MHz, (4) fewer/cheaper full-screen passes (blur) in
+frontend. Use the same scripted scroll for every A/B.
+
+# iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
+
+## Current direction and last known device state (2026-10-26, read first)
+
+- **LATEST (2026-10-26 01:20 IST): Bluetooth, battery and haptic probe.** Order
+  agreed with the user: haptics now, then GPU (smoothness, glyph glitches,
+  locked 60 fps, then 120 Hz, 825/950 MHz), video playback, sound, sleep,
+  modem, Apple ID, cameras.
+  - Bluetooth (0154/0155 kernel; ADT sweet-0146-bt.adt de459fbc...; root
+    bt-install-0147: launchd.plist with BT_HCI_TRANSPORT and the BlueTool stub,
+    original kept as BlueTool.orig). User: pairs with a laptop and headphones;
+    no headphone audio. Wi-Fi scans find networks only with BT off (coexistence
+    is still open).
+  - Battery 0156 (image 0150-battery2, 498f3eb2...; kernel CI of commit
+    7aef4b0): real PM6150 QG voltage/current, current-compensated seed, charge
+    counting, 5 s poll. User (2026-10-26): "current percentage is stable", plug
+    and unplug are detected. In logs/live-0150-battery2.txt the voltage curve
+    swung 40-61% under load while the counted value held 59-61%. 0158 (commit
+    48b7a28, not yet booted) drifts toward the curve only at a measured rest
+    (|I| < 100 mA, 2% per poll); previously an invalid current sample also
+    triggered the drift.
+  - Haptics 0157 (image shim/out/shim-boot-0151-haptic.img a4eb16e1...; kernel
+    CI 40226831888 d66ad746...; 0150 cmdline + sweethaptic=2,
+    sweetbuild=151). BOOTED 2026-10-26 (logs/live-0151-haptic.txt): QUP1 SE9
+    fw 0x303 proto 3 (I2C); "AW8624 chip ID read -> 0, id 0x24"; after reset
+    SYSST 0x30 SYSINT 0x30 GLB_STATE 0. The 0157 fault mask 0x2c wrongly
+    treated UVLO (bit 5, latched at power-up and live in standby, which the
+    vendor driver masks) and FIFO-almost-full (bit 3) as faults, so it put the
+    chip back into reset WITHOUT buzzing. 0159 stops only on OV/OCD/OT (0x46)
+    and clears SYSINT after going active (as aw8624_haptic_active does). CI
+    40227980643 (0158+0159) was building at handoff; next image 0152 = that
+    kernel + same cmdline (sweetbuild=152). After the buzzes work: a
+    /dev/sweet-haptic node plus a CoreAudio HAL "Actuator" plug-in (HackiOS
+    audio_plugin.c and redwood_haptic.c as reference).
+  - **0152 BOOTED (2026-10-26, logs/live-0152-haptic.txt)**: image
+    shim/out/shim-boot-0152-haptic.img 110e2dd1... = kernel CI 40228520033
+    (0158+0159+0160, ea579832...) + ADT shim/out/sweet-0152-haptics.adt
+    3fdc5b6c... (tools/adt-add-haptics.py: /product/haptics closed-loop=1,
+    supports-3rd-party-haptics=1) + sweethaptic=3, sweetbuild=152. Root:
+    research/audio-install-0160 installed /System/Library/Audio/Plug-Ins/HAL/
+    SweetAudio.driver (userspace/audio, HackiOS audio_plugin.c port, CI
+    40228338000, SweetAudio dd524fc1...; 12 chunks readback-verified; rollback
+    restore-delta.py). Result: /dev/sweet-haptic major 20; three test buzzes
+    each ended with SYSINT 0x01 (done), no fault; "serving /dev/sweet-haptic";
+    mediaserverd exec'd once (no crash loop). User feel-test of the buzzes and
+    of iOS haptics pending. 0161 (battery: hold the last reading through up to
+    12 failed polls; exact 0 mA is not a valid current) is committed but NOT
+    BUILT: the xnu workflow's concurrency cancels the older run on a new
+    dispatch (that is how 0159-only run 40227980643 got cancelled). The user's
+    "not charging" on plug/unplug matches the failed-read fallback lines.
+  - **0153 BOOTED (2026-10-26 ~03:00, logs/live-0153-mini.txt)**: image
+    shim/out/shim-boot-0153-mini.img 178e6f97... = kernel CI 40231786817
+    (0158-0163, 03bfc29a...) + ADT shim/out/sweet-0163-mini.adt 7be3b7fd...
+    (tools/adt-set-screen.py mini: disp0 canvas 1080x2340, /product
+    artwork-device-subtype 2340) + sweetimportmin=8192 (kernel cleans
+    imports < 8 MiB: glyph cache-coherency TEST), sweetbuild=153.
+    "presented as 1080x2340", swaps 1080x2340, SpringBoard/backboardd once.
+    User photos before (0152): keyboard/App Library index/"Cancel" cut at
+    both edges = 1125->1080 crop (fixed by 0163); CC glyphs garbled
+    (airplane, AirDrop, bottom row). Battery seeded from the OCV table (55%)
+    because sweet_spmi_read refused peripheral 0xb6: fixed in 0164 (NOT
+    BUILT). OrangeFox said 25% at that time; check SDAM seed next build.
+    Haptics: user felt nothing on 0152 (no buzz at 40 s, no long-press buzz)
+    although the chip reported done; parked by the user.
+  - **0154 BOOTED (logs/live-0154-scaled.txt)**: 0165 (iPhone X 1125x2436 scaled
+    onto 1080x2400, sweetfb_mode=3) + ADT sweet-0152-haptics.adt (X), MG cache reset
+    again (research/mg-reset-0165: journal 17 txns replayed, cache had subtype 2340).
+    USER: display normal, no borders, status bar right; battery 25% = OrangeFox
+    (0164 SDAM seed works; curve said 37%); Wi-Fi off; glyphs still garbled;
+    performance unchanged. 0153 (mini 1080x2340) had UIKit's red rdar://45025538 bar.
+  - **0155 BOOTED = CONFIRMED (logs/live-0155-rtc.txt)**: image
+    shim/out/shim-boot-0155-scaled.img b6fd322e... (kernel CI 40259446560 up to
+    0166, efa02c70...; 40258507338 failed to compile: return type split). "SWEET
+    RTC: calendar set from the PM6150 RTC: 147540383 s" (an arbitrary counter,
+    ~1974, unique per boot), "seed 25% from QG SDAM", radio up, en0 attached.
+    USER: Wi-Fi works, Bluetooth works, time accurate (network time), battery
+    accurate; performance still sluggish. Next: 0167 (A76 preference, CI
+    40260189402) as image 0156 (research/gpu/package-0156.py).
+  - **0156/0157 (2026-10-26)**: 0167 (UI threads prefer A76) = little change
+    (best 216 vs 195 presents/10 s, GPU busy 27-33% -> 38-49%); user: same.
+    0157 = + 0168 USB file server (sweetfiles=1, 192.168.7.2:2223 only, peers
+    192.168.7.0/24; tools/sweet-files.py get/put/mkdir/link/rm/chmod/sync) -
+    WORKS. SSH installed with user approval (tools/sweet-install-ssh.sh,
+    userspace/out-ssh from CI 40261978189: dropbear 2024.86 key-only + dash; toybox
+    build still fails): launchd job org.iossweet.dropbear on 192.168.7.2:22,
+    launchd.plist 91a36f36 -> new (796195 B), original kept as
+    /System/Library/xpc/launchd.plist.pre-ssh and research/ssh/launchd.plist.orig;
+    key research/ssh/id_ed25519 (git-ignored). Active after the next boot.
+    /var/local/mtl2-telemetry created (frontend K lines every 10 s).
+  - **GPU COST MEASURED (frontend telemetry, 0157)**: idle frames rp1 dr3 2.7 Mpx
+    ctc 1.7-2.5 ms; scrolling/CC rp8 dr65 8.2 Mpx ctc ~26 ms; heavier rp13 dr91
+    11 Mpx ctc ~38 ms => ~3.2 ms per Mpx (~300 Mpx/s) at a verified ~797 MHz
+    (PLL0 L=83). Per-pixel cost is ~10x what an A618 should do: shaders /
+    blending / sysmem vs GMEM to be traced (MESA_GPU_TRACES per pass over SSH).
+    Also: 78 VkPipeline creations in one 10 s window (372 ms, max 60 ms stall:
+    first-open jank) and "surface cache" 0.5 s CPU per 10 s (max 101 ms).
+  - **SSH WORKS (0157, 2026-10-26)**: `ssh -i research/ssh/id_ed25519 -o
+    UserKnownHostsFile=research/ssh/known_hosts root@192.168.7.2`. dash had to be
+    rebuilt without strchrnul (iOS 18 only: a NULL weak import crashed it at pc 0;
+    CI 40262874809, dash 11d9f7ab...). No toybox yet; iOS has ps, spindump,
+    tailspin, taskinfo, ioreg, vm_stat, df. Restart backboardd:
+    ps -A -o pid,comm | while read p c; do case "$c" in */backboardd) kill $p;; esac; done
+  - **GPU TRACE (MESA_GPU_TRACES=print via /var/local/mtl2-env, 20 s use;
+    research/ssh/tr1.txt, tools/gputrace-sum.py)**: render passes 6.94 s, of which
+    draw_ib_gmem 6.69 s (GMEM mode everywhere), gmem_store 0.64, gmem_load 0.39,
+    copy_buffer_to_image 0.70 s (the shadowed A8/RGBA8 buffer textures). By pass:
+    1125x2436 att2 load+store 44 bins (288x224): 670 passes, mean 7.9 ms = 76%;
+    1125x2436 clear passes 13.6 ms mean = 11%. => shading cost per pixel.
+    metal2vulkan holds `half` in f32 re-rounded after EVERY op (native route:
+    f32->f16->f32 conversion behind a barrier). Bridge 0201 (env
+    SWEET_M2V_EXACT_HALF=1 restores) holds half in f32 between ops; Metal
+    bundle CI 40263476644; install with tools/sweet-install-metal2.sh
+    (backup, unlink, write, readback, restart backboardd; no reboot).
+  - **CPU HOGS FOUND (spindump over SSH, 20 s while the user scrolled;
+    research/ssh/spin-bb.txt)**: vmd (VisualVoicemail, no cellular) 18.4 s,
+    ReportCrash 8.3 s, launchd 6.4 s, AegirPoster x4 7.5 s (crash loop: 1226
+    "device refused: Vulkan -3" since extra GPU clients are off, sweetm2extra=0),
+    kernel_task 3.9 s; backboardd itself 0.1 s. Same as sunfish (dropping vmd,
+    ReportCrash, axassetsd took them from 4 to 17 fps). DONE (live, effective next
+    boot): launchd.plist 4414a8b1 -> 531 jobs without com.apple.voicemail.vmd,
+    com.apple.ReportCrash, com.apple.accessibility.axassetsd (original:
+    /System/Library/xpc/launchd.plist.pre-perf, research/ssh/launchd.plist.pre-perf);
+    AegirPoster.appex moved from AegirProxyApp.app/PlugIns to
+    /var/local/disabled/AegirPoster.appex (mv back to undo).
+    Also tested: bridge 0201 (half in f32) - no per-pixel change (3.0 -> 3.15
+    ms/Mpx), kept; TU_DEBUG=sysmem via /var/local/mtl2-tu-debug - full-screen
+    pass 7.4 -> 6.6 ms, user "slightly better", left ON. Per-draw trace
+    (research/ssh/tr2.txt): draws are only 1.7 s of 7.0 s draw_ib_gmem.
+    toybox 0.8.11 installed (/var/local/bin, CI 40267503920; sys/disk.h stub).
+  - **WI-FI ROOT CAUSE (2026-10-26)**: wland auto_up() stores kern.boottime in
+    /var/local/wland.boot and exits "already started in this boot" when it matches.
+    No RTC: the calendar starts at the epoch, boottime ~40 s EVERY boot, so a repeat
+    silently skips Wi-Fi (0145c, 0153, 0154). Evidence: /dev/pmem traces stop after
+    43 SMEM reads (cap is 48) before the AOSS QMP write at 0x0c300000 that 0152 made;
+    the pulled wland.log was 0152's (log rotation happens after the check). Fix 0166:
+    SweetBattery sets the calendar from the PM6150 RTC (0x6046/0x6048) when before
+    2001. Kernel CI 40258507338; image 0155 = 0154 + 0166, sweetimportmin removed.
+  - **PERF (0154 in use)**: 12-17 fps; present avg ~25 ms of which gate (frame's GPU
+    fence) ~20 ms; copy 3.3 ms; acquire 1.3 ms; GPU 800 MHz (6-level OPP, index 6),
+    busy 30-45%; CPUs at 1.8/2.3 GHz. sweetimportmin=8192 tripled submit cost
+    (1.1 -> 3.5 ms) and did NOT fix the glyphs: keep it off. CA_FORCE_TIMER=1 and
+    64-byte surface rows (0124) are already in place (sunfish findings 1-2). Sunfish
+    (same A618 stack, research/ios-sunfish-reference docs/sunfish/display-perf.md,
+    plan.md) tops out at ~20 updates/s too: backboardd GPU 14-20 ms/frame (blur
+    passes, full-screen expensive draws), and GPU end -> swap p50 29 ms on the
+    CA/CPU side. Next: per-commit telemetry (touch /var/local/mtl2-telemetry),
+    MESA_GPU_TRACES via /var/local/mtl2-env, sweettrace-style timeline.
+  - **GLYPHS**: m2v-msg.log shows CA's A8 glyph masks are textures over no-copy
+    buffers (offset 64, rows 608/640) that Turnip refuses -> shadowed (copied in
+    before use, back after each GPU write). Not a cache problem (importmin test).
+    Better lead from flame (HANDOFF stage 11): garbled CC glyphs = CA's memoryless
+    attachment 1 never cleared (vibrant/MRT glyph pipelines); our garbled ones are
+    exactly the deselected (vibrant) CC buttons. Needs per-pass readback/trace.
+  - **ROOT WRITES NEED A JOURNAL REPLAY FIRST.** research/mg-reset-0163: the
+    root was left with 4.3 MB of unreplayed HFS+ journal (iOS stopped by a
+    forced reboot); fsck.hfsplus (no replay) saw a broken catalog and
+    segfaulted rebuilding it (overlay only, nothing written). Use
+    tools/hfs-journal-replay.py PLUGIN OVERLAY on a fresh overlay before the
+    guest (dry run with --dry-run), then a read-only fsck -fn: after the
+    replay only "volume header needs minor repair" (unclean flag) remained.
+    Applied: journal replay + MobileGestalt cache moved to
+    .../com.apple.MobileGestalt.plist.pre-0163 (it cached
+    ArtworkDeviceSubType 2436 and, probably, no closed-loop haptics; cache is
+    keyed by build+UUID only), 18 chunks readback-verified; copies in
+    research/mg-reset-0163/share/out (MobileGestalt.plist, mtl2.log).
+  - Log receiver: tools/sweet-usb-log.py holds UDP 5140. Do not use
+    `pgrep -f sweet-usb-log` in the same shell command: it matches the shell
+    itself and kills it (exit 144); anchor it as pkill -f "^python3 tools/...". Stop the previous
+    receiver before a new boot, otherwise the new boot keeps logging into the
+    old file.
+
+- (2026-10-25 entries follow.)
+
+- **0145c boot (after the BT-firmware install): Wi-Fi did NOT come up** - wland ran (SMEM reads) but no modem SMC/radio-up lines (logs/live-0145c.txt); previous three 0143-0145 boots brought the radio up. Read /var/local/wland.log first next session; a plain reboot may suffice.
+- **NEXT: Bluetooth port (in progress, nothing built yet).** User priorities after
+  BT: battery/charge %/charger state, then video playback (YouTube page and
+  thumbnails load over Wi-Fi, video does not play), then locked 60 fps, then 120 Hz.
+  Phone runs 0145 (Wi-Fi works, web pages load). Done for BT:
+  - Firmware dumped read-only: bluetooth partition (sde27, 1 MiB FAT, sha
+    5cfa6009...) -> research/sweet-bt-fw-0145/files/image/ (crbtfw21.tlv 230076 B,
+    crnv21.bin 4710 B, + 11/20 and ap* variants). Also INSTALLED on the root at
+    /usr/standalone/firmware/sweet/ (research/bt-fw-install-0145, 14 chunks verified).
+  - Bergamota BT sources assembled (patches-11215 0104,0117,0118,0124,0125,0128,0132,
+    0133,0136,0239 applied to an empty tree): scratchpad btsrc/bsd/dev/
+    beryllium_wlan.c (2858 lines; BT = wl_bt() + wl_bt_fw + wl_xport_*) and
+    beryllium_bt_hci.c (761; com.apple.uart[.sk].bluetooth kernel control + HCI
+    compat). Regenerate with `git apply --include=bsd/dev/beryllium_wlan.c
+    --include=bsd/dev/beryllium_bt_hci.c` from origin/wifi-bt18 xnu/patches-11215.
+  - Sweet hardware (downstream DT + Linux gcc-sm7150/pinctrl-sm7150, verified):
+    UART = QUP0 SE3 0x88c000 (hsuart0), SPI 604, wrapper 0x8c0000; GCC identical to
+    SDM845 layout: wrap0 s3 CBCR 0x173c0, RCG 0x173c4, vote 0x5200c bit 13 (m/s ahb
+    bits 6/7, CBCR 0x17004/0x17008), same ftbl/parent map, GPLL0 even. TLMM SOUTH tile
+    0x03d00000 (west 0x3500000, north 0x3900000); GPIO38 CTS, 39 RFR, 40 TX, 41 RX,
+    function qup03 = 1; wake gpio41. Rails (bt_wcn3990): vdd-io LDOA10 1.8 V, core
+    LDOC2 ~1.3 V, pa LDOC10 3.3 V, xtal LDOC1 1.8 V (Bergamota: ldoa7/17/25).
+  - Port plan: sweet_bt.c from beryllium_wlan.c with ONLY gcc/tlmm/se/wrapper mapped
+    (their wl_map/wl_probe read the apps SMMU + SMEM: apps-SMMU loads from a running
+    system stall a CPU on sweet - do NOT call wl_probe/wl_dump_smmu); constants above;
+    add sweet_rpmh_vreg_set() limited to the 4 BT rails (sweet_rpmh_vreg_enable allows
+    only ldoc11); firmware via ADT props under /arm-io/bluetooth (as GPU fw) instead
+    of sweet_a630_fw_get; stub sweet_ufs_read_part; init from sweet_ufs_init with
+    Bergamota boot-args (sweetwlan=2 sweetbt=1 sweetbtfast=1 sweetbtibs=1). Then ADT
+    bluetooth node (Bergamota tools/adt-bluetooth.py: transport-encoding 3,
+    transport-speed 3000000, local-mac-address), BlueTool stub + bluetoothd
+    BT_HCI_TRANSPORT=H4BC:POSIX:com.apple.uart.bluetooth,3000000 (Bergamota
+    root_tweaks18 bluetooth()); see Bergamota docs/WIFI_BT_IOS18.md, BT_IOS_TRANSPORT.md.
+
+- **WI-FI WORKS: DHCP address on en0 (0145, 2026-10-25 late).** Image
+  shim/out/shim-boot-0145-net-trace.img 93d24536... (0143 kernel CI 40207886158,
+  ADT sweet-0144-wlan.adt, + net_trace=80). Root changes (all delta-backed,
+  readback-verified): wland 0002 (research/wifi-install-0143), bdwlan.b00 =
+  bdwlan.bin (research/wifi-bdf-0143), preferences.plist moved to .pre-wifi
+  (research/wifi-sc-0144) - configd rewrote it with HostNames only (saved as
+  preferences.plist.configd-0145) - then a standard Wi-Fi service (en0, AirPort,
+  IPv4 DHCP, IPv6 Automatic; research/wifi-sc-0145/preferences.plist 6630ee74...).
+  0145 trace: configd now manages en0; IPv6 RS/NS out, DHCP DISCOVER out, OFFER in
+  (10.242.x.x hotspot), REQUEST, "configd en0 add address 10.242.x.x", default
+  route via the hotspot gateway, mDNS out. Settings: changing "Configure IPv4"
+  crashed Preferences (sig 6, unsymbolicated) on 0144. Bluetooth next: port
+  Bergamota's iOS 16-era WCN3990 BT series (UART transport + firmware download +
+  IBS + com.apple.uart.bluetooth control, 0239 HCI compat, ADT bluetooth node).
+
+- **Wi-Fi JOINS (0144, 2026-10-25 late).** 0144 = 0143 kernel + ADT with
+  /arm-io/wlan (tools/adt-add-wlan.py -> shim/out/sweet-0144-wlan.adt 07b0659b...;
+  image shim/out/shim-boot-0144-wifid.img 874e0568...): wifid now starts;
+  Settings lists networks; joining <redacted SSID> (ch36 WPA2/3 hotspot):
+  auth 0, assoc 0 aid 6, WPA2 4-way done, keys installed, link up, station state 4.
+  But iOS sent only 2 frames in 4.5 min (wland: tx 2 sent, rx 8) and left: no
+  DHCP. Same as flame's "configd had no network services": preferences.plist
+  held only HostNames. Moved it aside (research/wifi-sc-0144: preferences.plist
+  -> preferences.plist.pre-wifi, sha bb80fba3..., 6 chunks verified) so configd
+  builds a default Wi-Fi service for en0. Rebooted 0144: result pending.
+  wland.log 0144: research/logs-inspect-0144/files/wland.log.
+
+- **WI-FI RADIO UP on 0143 (2026-10-25 ~22:00).** With 0153 (kernel WLAN SMMU
+  stream: SID 0x240 -> CB4 via SMR6, ok) + wland 0002 installed, wland.log
+  (research/logs-inspect-0143/files/wland.log): rails/rfclk/cx[6]/mss[7] votes,
+  PAS init/mem-setup/auth-and-reset 0, modem ready after 100 ms, GLINK/QRTR,
+  rmtfs (modemst1/2, fsg), pd-mapper, tftp (wlanmdsp.mbn 3.8 MB), WLFW at
+  ~18.6 s, MSA 0x97d00000 hyp-assigned, chip 0x140 family 0x4002 board 0 fw
+  WLAN.HL.3.0.1.c3-00162, then "no bdwlan.b00" (sweet ships bdwlan.bin + .bXX
+  variants, none for board 0). Fixed by installing bdwlan.b00 = copy of
+  bdwlan.bin (b740afea...; research/wifi-bdf-0143, 9 chunks verified). Reboot:
+  "flame wlan: the radio is up (02:50:49:58:45:4c): en0 for wifid",
+  "net: en0 attached on wcn3990", "apple80211: the station says: power, 1".
+  Scan/join not yet observed (user to test Settings). TODO: wland fallback
+  bdwlan.bin when bXX missing (instead of the copied file).
+  Research 2026-10-25: Bergamota (Poco F1, WCN3990) wifi-bt18 has BLUETOOTH
+  WORKING on iOS 18 (UART transport + HCI compat 0238/0239, Skywalk 0250) -
+  port candidate; its Wi-Fi (wlan26) is paused at MSS/MBA boot (we are past
+  that). Bergamota 0240 GPU 2D-engine scan-out copy: built, not booted.
+  ios-flame (Pixel 4, A640) README: 20-26 fps swiping; no public port claims
+  60/120 Hz. Sweet now 24-30 fps (user).
+
+- **Wi-Fi 0139-0143 (2026-10-25 night).** 0139 (CI 40202374751): with BCM
+  SN15+CN0 voted (sweet_rpmh_bcm_vote) the kernel reads the apps SMMU fine:
+  sCR0 0x250406, ID0 0x4c017e4f (79 SMRs), ID1 0x6000003d (61 CBs, 4K pages,
+  128-page GR space). 0140 (CI 40203325188, votes at bsd init, sweetwifi=0
+  removed): wland.log again only "wland auto: boot ..."; USB console died at
+  that moment, UI kept running. 0141 (CI 40205614605, 0151 pmem trace): wland
+  reads SMEM (0x861ff000.., 0x86001000) fine, then its load from 0x15000020
+  stalls inside pm_rw on the SAME cached mapping the kernel probe read through
+  at bsd init (pmem-path ID0=0x4c017e4f) -> a CPU stalls forever; per-CPU timers
+  queued there never fire (touch 45 s timer -> no L11C -> GPU CX precondition
+  EAGAIN -> no Metal -> Apple logo). 0142 (CI 40206634111, 0152 recast votes
+  before each apps-SMMU access): votes OK, load still stalls (CPU1); GPU
+  bring-up timer stuck -> CPU-only CA (red clock, no blur). So NOT lost votes;
+  early-boot reads work, later ones stall (cause unknown: hyp trap / power
+  state?). 0143 (shim/out/shim-boot-0143-kernel-smmu-wlan.img 60d505df..., CI
+  40207886158, 0153): kernel programs WLAN SID 0x240/1 -> free SMR + bank
+  (CBAR 0x1f000, SCTLR 0xe0) in the probe thread at bsd init (sweetsmmuwlan=1);
+  wland patch 0002 (CI 40207885501, wland 951a05a2...) skips its SMMU step when
+  the boot-arg is present. Install prepared: research/wifi-install-0143 (only
+  /var/local/bin/wland, old 4373d001... verified first). NEVER boot a wland-on
+  image with the old wland binary (any apps-SMMU access from userland stalls).
+  Frontend 0004 (IOSurface texture format log, bundle CI 40205832322)
+  INSTALLED (research/metal2-install-0141, 47 chunks readback-verified);
+  surface-texture lines go to /var/local/mtl2.log only.
+
+- **0137/0138 (later 2026-10-25). USER: tearing in recents GONE (0145 beam
+  race confirmed); animation "slightly better, like 20-30 fps" on 0138;
+  garbled Airplane/AirDrop/Hotspot glyphs remain; Wi-Fi/Bluetooth not
+  working.** 0137 (CI 40199299205, 0147 early reserve): XNU still gave only one
+  48 MiB contiguous block. 0138 (shim/out/shim-boot-0138-pool-blocks.img
+  ccd18c38..., CI 40201144666, 0148 multi-block pool): "owned BO pool reserved
+  384 of 384 MiB in 6 blocks", write-combined in 72 ms; fallback=0, peak 287
+  MiB / 2596 BOs; kernel lock time per 10 s window 4.5 s -> 0.84 s; gpu_busy
+  ~19%; present gate still ~23 ms (frame's GPU fence after SwapEnd) - next
+  perf thread is CA pacing / per-frame GPU latency, not lock or clock.
+  Allocations of big BOs still 1.4-2.5 ms (zeroOwned 32-bit volatile stores on
+  WC). Wi-Fi: downstream apps-smmu vote = msm-bus 161->627 = BCM SN15 + CN0
+  (active-only); 0149 (CI 40202374751) adds sweet_rpmh_bcm_vote (SN15/CN0
+  only) and opt-in sweetsmmuprobe=1 thread that votes and reads sCR0/ID0-2 20 s
+  after boot with a log line before each read (wland stays off: sweetwifi=0).
+
+- **0134-0136 (2026-10-25 evening): the GPU is NOT the bottleneck; the kernel
+  GPU lock is.** 0134 (kernel CI40175753907, 800 MHz, PLL0 L=83 ~797 MHz
+  verified): user "feels the same", tearing scrolling recents. Session stats
+  (persist log logs/persist-0134.txt): ~11 fps in use (peak 23), gate ~19 ms,
+  acquire 1.2 ms, copy 2.6 ms, submit 2.2 ms. Dense sampler only caught idle.
+  0135 (image shim/out/shim-boot-0135-unlocked-wait-beam.img 0fdc41f9..., CI
+  40183460702 = 0144+0145): 0144 Turnip's 1 ms WaitFence slices no longer spin
+  under the lock (poll + IODelay(20) between checks; sweetwaitlock=1 = old) and
+  a 10 s "SWEET RENDER: window_ms=... gpu_busy_pct=..." line (busy sampled at
+  120 Hz by trylock, per-method calls/avg_us, lock wait). 0145 beam-raced copy:
+  INTF_1 @0xae6b800 timing engine, 2432 lines, active 12-2412, 8.333 ms (120 Hz
+  measured), line 3426 ns; copy starts only where it cannot overtake the scan
+  (sweetfbbeam=0 = off); waits 0-2 ms. MEASURED on 0135 in use: gpu_busy
+  17-44%, but per 10 s BoAlloc 349x5.6 ms, BoMap 488x2.1 ms, BoFree 275x2.8 ms,
+  Submit 243x3 ms = ~4.5 s of lock time; BoAlloc spikes 22-57 ms
+  (vm_page_find_contiguous scanning 255k pages and failing, then per-page
+  pmap_set_cache_attributes for write-combine). Root cause: UniXNU's owned-BO
+  pool (NativeAdrenoMemory::reservePool/writeCombinePool) was never reserved on
+  sweet, and pooled BOs had no descriptor for clientMemoryForType.
+  0136 (shim/out/shim-boot-0136-bo-pool.img 8737dc65..., CI 40198161016, 0146):
+  pool reserved at publish got only 48 of 192 MiB, full within seconds (peak 97
+  BOs, 466-1119 fallbacks/10 s); submits dropped to 1.0-1.4 ms. 0147 (CI
+  40199299205 building) reserves 384 MiB from sweet_ufs_init (bsd init, before
+  root mount); sweetbopool=MiB, 0 = off.
+  ICONS (user video ~/Videos/VID_20261025_184706286.mp4): Airplane, AirDrop,
+  Personal Hotspot glyphs are not missing but GARBLED (glyph repeated
+  horizontally, squashed vertically = row-pitch/layout mismatch); Wi-Fi and
+  Bluetooth (vector) are fine. These are A8 masks: Turnip refuses their explicit
+  linear layout (pitch 224/544/608/672 not 64-aligned, "pitchalign 6") so
+  metal2vulkan shadows them (copy before use). 0134 mtl2.log shows no refusals
+  (x0). Candidate experiment: bridge patch preferring R8_UNORM + (0,0,0,R)
+  swizzle for sample-only A8 (metal2vulkan format/mod.rs make_repr A8Unorm).
+  Video also shows two thin vertical white lines at ~40% width on every screen
+  (Safari, dialer, settings): likely panel hardware (cracks visible) - ask.
+  AegirPoster crash-loops (62 aborts, no device with sweetm2extra=0) keep
+  ReportCrash busy. Reading fragmented HFS+ files: research/logs-inspect-0134/
+  read2.py (extents-overflow aware) over the nbdkit ADB export.
+
+- **0132 booted (kernel CI40173049234 ecd870b, SHA 72c1d784...; image
+  shim/out/shim-boot-0132-present-split-small-imports.img 06180c25...;
+  sweetwifi=0). USER: buttons WORK again (confirms wland's hang), 2
+  notification-panel icons + lock-screen camera icon still missing, still
+  sluggish, Bluetooth unavailable, Wi-Fi toggle stuck.**
+  wland root cause: /var/local/wland.log has only "wland auto: boot 38 ..."
+  - it hung in smmu_wlan_identity() reading apps SMMU 0x15000020 via
+  /dev/pmem; downstream apps-smmu needs msm-bus APPS(161)->TCU(627) vote
+  (qcom,msm-bus,vectors-KBps) and TBU vdd; an unvoted TCU read stalls the CPU
+  (keys poller stopped). Keep sweetwifi=0 until a TCU/BCM vote or a guarded
+  kernel-side SMMU stream setup exists. 0141 PMEM_RPMH whitelist is built.
+  0132 present split (interaction): swaps==presents 34-109/10s (~290ms frames),
+  gate 15-46ms, acquire ~1.2ms, copy ~2.7ms, submits ~2ms -> CoreAnimation's
+  own frame production is the cap, not the kernel present or GPU clock.
+  Next image 0133 (kernel CI40174803466, 0142 dense sampler, SHA 73481baa...;
+  shim/out/shim-boot-0133-sampler-presentfence.img 9edb7877...): boot-args add
+  sweetpresentfence=1 sweetsample=backboardd sweetsamplefirst=150
+  sweetsamplems=300 sweetsamplecount=600. Root diag research/m2v-diag-0133
+  (prepared, NOT installed): copies out mtl2.log/backboardd pipelines.log/
+  wland.log, adds /var/local/mtl2-env SWEET_M2V_MESSAGES=/var/local/m2v-msg.log
+  + m2v-msg.log 0666. Missing icons suspect: A8 (VK 1000470001) textures with
+  "explicit layout refused" (422 on 0131). Symbolicating SMP samples needs the
+  ipsw CLI (downloaded to research/tools-ipsw, checksum OK) - running it was
+  blocked pending user permission.
+
+- **0131 hardware results (user + logs/live-0131-wc-wifi.txt).**
+  GPU CLOCK MEASURED for the first time (0137 GPUCC readback): PLL0 L=27
+  (VCO~518MHz, gfx3d~259MHz via CRC/2) before DCVS, L=58 (VCO~1114MHz,
+  ~557MHz) after index 4 -> every boot before 0127 ran the A618 at ~259MHz.
+  0135 WC owned BOs: legacy submit 0.19-0.66ms early, ~2ms under load
+  (was 16ms 0129, 9ms 0130); publish 26-218us/80KiB/3 objects; no WC distrust.
+  Presents up to ~200/10s but present avg 15-66ms, max 100-247ms ->
+  the CPU present path is now the cap (0139 splits gate/acquire/copy).
+  User: performance "feels the same"; WALLPAPER SHOWS CORRECTLY (with
+  sweetm2extra=0); notification-panel icons flicker/missing; Wi-Fi toggle
+  stuck off; Bluetooth unavailable; POWER/VOLUME BUTTONS DEAD this boot.
+  Kernel logged zero "SWEET KEYS: key=" lines (9-25 on 0126-0130), no read
+  errors. wland: /dev/pmem + /dev/wlan up, wland exec'd at boot; its first
+  rail vote uses PMEM_RPMH which 0138 did not port (ios-flame 0102) -> modem
+  never booted. Before that it ran smmu_wlan_identity() (apps SMMU SMR/CB
+  for SID 0x240). Button root cause NOT proven; next recovery: read
+  /var/local/wland.log; consider sweetwifi=0 A/B. Fixes queued: 0140 small
+  imported BOs (<2MiB, no-copy host buffers) kernel-maintained again (flicker
+  candidate); 0141 PMEM_RPMH with Sweet whitelist. CI 40172435680 (0139+0140)
+  SUCCESS; 40173049234 (through 0141) building.
+
+- **0131 image + Wi-Fi root install (booted; results pending).** Kernel
+  CI40156111990 on fa22c25 (patches through 0138), SHA 4083ad5f...,
+  image shim/out/shim-boot-0131-wc-wifi-kernel.img SHA ba2a5d6d..., cmdline
+  0130 + sweetbuild=131 sweetm2extra=0 sweetpmem=1. New since 0130:
+  0135 write-combined Turnip-owned BOs (sweetwc=0 restores) - 0130 showed the
+  owned-BO publish growing to 8.5-9.1ms/115-134MiB/530-770 objects per submit;
+  0136 GPU LOST report on quiesce/close failure; 0137 GPUCC PLL/RCG readback;
+  0138 ios-flame Wi-Fi kernel side (/dev/pmem off unless sweetpmem=1; en0 +
+  Apple80211 + IOKit-quiet fix + AKS wrap/unwrap for keychain).
+  0130 results: recents OK (user), perf "same"; wallpaper customize hung the UI:
+  AegirPoster still killed "extension check-in timeout" (device open
+  0.85-2s + cold shaders), then the backend was lost silently in quiesce()
+  and backboardd SIGSEGV after "no-copy buffer refused: HostMemory
+  NotRepresentable" -> hence sweetm2extra=0 until GPU hang recovery exists.
+  Wi-Fi userland CI40156101166 (userspace/wifi/patches/0001 on ios-flame
+  f09fdb58): wland SHA 4373d001..., netsvc 005e61f8...; Sweet rails L9A 640,
+  L1C 1800, L2C 1304, L10C 3312 (NOT L11C = touch), MPSS 0x8b000000+0x8400000,
+  MSA 0x97d00000/1MB, bdwlan.bXX/.XXX by board id; XNU uses only high DDR
+  (ADT dram-base 0x1_00000000) so wland's 0xE0000000+ buffers are free.
+  Read-only dumps (sha256 matched on-phone) in research/sweet-wifi-fw-0131:
+  modem 320MiB (FAT, 1140 files), modemst1/modemst2/fsg 8MiB, fsc 256KiB.
+  Root install research/wifi-install-0131: /var/local/bin/{wland,netsvc},
+  /var/local/fw/modem (321 files: modem.*, wlanmdsp.mbn, bdwlan.*, *.jsn,
+  modem_pr), /var/local/fw/rmtfs/*.img 0600 (copies; wland never writes the
+  partitions), launchd.plist + org.ios-sweet.wland (533 jobs; guarded by old
+  hash d7fd1507...). Guest VERIFIED_UNMOUNTED (659 checks), 113 chunks
+  88932352 bytes, preflight matched, all readback-verified. wland logs to
+  /var/local/wland.log (not the console); off: /var/local/wland.off or
+  sweetwifi=0. Live log logs/live-0131-wc-wifi.txt.
+
+- **0130 = kernel 0133+0134 (CI40152237332 eb47373, kernel SHA 717e103c...,
+  image shim/out/shim-boot-0130-import-sync-faultlog.img SHA 3f2f8dc7...)
+  + bundle CI40152843590 (5cc1a54: frontend 0001-0003, bridge
+  userspace/metal2/bridge-patches/0200; frontend SHA ed571c06..., Turnip
+  03844ca8...; ABI 0f5a0900 unchanged). Installed research/metal2-install-0130:
+  fresh snapshot, guest VERIFIED_UNMOUNTED (fsck OK x2, 42 hash checks),
+  47 chunks 39518208 bytes, preflight matched, all readback-verified; 0129
+  mtl2.log saved share/mtl2-before-0130.log. Booted send0.504s/boot0.130s,
+  live logs/live-0130-import-sync-faultlog.txt.**
+  Wallpaper root cause chain (AegirPoster pipelines.log via OrangeFox):
+  aegir_star/luna/earth refused Unsupported(ExtendedRangeBlend(SrgbForm))
+  = source-over blend into BGR10_XR_sRGB under fast math -> nil pipeline ->
+  frontend "foreign render pipeline" -> killed. With bridge 0200 on 0130:
+  no refusals; device opens (853-1956ms) but every instance is killed
+  "extension check-in timeout" (9x) - device open + cold shader compile on
+  the extension's startup path exceed ExtensionKit's check-in limit. Next:
+  measure/shorten device open (Turnip dlopen/instance/device, bridge priming)
+  or make first-frame pipelines warm.
+  0130 import sync: publish 3076us/39MiB/51 objects per submit at boot
+  (owned cacheable BOs only; 0129 was 15.7ms/204MiB/620 objects).
+
+- **0129 measured the submit cost and then lost the GPU (user: crashed opening
+  recents, black screen).** legacy submit windows: publishMapped 5315us/61MB/
+  75 objects early, then 15390-15660us of a ~16.1ms submit, ~204-208MiB in
+  490-719 imported objects PER SUBMIT. Unlocked present gate worked
+  (fence-targeted waits 14us-9.6ms). AegirPoster got a real Turnip device
+  (window 0x80000000) but frontend refused its command buffer "foreign render
+  pipeline" (that check also fires for nil = failed pipeline creation); it was
+  SIGKILLed (extension check-in timeout). After its slot closed, the next
+  AegirPoster open hit VK_ERROR_INITIALIZATION_FAILED and backboardd's device
+  became DeviceLost at the same moment: healthy() marked backend.lost silently
+  (faulted(): CP int/hw fault/SMMU FSR/GMU OOB/RBBM) with no log and no
+  recovery -> black UI. Cause NOT yet proven (second client fault suspected).
+  Next kernel (CI40152237332 on eb47373): 0133 imported BOs client-maintained
+  (sweetimportsync=0 default; =1 restores kernel full publish/acquire) per the
+  Sunfish donor contract and SweetMetal2 flushSurfaces(); 0134 one-time
+  "GPU LOST (...)" register/last-submitter report. Frontend 0003 (bundle CI
+  40152398536 on 3daebe6): async pipeline constructors + refusal names class
+  or "nil render pipeline". Next recovery: read
+  /var/local/m2v-cache/AegirPoster/pipelines.log for the failed pipeline.
+  If the GPU is lost again with extras on, boot with sweetm2extra=0.
+
+- **Wallpaper root cause from on-device crash reports (OrangeFox read-only,
+  research/wallpaper-inspect-0129: poster-paths.txt 606 entries,
+  crashreporter-list.txt 214 reports, files/*.ips).** AegirPoster aborts with
+  NSInvalidArgument in -[NUNIAegirRenderer
+  getOrCreateUniformBufferforFrameBufferIndex:] -> -[__NSArrayM
+  insertObject:atIndex:] (nil MTLBuffer): no usable Metal device (0126 "not
+  listed", 0127 Turnip OutOfMemory from the 0x70000000 window overlap).
+  Live logs: Aegir crashes 0126=60, 0127=62, 0128=0 (never launched on 0128).
+  PosterBoard's 9 SIGTRAP reports (-[PBFPosterExtensionDataStore
+  _stateLock_setupSwitcherConfigurationForFirstTime]) are from OLDER boots;
+  no PosterBoard crash on 0126/0127/0128. GradientPosterExtension 3 old
+  aborts. Persistent 0128 log logs/gpu-0128-aegir-window-backlight-recovery.txt.
+  0129 image (kernel 0132, CI40151308398 de6d224, kernel SHA 12d6816f...,
+  image shim/out/shim-boot-0129-unlocked-present.img SHA 3df098b1...)
+  temporarily booted send0.508s/boot0.130s; live logs/live-0129-unlocked-present.txt.
+
+- **0128 booted (kernel CI40150202949 f0388cf, SHA 9857e626...; image
+  shim/out/shim-boot-0128-aegir-window-backlight.img SHA 27beb7f2...).
+  USER CONFIRMED: brightness slider changes real panel brightness.**
+  backboardd/CoreBrightness sets IODisplayParameters "brightness" 0..65536
+  (e.g. 32222 -> DCS level 1010); every DCS 0x51 via DSI0 TPG FIFO reports
+  DMA done, ack_err=0, timeout=0 (0.3-6ms). Wallpaper still BLACK: on 0128
+  AegirPoster never launched; PosterBoard launches CollectionsPoster,
+  Emoji/Gradient/Extragalactic/Legacy/Photos/Pride/Unity posters (twice,
+  around the backboardd restart); none requests Metal, none crashes. So the
+  black wallpaper is not a Metal-device problem now. Next: OrangeFox read-only
+  pull of /var/mobile/Library/Logs/CrashReporter Aegir/Poster reports (abort
+  reasons) and PosterBoard configuration. User: performance "feels the same"
+  although presents/10s rose 95 (0126) -> 140 (0127) -> 189 (0128); present
+  avg 11-29ms, legacy submit avg ~16ms (inside lock, not lock wait).
+  0132 (unlocked fence-targeted present gate + publishMapped timing) CI
+  40151308398 on de6d224. pmap dirty-tracking for publish REJECTED: clearing
+  PP_ATTR_MODIFIED loses VM dirty state of pageable imported memory.
+
+- **0127 booted (live log logs/live-0127-cpufreq-opp-pipeline.txt). Observed:**
+  CPU: OSM had A76 cluster at LUT0 = **300MHz** (measured 299989kHz on cpu6),
+  A55 at LUT6 1497.6MHz (measured 1496893). Now LUT13 2304MHz (measured
+  2303712kHz) / LUT9 1804.8MHz (measured 1803876). (current_vote decode in the
+  log line is wrong - ignore it.) GPU: 4-level HFI table accepted; APPS
+  gfx.lvl raise verified selector5 (NOM), mx already selector3; DCVS index4
+  (565MHz) errno0, BUT RBBM ALWAYS_COUNT read 0 kHz before/after (counter
+  does not advance at idle) -> GPU clock still UNMEASURED. Metal: backboardd
+  slot0 OK; pipelining on; legacy submits avg5169us max8485 in-flight avg1.0;
+  first 10s windows: 116 presents/10s, missed_deadlines 0 (was up to 306),
+  present avg 4.3-5.3ms max 30ms. No backboardd/SpringBoard crash.
+  AegirPoster now connects (slot1) but its first BoMap at 0x70000000 was
+  refused Busy: **0x70000000 is A618_CP_IOVA (kernel CP fw/ring/fence)** ->
+  Turnip OutOfMemory -> still aborts. Fixed in 0131 (windows at 0x80000000).
+  Backlight: CoreBrightness accepted AppleARMBacklight and sets
+  brightness-nits, brightness-nits-cap(65536), DisplayBrightness{},
+  DisplayBrightnessSliderPosition, CompensationTweak - 0130 parsed none, so
+  no DCS was sent. 0131 decodes brightness-nits as IOFixed (Bergamota 0249
+  confirms nits*65536 SInt32) and logs nested values. vm_page_find_contiguous
+  failures pre-exist (654 in 0126). User feedback on speed/wallpaper pending.
+  0131 CI: 40150023455 cancelled (fix), 40150202949 pending on f0388cf.
+  References added by user: ry-diffusion Chlorophyll (787338f) and Bergamota
+  (5d51b58, develop): Bergamota has SD845 cpufreq governor (0190/0192), GPU
+  DCVS/touch boost (0188/0189/0217), MDP page-flip + zero-copy scanout
+  (0096/0126/0127, docs/DISPLAY_HW.md) - next lever to remove our 10MB CPU
+  copy - and WCN3990 BT over UART/IBS (0117-0136, 0239, docs/BT_IOS_TRANSPORT.md).
+
+- **0127 (Claude) built, root delta installed, temporarily booted.**
+  Diagnosis from 0126 live+recovery logs (logs/gpu-0126-metal2-presentation-recovery.txt
+  613631 bytes) and /var/local/mtl2.log: interaction peaks ~95 presents/10s
+  (~9.5 fps), vsync timer missed up to 306 deadlines/10s because present()
+  (GPU gate wait up to 39ms + CIVAC + 10MB copy) ran INSIDE the vsync timer;
+  every Submit/BoMap drained the whole GPU under the global lock (no
+  pipelining); backboardd commits every 95-120ms with 8-18 render passes,
+  42-92 draws, ~8.2Mpx per commit, ctc 65-145ms; GPU had never left perf
+  index 1 (267MHz configured, never measured); cpufreq-hw (OSM) was never
+  programmed by XNU. AegirPoster crash-looped 60x ("not listed ... no Metal
+  device") feeding constant ReportCrash; bluetoothd/fairplayd respawn ~100x.
+  Donor (Pixel4a, docs/sunfish/display-perf.md) found GPU clock did NOT help
+  there and a present thread was WORSE (14.7 vs 21 updates/s) - so both are
+  boot-arg switchable here and must be measured, not assumed.
+  Kernel patches (source tree = xnu-8796.141.3 + all patches, reconstructed in
+  scratch; patches reproduce it byte-identically):
+  0126 cpufreq-hw: logs OSM LUT, selects highest non-boost row, measured
+       before/after per cluster (dependent-add loop on bound cpu0/cpu6).
+       sweetcpufreq=0 = log only.
+  0127 measured OPP: HFI perf table 267/355/430/565MHz (Linux arc votes from
+       cmd-db), after CP fence: APPS raise-only mx/gfx floors, DCVS index 4,
+       GX clock measured via RBBM ALWAYS_COUNT before/after. sweetgpukhz=267000
+       = old single level.
+  0128 Submit/BoMap no full drain (BoFree/close still drain; sweetpipeline=0
+       restores); present thread off the vsync timer (sweetfb_thread=0 =
+       inline as before); per-window present_avg/max_us + coalesced counters;
+       legacy-submit avg/max us and in-flight stats every 120 submits.
+  0129 AegirPoster gets one of 3 separate 256MiB GPU VA windows at
+       0x70000000+ with its own queue range (sweetm2extra=0 disables).
+  0130 DSI DCS brightness: AppleARMBacklight (backlight-control,
+       IODisplayParameters/brightness 0..65536) -> DCS 0x51 via DSI0 TPG DMA
+       FIFO (0xae94000, downstream kickoff_fifo_command), logs exact
+       setProperties keys; sweetbl=N test level; sweetbacklight=0 disables.
+  CI: 40131677852 FAILED (machProcessor protected), 40132388902 compiled but
+  failed marker step (scheduler v2 string), 40133792777 cancelled by
+  concurrency, **40134086144 SUCCESS on 660ca85f7025a76744d69ea42d10e57956fbfbdf**.
+  Kernel xnu/out-0127-range SHA256 324f892a7402200a7f23952cf1f3e6468c5a3810cedd1202f734dfdc8012b8f6
+  (matches SHA256SUMS, CRC verified). Image shim/out/shim-boot-0127-cpufreq-opp-pipeline.img
+  17416192 bytes SHA256 dd2933e10a718bbdc632ef9cd0282d3fed794d492837578ba54d429cd3563f1f,
+  cmdline = 0126 with sweetbuild=127; manifest research/gpu/0127-boot-manifest.json.
+  Userspace bundle unchanged (0126 final CI40128850465).
+  Root delta research/metal2-wallpaper-0127: fresh OrangeFox snapshot, guest
+  fsck clean before/after + 12 bundle hashes OK, writes
+  /private/var/local/mtl2-clients="AegirPoster" (0:0 0644) and
+  m2v-cache/AegirPoster (501:501 0700); 10 chunks 655360 bytes, preflight
+  matched all, every write readback-verified (installed-readback-verified).
+  Rollback: restore-delta.py. Snapshot cache now STALE after this iOS boot.
+  Temporary boot accepted send0.515s/boot0.130s. Live log
+  logs/live-0127-cpufreq-opp-pipeline.txt (receiver 3600s started pre-boot).
+  Not done this pass (honest): Wi-Fi (donor phone/wifi is a 5.7k-line /dev/pmem
+  userland stack: modem PAS, SMP2P, GLINK/QRTR/QMI WLFW, CE/WMI; needs Sweet
+  carveouts/IRQs/firmware + kernel pmem), audio (ADSP PIL/APR/AFE + 2x AW882xx
+  at i2c 0x890000 0x34/0x35, reset gpio64 irq gpio93), Bluetooth, haptics
+  (AW8624 at i2c 0xa8c000 addr 0x5A, reset tlmm4, irq pm6150l gpio10).
+
+
+- **0126 installed/booted: user says glitches improved, performance unchanged.**
+  FinalbundleCI40128850465 source3e219db, frontendSHA470cbb93cdeba870db47ce7b53ff348458e2191b91246c6beacbc391286aab80,
+  TurnipSHA7c391fb0da42766aac17b0a725b6a95347967faa86490763497d09729b244b02.
+  Guest60928 HFSchecks/fullnewhashes/cleanunmount passed; editedcatalog cache
+  ownership501:501/0700 preserved. Delta50chunks39911424bytes, ALLbeforebytes
+  saved, freshlymatched theneverywritereadbackverified (apply81289). Metadata
+  research/metal2-install-0126/{delta,installation-manifest}.json updated.
+  Temporarybootaccepted send0.530s/boot0.131s; imageSHA5b3ec7eb... unchanged.
+  Currentphone iOS; liveUSBreceiver13880 startedpreboot for3600seconds,
+  logs/live-0126-metal2-presentation.txt isgrowing. Initial283450byteprefix:
+  Adreno618devicecreated3247ms, MTLFunctionadopted, ownedrows64, CPUgateenabled,
+  gatefirst4/sample120result0; sourceacquirerefusals0/functionwarnings0,
+  layoutrefusals74 (shadowfallbackpossible). Fenceretire240gpuwait72698us/
+  cache10410us/result0; notFPS. No fullperformance/correctness successclaimed.
+  UserrequestsClaudehandoffnow; docs/CLAUDE-CODE-CONTINUE-0126.md contains full
+  prompt, exactartifacts/live+previouslogs/rollback/references and Wi-Fi/audio/
+  BT/haptics/brightness/wallpaper tasks. NativeWiFi URLnowredirectsAth12kWifi,
+  notadropinSweetWCN3990driver. TopazlatestREADMEreportsnewGPU/audio work;
+  olderlocalreviewsarehistorical, refreshactualsource/contradictoryREADME.
+  All126snapshot/NBDbase/overlaycachedblocks nowSTALE afteriOSboot: neveruse
+  themfornextwrite; preserveoriginaldeltaforrollback. No additionalbootsplanned.
+
+
+- **0126 waiting finalbundle; graphicsenvironment checked read-only.**
+  Freshroot mergedBackBoard graphicsenv onlyCA_FORCE_TIMER=1; noTU_/MESA_/M2V_
+  debugoverride present. Log research/metal2-install-0126/graphics-env.log saved.
+  Finalbundle40128850465 stillbuilding; prepared separatefinal rangedfetch
+  cache toavoid reusing preliminaryartifactchunks. 7.3GBhostfree. No phonewrite.
+
+
+- **Final0126 bundleCI40128850465 on3e219db; kernel/image unchanged.**
+  Frontend optionalwait now requires SWEET_CPU_PRESENT_WAIT=1; noenvoptin will
+  beinstalled. Originalasynccommitretainedbydefault. InitialCI40127901139 build
+  is archived userspace/out-0126-preliminary (notinstalled). Itsverifiedlocal
+  guest/overlay/payload archived as preliminary in research/metal2-install-0126.
+  Createdfreshlocaloverlay fromsamefreshunmountedphonebase; cachedblocks still
+  validbecauseNOphonewrites/boots sinceOrangeFox. No delta staged/applied yet.
+  Finalprepare/verify scripts reference40128850465; useexisting0126image/kernel.
+
+
+- **0126 final frontend adjustment after recovered timing evidence.**
+  Do NOT install initialbundleCI40127901139: frontend0002 forcedwait insidecommit
+  is unnecessary for observed893/893 caller scheduledwaits and could change
+  callerlock/callback ordering. Set optionalguard OFF bydefault; explicit
+  SWEET_CPU_PRESENT_WAIT=1 opts in, noenvchangeplanned. Kernel fence/cache gate
+  remains enabled in verified0126 image and waits actualGPUcompletion. Initial
+  localguest71825 verified/unmounted but NOphonewrites occurred. Rebuildbundle,
+  fresh localoverlay from sameunmountedphonebase before staging finaldelta;
+  initialimage bytes/kernelneednotchange (bundleCI metadata will beupdated).
+
+
+- **0126 packaged/verified; local replacement guest71825 running.**
+  Image shim/out/shim-boot-0126-metal2-presentation.img17412096bytes SHA256
+  5b3ec7eb7b36691c9f4ae4150e71a30e83b331da9f1b2b2afe66665c0c9c5736.
+  Unpack confirms shim/DTB/firmwareADT/payload/cmdline; sweetpresentwait1/build126.
+  Bundlegh download and independent ZIP-digest/CRC download match everyfile;
+  allfiles/ABI/frontendpatches match report. FrontendSHA751dc87b9fdb3f929d4e407ab1f4ad6b494c786cd7b7fd447a09e143d5313903,
+  TurnipSHA42498b88bc666f26b981b31aa064acdb0baaa6c502ef116d05c3803e77970570.
+  Local payload15files38921382bytes, includesfreshlogmarkers/installrecord,
+  keepsshadercache. Guest requires oldbundlehashes beforecopy and newafter,
+  HFSchecks before/after/cleanunmount. PhoneOrangeFox; no126writesyet.
+
+
+- **0126 kernel/library CI bothSUCCESS on exacte92bce0.**
+  Kernel40127896529, bundle40127901139. Kernel17395128bytes SHA256
+  9aad4df66dcd3e15abc7dc7312f4bf3bc2ef5f73fb2373e9d83380ca32d2cffe,
+  rangedZIPmemberCRC and publishedSHA checked; markers ownedrows/presentgate/
+  acquire-refusal present. Bundleartifact12542461bytes stilldownloading (gh9718
+  and independent ranged15159, separatedirs). Fresh126guest oldbundlehashesOK;
+  preparedreplacementguest requires oldhashes before writes, retainsm2vcache.
+  No phonewrites/newboot yet; phoneOrangeFox. Package research/gpu/package-0126.py
+  will add sweetpresentwait=1 and sweetbuild126, sameverifiedshim/DTB/firmwareADT.
+
+
+- **0125 full Metal telemetry recovered via fresh126 guest.**
+  Extraction guest37065 cleanly unmounted/poweredoff after41s; old installed
+  bundle hashes allOK. Files research/metal2-install-0126/share/boot-0125-telemetry:
+  mtl2.log183KiB, pipelines.log370KiB. SmallHFSparser hit overflowextents;
+  guest handles them. Lastsummary893commits/0failed/893completed,140pipelines,
+  meancommit-to-complete78263us max397ms,893scheduledwaits,9completedwaits.
+  Thus CA ALREADY waits scheduled in this capture; frontend0002 is defensive
+  ordering, not proof of a missing caller wait. GPU-to-CPU kernel gate stillnew.
+  Texture refusalcount0 despite explicitlayoutwarnings: runtime can shadowcopy
+  incompatiblelayouts; alignment aims toavoidcopies and isnot proof those
+  warnings causedmissingpixels. 20.47GBusersurfacecache maintenance total1.98s,
+  pipeline creation20.16s including firstuse. Neither metric isdisplayFPS.
+  LastphoneOrangeFox; fresh126overlay includesonly localHFScheckchanges and
+  extraction; no phonewrite. Mustkeepphoneuserdataunmounted untilpreflight.
+
+
+- **0126 CI dispatched on e92bce0148f2745c33c23ab2bcf3c9f52a974626.**
+  Kernel40127896529 (run_tests=false, keep_going=false) and Metal2 40127901139
+  running. Superseded Metal2 40127402906 cancellation requested; it lacks0002.
+  User returnedFASTBOOT; verifiedOrangeFox temporaryboot accepted (send4.036s,
+  boot0.130s), ADBrecovery sweetin nowconfirmed, userdataunmounted/correctsize.
+  Persistent GPUring saved logs/gpu-0125-metal2-cache-fixed-recovery.txt,
+  571125bytes, flush90. Fresh126 NBD server76102 root socket
+  /tmp/sweet-metal20126-root.sock; catalog/log extraction31696 inprogress.
+  Original125 snapshot isstale;126 cache starts empty. No126phonewrites yet.
+
+
+- **0126 prepared: synchronize CPU presentation with real GPU work.**
+  User describes0125 defects as missing regions/trails/cutoffs. Existing display
+  path memcpy reads IOSurfaces without a GPU fence/cache acquire; frontendcommit
+  returns before asynchronous runtime submission. New kernel0125 patch exports
+  a release/acquire-published backend gate: sweetpresentwait=1 + sweetmtl=2 waits
+  real CP fences and holds submission/VM gate across physical cache acquire and
+  source copy. Faults retain previous frame; no fabricated completion. Matching
+  frontend0002 waitsUntilScheduled after successfulBackBoardcommit (notcomplete,
+  runtime deadlock refusal retained; SWEET_CPU_PRESENT_WAIT=0 opts out). Both
+  frontend patches and kernel patch apply to pinned/current sources. This may
+  increase waiting; correctness/performance need device evidence. Prior Metal2
+  CI40127402906 lacks frontend0002; dispatch replacement and matchingkernel.
+  No new phone write/boot. Last device iOS; ADB/fastboot absent, FASTBOOT request
+  pending for recovery telemetry/freshroot. No tests added/run.
+
+
+- **0125 after cache repair creates real Metal device; visual defects remain.**
+  logs/live-0125-metal2-cache-fixed.txt: BackBoard276 creates TurnipAdreno618 in
+  2095ms; Turnip image0x10cd28000 loaded, ABI compositor opens/queries succeed,
+  method5 submissions and real fence retirements result0 (sampled through1440).
+  User: similar speed, significant missing regions/trails/cutoffs. No captured
+  BackBoard crash in first533665bytes. There are280 MTLFunction validation
+  warnings and196 explicit-layout refusals in that prefix; not full GPU success.
+  Prepared kernel0124-sweet-metal-owned-surface-rows.patch from donor0159:
+  Metal2-only64byte owned single-plane rows (128 for8B texels), guarded by
+  sweetsurfalign; preserves caller IOSurfaceAddress and plane layouts/bounds.
+  Prepared userspace/metal2/patches/0001-sweet-function-protocol.patch adopting
+  real NBFunction objects into MTLFunction; build records local frontend patches.
+  Both patches apply to pinned/current sources; no tests added/run.
+  Framebuffer currently CPU-copies swaps without explicit GPU-completion gate:
+  investigating presentation ownership as another possible cause of trails.
+  User asked to returnFASTBOOT for telemetry pull/fresh next-stage snapshot.
+  Same-GPU donor branch now4c67bd5911703550f45c838fd9de6c10f04ee79b (fetched only,
+  pinned build stillf09fdb58). Delta adds optional drawlog/dead-draw culling, off
+  by default, no new kernel/Turnip patches; not blindly replacing our pin.
+
+
+
+- **0125 shader-cache directory repair installed; same kernel rebooted.**
+  Fresh read confirmed absent cache under root-owned0755 /private/var/local.
+  Local guest56727 completed HFS checks before/after, full bundle SHA checks
+  before/after, clean unmount. Read-only edited catalog verifies parent0:0/0755,
+  backboardd501:501/0700. Delta8 chunks589824bytes (576KiB) saved with all originals
+  in research/metal2-cache-repair-0125; apply preflight freshly matched every
+  before chunk, wrote only this delta, readback verified every after chunk.
+  Host installation-manifest.json and delta.json record installed-readback-verified.
+  No bundle/kernel code replacement; same verified0125 image SHA6f8dbe8f... .
+  ADB rebootbootloader, fastboot product sweetin, temporary boot accepted
+  send0.517s/boot0.130s. logs/live-0125-metal2-cache-fixed.txt receiver59530,
+  duration600s, started before reboot. Metal initialization and rendering result
+  pending. Existing cache snapshots are now stale after this iOS boot.
+
+
+
+- **0125 cache repair: OrangeFox booted, fresh root inspected, overlay guest running.**
+  User reports0125 home screen/similar performance and returned toFASTBOOT.
+  Temporary recovery/recovery.img SHA4efe9045... boot accepted send3.893s/
+  boot0.130s. ADB recovery product sweetin; userdata unmounted114970046464bytes.
+  Fresh research/metal2-cache-repair-0125 snapshot confirms /private/var/local
+  root0:0/0755 and BOTH m2v-cache/backboardd directories absent. Persistent
+  mtl2.log5420bytes confirms same ShaderCachePermissionDenied beforeTurnip load.
+  One-time wallpaper marker remains attempting; helper log sees LScollections1/
+  legacy1 but EXquery0 and refusesautomaticretry. Do not reset it blindly.
+  Local qcow2 overlay created; guest56727 performing HFS checks then cache
+  provisioning and full installed-bundle hash checks. No repair phone writes yet.
+  Read-only root NBD76861 socket /tmp/sweet-metal2-cache125-root.sock; cache is
+  fresh for this OrangeFox interval, must not reuse after iOS writes again.
+
+
+
+- **0125 reaches BackBoard Metal initialization; shader-cache permissions block it.**
+  Live logs/live-0125-metal2-discovery.txt confirms sweetbuild125, Metal service
+  publication, and exactly the expected BackBoard restart. BackBoard274 enters
+  SweetMetal2, but native_bridge_metal_open refuses in30ms: ShaderCache path
+  /var/local/m2v-cache/backboardd PermissionDenied(os error13). Turnip image base
+  remains0: failure occurs before Vulkan load/GPU submissions. This is a new
+  concrete filesystem prerequisite; not successful Metal UI yet.
+  Asked user to open OrangeFox for recovery access (physical step, no new approval
+  needed under standing boot/install authorization). No ADB yet; phone last iOS.
+  Prepared fresh research/metal2-cache-repair-0125 (empty cache, new NBD sockets
+  /tmp/sweet-metal2-cache125-{root,edited}.sock; scripts/guest not run yet).
+  New tools/prepare-sweet-metal2-cache.sh provisions root-owned0755 parent and
+  mobile501:5010700 BackBoard cache, refuses symlinks/wrong iOSbuild/hostroot.
+  Guest will hash-check the entire unchanged bundle before/after; inspect fresh
+  directory metadata first, then local overlay/fsck/read-only owner verification,
+  delta/preflight/apply/readback. Reboot same verified0125 image afterwards.
+  No cache-repair phone write yet. Receiver44182 still captures for600seconds.
+
+
+
+- **0125 verified and temporarily booted; Metal startup trace pending.**
+  Kernel CI40125083266 source9a6399559a41 succeeded; CRC and published kernel
+  SHA9176e88e2be978603e2f278133f5dafe6f045a4158e6b880ab1388508a69b048 match.
+  Image shim/out/shim-boot-0125-metal2-discovery.img17412096bytes SHA256
+  6f8dbe8fdfb7fccfa099ecba7850e078b8174800d893d1d18c1880703589811f.
+  package-0125.py verifies unpacked shim/DTB/payload/ADT/cmdline and bundle hashes;
+  manifest research/gpu/0125-boot-manifest.json. Same root installed0124 bundle.
+  No new userdata write; temporary fastboot boot accepted send0.519s/boot0.130s,
+  product sweetin confirmed. Capture started preboot for600s:
+  logs/live-0125-metal2-discovery.txt, receiver session44182. Expected single
+  BackBoard restart after Metal service publishes; check MTL2 device creation
+  and actual NativeAdreno submits before claiming UI acceleration/performance.
+
+
+
+- **0125 corrected build succeeded; artifact download in progress.**
+  CI40125083266 SUCCESS on9a6399559a41cf479b8372b9e6c78255a0bc84dd;
+  tests disabled. This confirms the proc_signal/proc_best_name replacement
+  compiles and links. Kernel artifact12572601846,60650252bytes, zip digest
+  65ad643ab5854077f5cbb6cd8e27ccdfa4237744a36c896b7cd638d6e88659ff.
+  Ranged download research/gpu/fetch-kernel-0125.py session22607, output
+  xnu/out-0125-range. Must verify CRC/published SHA, run package-0125.py,
+  then start live receiver and fastboot boot verified image. Phone FASTBOOT.
+  Same installed0124 bundle; no new userdata delta. Actual Metal initialization
+  and UI GPU work remain unverified; 0124 had neither in the captured trace.
+
+
+
+- **Corrected 0125 CI40125083266 running on9a6399559a41.**
+  Uses IOKit-visible process KPIs for restart; run_tests=false, keep_going=false.
+  Phone in FASTBOOT; no image from failed203d781 build was packaged or booted.
+  research/gpu/{fetch-kernel-0125,package-0125}.py prepared, updated to this run.
+  Uses same installed0124 bundle and verified0123 firmware-bearing ADT/shim/DTB;
+  no new userdata delta planned. Pending compile/download/package/temporaryboot.
+
+
+
+- **Restart kernel failed; remove BSD-private signal dependency before rebuilding.**
+  CI40123710586 on203d781 failed during Build; no new boot image was used.
+  GitHub downloads repeatedly disconnected, but the first3.9MiB of the compressed
+  run log yielded a partial build log with the exact compiler errors:
+  SweetNativeAdrenoClient.cpp:281 psignal undeclared, plus invalid proc*→int
+  from compiler suggesting signal(). Diagnostic excerpt saved locally at
+  research/gpu/0125-restart-compile-errors.txt. This confirms the source audit:
+  signalvar.h hides psignal behind BSD_KERNEL_PRIVATE;
+  IOKit should use sys/proc.h process KPIs. Revised patch0123 now includes
+  sys/proc.h + sys/signal.h and uses proc_best_name/proc_signal while holding
+  proc_find reference; avoids direct p_comm layout and private psignal.
+  Both plugin selection and revised restart patches apply to current source
+  in order. This is not a successful compilation or hardware result yet.
+  Phone remains FASTBOOT; current installed Metal2 bundle unchanged.
+
+
+
+- **Continuation after DeepSeek: 0124 is CPU UI; discovery follow-up pending.**
+  User reports currently iOS, unchanged performance; subsequently moved to
+  FASTBOOT as requested, product sweetin verified. New commits a9a2c8a through
+  203d781 reviewed. Actual recovery delta research/metal2-install-0124/delta.json
+  is installed-readback-verified (40108032 bytes), although the older installation
+  manifest/NOTES were not updated. Bundle CI40121858239 built e2ca25c successfully.
+  Live logs/live-0124-metal2.txt has sweetgles=0 sweetmtl=2 sweetbuild=124;
+  SweetMetal2 discovery is published, Safari/WebKit load the bundle but are
+  intentionally denied by its client policy. No BackBoard MTL2 initialization,
+  no scoped submits and no legacy method5 submits in this capture. The unchanged
+  performance is therefore not a successful Metal UI measurement.
+  Kernel CI40123710586 on203d781 is still building. Its patch0123 restarts
+  BackBoard once after service publication (unless sweetm2restart=0 or GLES1),
+  allowing a fresh Metal-framework discovery after asynchronous GPU bring-up.
+  Next: verify/download/package as0125, temporarily boot with installed0124
+  bundle and live logs, inspect initialization/real work before another root edit.
+  Turnip source audit: donor backend still submits legacy method5 and does not
+  use sweet method17/resource capability despite compiling against its header.
+  Legacy kernel path remains supported but maintains all mapped BOs; full scoped
+  integration remains work. Do not claim ABI-header parity alone solves this.
+
+
+
+- **Metal2 bundle built; kernel and temporary boot image ready; install pipeline
+  mock-tested.** metal2 CI 40119323375 failed only in the license-copy step
+  (`Path + str` TypeError, Turnip and the Rust bridge had already built); fixed
+  in edd176c and CI 40120074218 succeeded (artifact 100 MB with dSYM). Kernel
+  CI 40118808385 (head a9a2c8a, patches 0123 + 0122 only) succeeded; artifact
+  SHA256 matches the published 5b55f39444838ccbb86199acfdada2992470f5018a9091f04966a4d9d78aae3f,
+  strings contain `SWEET RENDER: Metal plugin %s selected (%s)`,
+  `SweetMetal2`, `SweetMTL2Device`, `MetalPluginClassName`. Payload and boot
+  image built from the same ADT/DTB/shim as 0123:
+  shim/out/payload-0124-metal2-sweet.bin and
+  shim/out/shim-boot-0124-metal2.img, 17412096 bytes SHA256
+  519b45aef67329d9582ab22bfd4f3618d4a977b8ca729ced218c85c426c303b0;
+  unpacked ramdisk==payload, dtb and shim byte-identical to 0123; cmdline is
+  0123's with `sweetgles=0 sweetmtl=2 sweetbuild=124`. New install pipeline
+  research/metal2-install-0124 (prepare-guest.py + init-template + the 0123
+  inspect/stage/preflight/apply/restore scripts, sockets sweet-metal20124-*,
+  RUNBOOK.md). A full mock run (synthetic 16 GiB HFS+ base + NBD root,
+  qcow2 overlay, QEMU guest install, edited NBD, stage-delta) passed:
+  guest VERIFIED_UNMOUNTED and 4 chunks/1703936 bytes staged. The guest init
+  no longer uses grep (absent from the initrd); it reads SystemVersion.plist
+  with cat/case. Pending: download artifact, prepare the real payload, reboot
+  the phone to OrangeFox (user action), inspect, overlay, guest, stage,
+  preflight, apply, then `fastboot boot` this image. Not yet observed: any
+  device-side Metal behavior, AMFI accepting the ad-hoc bundle, wallpaper.
+
+- **0123 observed; Sunfish metal2 userland port started.** User feedback on
+  0123: reaches home, wallpaper still absent; performance "kinda better" but
+  not significant, blurs present, app-open animation improved, recents
+  similar, notification pull-down "very very sluggish". 0123 booted the 0120
+  GLES library (`sweetgles=1`; boot-args line361 of the first capture).
+  Idle600s capture logs/live-0123-sunfish-prereqs-usb.txt337443bytes,
+  session84259, started pre-reboot: sweetbuild=123, sweetamfi=1, ABI/Metal
+  publication about60s, "SWEET ADRENO: HFI active OPP configured=267000 kHz"
+  at existing raw_corner64, only19 scoped submits while idle. CRASH lsd[98]
+  sig9 at line4408, 135 lines after exec sweet-wallpaper-register line4273:
+  "Too many corpses being created." AegirPoster(283/286/311),
+  GradientPosterEx267 and EmojiPoster abort sig6 with identical
+  pc0x1d766f198; backboardd56 SIGSEGV at3451 and backboardd restarts as289.
+  Observed, not proven: these are extension-host/poster failures, separate
+  from the missing Metal device. Second300s capture
+  logs/live-0123-after-boot-usb.txt64328bytes during user interaction: scoped
+  submits16920..22560, sweetgl0.4..9.3 flushes/s, finish avg75..171ms
+  (max929ms), present_calls0..86 per10s, one window missed_deadlines293, map
+  table up to1341/4128 objects and30356/65536 spans. The 180s rebuild job
+  execs twice without another lsd crash; the one-time marker refuses mutation.
+  Port started from Sunfish phone/metal2 + phone/turnip: our ABI1 adds
+  method17/4096 but is otherwise identical, and Turnip's darwin backend needs
+  only methods1..16 (Submit/BoImport/...); the kernel already matches
+  IOAcceleratorES and open type0x4147 for backboardd. Plan: plugin-name patch
+  (SweetMetal2 by default, sweetmtl=1 keeps old NativeAdrenoMetal), macOS CI
+  bundle build, userdata stage and temporary boot. Keep the old untested 0110
+  NativeAdrenoMetal.bundle; install SweetMetal2 alongside it.
+
+
+- **0123 installed and temporarily booted; observation is in the entry above.**
+  Standing user authorization covers these boot/install updates, so no further
+  per-update permission prompt was issued. Source 30bad3279c06; kernel CI
+  40111479897 and helper CI 40111462084 both succeeded. Ranged ZIP member CRC
+  and published kernel SHA match: d43605b4e0b8738a90aae5539b016482c200f94ebab51cf31f7caf08b55de15f.
+  Boot image shim/out/shim-boot-0123-cache-prereqs-gles-120hz.img, 17412096 bytes,
+  SHA 0654555a61306452478c807ac77c6ca7fbef22d88848ceae02b402c6d750e577.
+  Unpacked shim/DTB match known-working base, payload/ADT/cmdline match inputs.
+  Fresh all-before-block check passed immediately before install; all 12 chunks
+  (1769472 bytes) written/readback verified, header last. Originals and restore
+  script retained in research/wallpaper-install-0123. Only userdata delta written;
+  no boot/recovery/GPT/modem/persist flashing. Old per-plugin job stays disabled.
+  ADB rebooted OrangeFox to fastboot; product sweetin verified; fastboot boot
+  accepted send0.497s/boot0.130s. Logs in same directory/fastboot-boot.log.
+  Live receiver logs/live-0123-sunfish-prereqs-usb.txt, session84259, duration600s,
+  started before reboot. Boot acceptance is not UI/wallpaper success.
+  New root BackBoard CA_FORCE_TIMER=1 and delayed one-time LS rebuild (180s)
+  pair with sweetamfi=1 and chosen MAC identity placeholders. Current GLES is
+  unchanged 0120; full Metal frontend/Turnip port remains unfinished.
+
+
+
+- **0123 builds passed; fresh OrangeFox stage verified, installation authorized.**
+  User now explicitly says no need to ask permission to boot/install; proceed
+  with these prepared updates under that standing authorization. This supersedes
+  per-update approval prompts for this work; preserve backups and temporary boots.
+  Kernel CI40111479897 SUCCESS, helper CI40111462084 SUCCESS, source30bad3279c06.
+  Helper SHA230d394747fe802125a48d8a561a56750318354e68f2b993ca2667a9663fa491.
+  Phone in OrangeFox, sweetin, userdata unmounted,114970046464bytes. Fresh snapshot
+  research/wallpaper-install-0123; local overlay HFS checks OK before/after, all
+  installed payload hashes match read-only remount, VERIFIED_UNMOUNTED.
+  Four files887429bytes: updated helper, distinct delayed one-time rebuild job,
+  merged BackBoard CA_FORCE_TIMER=1 config, installation record. Old per-plugin
+  registrar remains disabled; GLES0120 and wallpaper PNG/CAML retained.
+  Delta12chunks1769472bytes (1.6875MiB), originals saved; fresh preflight matched
+  all12 before chunks. No0123 phone writes yet. Kernel artifact12566654090
+  downloading via ZIP ranges; must verify published SHA/package/unpack before
+  applying and temporarily booting. New Metal userland is still NOT ported.
+
+
+- **New user references: A618 sunfish + updated Chlorophyll; prerequisites prepared.**
+  User supplied Yofuness/ios-flame sunfish, closest sameA618/iOS16 donor. Pinned
+  f09fdb58a2c074d131072947b247240532b7d97d under research/ios-sunfish-reference.
+  docs/sunfish reports Metal→m2v→Turnip at565MHz/~21 panel updates/s; pacing,
+  aliases and leaks remain work. Inherited README is A640, use branch docs.
+  Detailed findings docs/SUNFISH-A618-PORT.md, source hashes sunfish-adreno618-reference.json.
+  HANDOFF documents exact PosterBoard assertion fixed via chosenMACs + AMFI
+  trust-cache query IOService + one-time LS rebuild. Current root lacks first2.
+  Prepared mkadt chosenMACs and tools/sweet-mg-adt.py preserving existingfirmware
+  ADT/identities. shim/out/sweet-0123-mg-gles-srgb.adt SHA88aa6092... preserves
+  firmware; sourceSHA331ce035... sidecar research/gpu/0123-adt-manifest.json.
+  Patch0121-sweet-extension-cache-trust-service adds opt-in sweetamfi=1 service;
+  validates selector6 hash20/32 + optionalscalar1; other selectors unsupported.
+  MIT attribution included. Patch applicability passes; full local compile
+  unavailable (/home/dan/swift clang absent), need realCI compile.
+  Prepared tools/prepare-backboard-vsync.py: BackBoard CA_FORCE_TIMER=1 in a NEW
+  merged plist. Current phone lacks this; donor fixes syntheticA11 VBL gate.
+  Local prepared research/gpu/0123-backboard-vsync-launchd.plist only, not staged
+  against fresh phone blocks and NOT installed. Wallpaper job stays disabled.
+  Chlorophyll updated2a463aed (3 commits newer): system bundle,targetDeviceInfo,
+  empty colour-slot clears/CoreImage graph workaround; still iOS18/arm64e build.
+  NativeMetal userland port is NOT yet done: donor ABI1 lacks ourmethod17/scoped
+  residency and4096 budget; preserve16KiB hostpages/cache/fences when adapting.
+
+  Kernel0122 CI40109685834 SUCCESS on781b4ed, tests disabled; ranged ZIPmemberCRC
+  and publishedSHA verified xnu/out-0122-range/kernel SHA256
+  8b2fbbe87f90d75e59d7e9e51b4385c769f83d2f0a67eb4c545adcc994a048f7.
+  Packaged shim/out/shim-boot-0122-low-svs-gles-120hz.img17403904bytes SHA256
+  159d54217d091ea59c3b2e308c0f47b1abd8e6db6875e8f4f7f450098967860f.
+  Unpacked shim/DTB/payload verified, tag122; current0120GLES compatible.
+  Clock267 at already-present raw64 per pinnedPMOS table, newfence/cache timings.
+  NOT booted. It does not include newerMAC/AMFI/VBL prerequisites or Metal port.
+  Sunfish uses more conservative voltage-to-frequency pairs; preserve sweet's
+  pinned board OPP source rather than copying its rawlevel assumptions.
+  New helper --rebuild-once source requires root, AMFI service and chosenMACs.
+  Uses documented one-time LS rebuild, records attempt before mutation, refuses
+  automatic retry after incomplete attempt, verifies providers before success.
+  Intended distinct delayed job StartInterval180; old registration job stays
+  disabled. Source/build only, NOT installed/hardware-verified; no root stageyet.
+  No new phone writes after approved startup correction; current0121 reaches
+  home, sluggish userfeedback/blur good/no wallpaper. FollowupUSB180s capture
+  logs/live-0121-after-home-usb.txt session81516, status file has completion count.
+
+
+- **0121 isolated boot reaches home; wallpaper unresolved; next clock audit build.**
+  User confirms same overall slowness: recents scrolling relatively smooth,
+  app open/close and notification shade very sluggish, blur good, no wallpaper.
+  Disabling only automatic registration restored progress to home with same0121
+  kernel, strongly implicating the early LaunchServices registration job.
+  Completed300s live-0121-no-registrar-usb.txt270619bytes: >6000 scoped submits,
+  read-only normalization handle2090 exercised8 times, no observed BackBoard
+  crash or renderer-submit rejection. PosterBoard still SIGTRAP during initial
+  configuration. Thus provider registration/wallpaper repair remains incomplete.
+  GLfinish windows ~50..140ms averages, maxima >1second; those are not FPS.
+  Kernel submit calls often~2..5ms, but exclude userspace's previous-fence wait.
+  Source audit: HFI table and CP DCVS configure a single180MHz active level.
+  Pinned PMOS DT fd78d179 GPU267MHz requires rawLOW_SVS64, all bins0x1f;
+  live existing vote0x400202 already uses raw64 (MIN48 rounded up). New patch
+  0120-sweet-low-svs-clock-profile chooses267MHz only if existing raw vote>=64,
+  otherwise180; no additional voltage vote, no higher corners. Logs configured
+  frequency, explicitly not a measured clock. Adds real fence-wait vs cache-retire
+  timing, without dropping waits or cache maintenance. Source references remain
+  docs/adreno-port-sources.json and research/gpu/pmos-pinned/manifest.json.
+  HFI C compilation passed -Wall/-Wextra/-Werror; no tests added/run.
+  Kernel0122 CI40109685834 queued on781b4ed13ab81f1215df8ddf8a9987cee31aa35e,
+  run_tests=false. Package helper research/gpu/package-0122.py prepared.
+  No further device write/reboot after approved
+  startup correction. Wallpaper job remains disabled; do not auto-enable it.
+
+
+- **0121 startup correction approved/applied; isolated boot in progress.**
+  User explicitly approved "Apply startup correction and boot0121". Fresh apply
+  matched all5 original chunks before writing1179648bytes, readback-verified all5.
+  research/wallpaper-recover-0121/{delta,plan}.json installed-readback-verified;
+  original bytes retained. Only merged/standalone wallpaper job configuration
+  changed (Disabled=true,RunAtLoad=false); PNG/CAML/ExtensionKit/GLES retained.
+  Product sweetin verified. Temporary same0121 image accepted; exact fastboot
+  timing in research/wallpaper-recover-0121/fastboot-boot.log. No partition flashing.
+  Live receiver started before reboot: logs/live-0121-no-registrar-usb.txt,
+  capture session77516 for300seconds. UI startup/causal confirmation pending.
+  Guarded query-only helper source c32d26e CI40108106711 SUCCESS is NOT deployed;
+  old helper binary retained but disabled. Do not auto-register plugins at boot.
+  Do not reuse preboot userdata caches if more recovery inspection is needed.
+
+
+- **0121 regressed startup: user reports stuck Apple logo (2026-10-24).**
+  User moved to fastboot; product sweetin verified. Temporary OrangeFox image
+  recovery/recovery.img hash4efe9045... accepted send3.827s/boot0.130s; recovery
+  ADB ready, userdata unmounted/114970046464bytes. Fresh read-only snapshot
+  research/wallpaper-debug-0121 (no old caches reused). Saved persistent log
+  logs/boot-0121-wallpaper-recovery.txt215241bytes, ring flush68.
+  Helper /private/var/mobile/Library/Logs/sweet-wallpaper.log122bytes:
+  start uid501; query0 collections0 legacy0; PaperBoard registration1; stops
+  before first registerPlugin returns (sorted first target LegacyPoster).
+  This is a new suspect, not yet proof of the UI wait cause. No new current-boot
+  helper/PosterBoard crash in logs; saved historical crash files also extracted.
+  Symbolication against matching original cache maps SpringBoard t0/t3 to
+  CoreServices lock waits, t1 to synchronous XPC through Foundation/CoreServices.
+  BackBoard t0 is in CoreFoundation run loop; no captured GPU error. Local
+  symbols are redacted, so exact private methods not identified. Registration
+  implicated, causal confirmation still requires isolated boot.
+  Staged local correction in research/wallpaper-recover-0121: only disable
+  automatic wallpaper job in merged/standalone plists, retain PNG/CAML/flags/GLES.
+  Both fsck passes OK, read-only-remount hashes match, VERIFIED_UNMOUNTED.
+  Delta saved5 chunks1179648bytes=1.125MiB, all original/edited bytes retained.
+  Fresh preflight matched all5 phone chunks; no writes. New approval required
+  to apply startup correction and temporarily boot same0121 for isolation.
+  plan.json/delta.json staged-not-written; /tmp/sweet-wallpaper121-debug.sock
+  and /tmp/sweet-wallpaper121-recover-edited.sock read-only backing exports.
+  Source helper now defaults query-only, explicit --register needed for mutation;
+  guarded helper source c32d26e CI40108106711 SUCCESS; not deployed.
+  Original binary remains on phone, so
+  disabling the job is necessary. Alarm cannot cancel server-side SPI work.
+  No new phone writes after approved0121 update; remains in OrangeFox.
+
+
+- **0121 wallpaper installation approved and verified (2026-10-24).**
+  User explicitly approved "Apply wallpaper repair and temporarily boot0121".
+  Fresh apply preflight matched all88 original chunks before writing any bytes;
+  wrote50855936bytes/48.5MiB, readback-verified all88 including volume headers last.
+  delta.json installed-readback-verified; originals retained. Device sweetin in
+  OrangeFox, userdata unmounted. No boot/recovery/GPT/modem/persist flashing.
+  logs/live-0121-wallpaper-usb.txt receiver started before reboot (300seconds).
+  Boot/artifact hashes reverified against0121 manifest. Temporary0121 boot accepted: send16996KB OKAY0.500s, BootingOKAY0.130s.
+  Live USB confirms sweetbuild=121, exec sweet-wallpaper-register, A618 Mesa
+  startup and first8 real scoped submissions result0 (~1.9..2.6ms kernelcall).
+  Kernel quiesce10..12us excludes userspace waiting. Helper registration result,
+  wallpaper visibility and long-run stability unverified. Asked user to compare.
+  Capture logs/live-0121-wallpaper-usb.txt finished300seconds, 192430bytes.
+  Only8 initial submit log lines and4 framebuffer swap log lines observed, then
+  no sustained UI activity (timer/USB/other daemon messages continue). No captured
+  BackBoard/PosterBoard/helper crash or scoped-submit error/readonly normalization.
+  These startup commands do not establish home-screen rendering or stability.
+  User screen/wallpaper reply pending; helper diagnostic remains on-device.
+  If UI stuck/missing wallpaper, obtain recovery and a FRESH block snapshot to
+  inspect /private/var/mobile/Library/Logs/sweet-wallpaper.log and updated LS state.
+  Do not reuse any preboot cached userdata blocks after this boot.
+
+
+- **Wallpaper staging history (approved install/boot results above).**
+  OrangeFox confirmed sweetin, userdata unmounted, partition114970046464bytes.
+  Fresh research/wallpaper-install-0121 cache/NBD: all66 wallpaper source hashes
+  match prepared PNG/CAML bundle. Current installedGLES is0120 SHA72375e...
+  ExtensionKit flag and migration sentinel absent. Nine PosterBoard reports
+  SIGTRAP _stateLock_setupSwitcherConfigurationForFirstTime+2040; both LS csstores
+  lack CollectionsPoster/LegacyPoster strings (supporting evidence only, not a
+  runtime registration query). Targeted provider repair replaces full migration.
+  Added userspace/wallpaper/register.m, entitlements and wallpaper CI. Uses
+  runtime-checked LS registerApplication/registerPlugin selectors, enumerates LS
+  extension records and checks ExtensionFoundation provider query; no hardcoded
+  IMP offsets, no whole database rebuild, no KeepAlive. Alarm90s bounds job;
+  retries8 times. Mobile-context diagnostics Library/Logs/sweet-wallpaper.log.
+  Registers10 active PosterKit providers; reports success only on both required
+  LS records plus nonempty ExtensionFoundation query. On-device success unverified.
+  Source ba14dd89ea9f40e6cd76e2fb0cef15aa3647f6ad; helperCI40101724073 SUCCESS
+  (strict compiler/codesign checks); publishedSHA, arm64/iOS16 platform and embedded
+  signature bounds verified locally. No tests added/run.
+  Local qcow2 guest installed71 files:48PNG+18CAML+helper+provider list+ExtensionKit
+  flag+standalone/merged launch job. Original HEICs and migration-skip preferences
+  retained. Both fsck passes OK; clean unmount/read-only remount matched71 hashes;
+  share/guest-success VERIFIED_UNMOUNTED. Payload47870099bytes.
+  Saved88 changed original/edited chunks totaling50855936bytes=48.5MiB in
+  research/wallpaper-install-0121/delta; delta.json staged-not-written.
+  Fresh phone preflight matched all88 original chunks; no writes/reboot. New raw-write approval
+  needed before applying this wallpaper delta and temporary0121 boot.
+  Read-only sockets /tmp/sweet-wallpaper121-{root,edited}.sock.
+  New GPU kernel0121 CI40064123544 SUCCESS oncd67bc40835d67cbfd36604193b997fbba912ac3.
+  xnu/out-0121-range/kernel.development.sweet SHA256
+  f74cf8c0660d7e7d70734e968a3b2ae20b28f1e61dcbeaad52af6326efc5bbbd.
+  shim/out/shim-boot-0121-immutable-gles-120hz.img17403904bytes SHA256
+  e38f7c84e944f68d8c665a63c38169afac09fea0e74908270cd854107ffbb7f1.
+  Compatible with installed0120 GLES; no new library delta needed. Corrects likely
+  immutable IOSurface conservative READ|WRITE residency rejection while retaining
+  SMMU read-only protection. Actual0120 faulted BO not logged: root-cause hypothesis
+  still needs0121 hardware confirmation. Not booted. Manifest research/gpu/0121-boot-manifest.json.
+  Research complete docs/ADRENO6XX-PORT-COMPARISON.md. Best donor ios-flame/Pixel4
+  A640 iOS16 actual Metal2→metal2vulkan→Turnip and WCN3990 wland; pinned745c4341.
+  HackiOS currentREADME workingGLES/appMetalpartial,WCN6750WiFi,BTunfinished.
+  Topaz publishedCPU/noGPUbranch/WiFi working. Chlorophyll actualAIR→NIR→ir3 for
+  A630/iOS18/arm64e; Bergamota inspectedREADME stillGPU/networkWIP. SameSM7150
+  A71/POCOX3 repos CPU/noGPU. SagitWCN3990BT code explicitly offline/unqualified;
+  vince namedBT patch/hooks remain unlocated. Source report distinguishes code
+  presence from hardware authors' reports and independent qualification.
+
+- **ACTIVE: 0120 blur improves; UI still slow, wallpaper always absent; later crashes captured.**
+  User says initially "Kinda better...blur...much better", then clarifies only
+  clear improvement is working blur; still slow; wallpaper absent even before0120.
+  Initial240s capture finished210052bytes. Fresh live capture
+  logs/live-0120-interaction.txt(session34788,240s) recovered later interaction:
+  >7080 real scoped submissions, but method17 returns0xe00002c2(BadArgument)
+  twice, each followed by user transport latching lost, BO_NEW NotReady and
+  backboardd SIGSEGV(far0x1c), PIDs56 and326. Process restart recovers GPU client.
+  First failure near map2304 objects1005/4128 spans14631/65536: ample memory
+  metadata capacity; no observed0120 NoResources. Some old allocator pressure
+  is resolved, but not stable. Typical submits~2..3ms; GLfinish observed16..117ms
+  averages, active window maxima405..655ms. No FPS/benchmark claim.
+  Likely rejection cause: Mesa FD_RELOC_FLAGS_INIT=READ|WRITE for every BO,
+  including immutable IOSurface imports that NativeAdreno correctly pins/maps
+  read-only. Submit core currently rejects access3 against SMMU permission1.
+  New patch0119-sweet-immutable-gles-residency narrows these conservative
+  residency flags toREAD for memory.readOnly(), retains the SMMU RO mapping,
+  refuses write-only access, logs normalization and exact core validation failure.
+  Actual GPU stores still fault; no page protection upgrade or fake completion.
+  This mechanism is source-proven; exact rejected BO not in old trace, so
+  hardware root-cause confirmation still required. Same0120 library/ABI works;
+  next kernel0121 need not rewrite userdata for GPU change alone.
+  Wallpaper audit: Sailfish tools/wallpaper-heic2png.sh converts HEIC layers toPNG
+  and rewrites main.caml; README says no HW HEVC decode. Our original local root
+  contains48 HEIC/0 PNG and36 CAML files; many reference HEIC. Also Sailfish
+  root tweaks register extensions via DataMigration/ExtensionKit; our older root
+  tweaks skip migration. Current phone assets/registration not inspected yet.
+  Preparing Linux-compatible conversion locally; no phone write/reboot this turn.
+
+- **0120 installation and initial startup (historical; later failures above).**
+  User explicitly approved "Apply and temporarily boot0120". Revalidated all
+  image/library/manifest hashes and sweetin identity. apply-delta.py freshly
+  matched all35 original phone chunks, wrote19857408bytes, readback verified
+  all35; delta.json installed-readback-verified. Every original byte retained
+  under research/gles-install-0120/delta; apply.log records complete operation.
+  adb reboot bootloader; product sweetin confirmed. fastboot boot
+  shim/out/shim-boot-0120-buffer-gmem-gles-120hz.img accepted:
+  send16996KB OKAY0.519s, BootingOKAY0.130s. No boot/recovery/GPT flashing.
+  Receiver started before reboot, logs/live-0120-usb.txt duration240s;
+  capture session40204. Manifest research/gpu/0120-boot-manifest.json updated.
+  Source3806917, kernel40062657768/GLES40062657825; both SUCCESS.
+  Live USB confirms bootargs sweetbuild=120, ABI1/FD618 EAGL frontend and
+  automatic GMEM/sysmem policy marker. First8 scoped submissions result0,
+  total_us1971,1908,4317,2363,2115,2034,2322,5272; kernel quiesce10..12us.
+  The userspace transport also waits before the kernel call, so those kernel
+  quiesce times do not measure total GPU execution/wait. Main BGRA1125x2436
+  pitch4608 framebuffer swaps observed. Initial GLfinish avg30372us/max82267us
+  in an idle/startup window; not FPS and not a controlled performance comparison.
+  First map: objects4/spans4 (3 shared kernel mappings before the first user BO).
+  Thus the old near1004 failure could be span pressure, not proved object limit;
+  await later0120 map counters. No allocation failure/CRASH observed yet.
+  Asked user to compare page swipes/Control Center with CPU fallback and keep USB
+  connected. Capture still running; no stability/performance qualification.
+
+- **0119 regression and 0120 build/staging history (superseded by current state above).**
+  User says "home screen. Significantly worse." Completed240s live capture
+  logs/live-0119-usb.txt is429837bytes. Replayed startup is the same boot.
+  Scoped method17 submissions complete(result0), normally~2..5ms per call;
+  observed GLfinish windows avg48.7..77.5ms,max375.8ms. These are not FPS.
+  No remaining Mesa layout failure in this capture, but backboardd[56] later
+  SIGSEGVs(far0x1c), immediately after BoMap method3 returns0xe00002be
+  (NoResources), BO_NEW16384 fails, last logged imported BO1004.
+  Shared VM limit1024 includes kernel allocations; client limit1024 likewise.
+  This fits object exhaustion but old log has no count to exclude span pressure.
+  Do not claim the exact exhausted limit is proven. 0119 rendering is a regression.
+  Source f26a9f8; kernel40058371440/GLES40058371530, both23a1fc8 builds succeeded.
+  Installed/readback-verified36chunks/20185088bytes; originals in
+  research/gles-install-0119/delta. Temp image
+  shim/out/shim-boot-0119-scoped-gles-120hz.img SHA256
+  2646376c31502337a2fcac8b659d596d134a6aaae5e9c0b267fbefbdc61d13d5.
+  Kernel xnu/out-0119/kernel.development.sweet SHA256
+  554684a99a1489d8b9cff266a98bdfc670a5afa46ffdcc3a07e072bd84a5d282;
+  library userspace/out/0119-gles-23a1fc8-range/sweetgl.dylib SHA256
+  f21332e828b8da34130d46880c8f5e6d18d2b1d63c184383b74bef98ea0cea28.
+  CPU fallback remains available, same installed library inactive with sweetgles=0:
+  shim/out/shim-boot-0118-cpu-fallback-120hz.img SHA256
+  84c745e436a3095da8eb4821d557c00c4970cac5f7ab1c1433ea1f34a49e9a1f.
+  No phone reboot/write performed after user's regression report.
+  0120 source separates live BO budget4096(+32 shared kernel reserve) from
+  unchanged per-submit1024 residency limit, capability-gated to reject old kernels;
+  logs actual VM objects/spans on pressure. Mesa retries allocation once after
+  releasing unused caches and guards failed heap metadata/backing/maps.
+  Reuses copy-upload texture storage on same-layout seed refresh. Removes
+  inherited A530 forced-sysmem workaround: A6xx fd6_gmem set_blit_scissor rounds
+  height4/width16, owned surfaces have patch0117 backing and imports keep Mesa
+  size/pitch validation. IR3 nofp16 retained. GMEM selection is unqualified.
+  Do not skip glFinish presentation waits: object completion queries currently
+  also block, but their actual call frequency/ownership semantics remain unaudited.
+  Core VM/UserClient/Submit C++ syntax compilation passed with IOKit type shims;
+  frontend generation and all four Mesa patches apply to the pinned sources.
+  Kernel patch applies to the post0119 source. No tests added/run.
+  Pushed source380691712dca8a8c19854164ffffcbd96eb6e8fe; matching CI
+  kernel40062657768 and GLES40062657825 running with run_tests=false.
+  Additional60s live capture saved1061bytes to logs/live-0119-after-regression.txt;
+  USB is alive, framebuffer callbacks continue, no new GPU/present evidence.
+  User asked to open OrangeFox for fresh staging; answer pending.
+  Fresh research/gles-install-0120 scripts/cache/initrd prepared; no old cached
+  blocks, overlay or delta copied. Package helper research/gpu/package-0120.py.
+  User opened OrangeFox; ADB confirms sweetin and unmounted userdata,
+  partition114970046464bytes. GLES40062657825 SUCCESS; downloaded via gh to
+  userspace/out/0120-gles-3806917; all SHA256SUMS entries pass. Actual arm64,
+  iOS16.0 platform and embedded-signature bounds verified (CI codesign strict
+  passed). Dylib18791216bytes SHA256
+  72375ea0bd85df78984c5f40eaf9aacbcee87bf024f9341527afbb00f5349fef.
+  Fresh active-root inspection confirms20H392/cache UUID and0119 install record.
+  Local qcow2 guest verifies actual prior library+record hashes, copies0120,
+  checks permissions, fsck, read-only remount and hash; VERIFIED_UNMOUNTED.
+  Fresh delta35chunks19857408bytes=18.9375MiB; all before/after chunks saved
+  research/gles-install-0120/delta; fresh preflight matches all35 phone chunks.
+  State staged-not-written. Read-only NBD sockets /tmp/sweet-gles120-root.sock
+  and /tmp/sweet-gles120-edited.sock. No phone writes or reboot this turn.
+  Kernel40062657768 SUCCESS on same3806917 source as GLES. Full gh artifact
+  download stalled; kernel member+SHA256SUMS fetched by ZIP ranges to
+  xnu/out-0120-range, CRC and published SHA256 verified. Required scoped-submit
+  and expanded-map-budget strings present. Kernel17369776bytes SHA256
+  dd226ee21e6aa583296a34780620a33dacffdc079e182f8c276388520b2c44a5.
+  Packaged shim/out/shim-boot-0120-buffer-gmem-gles-120hz.img17403904bytes,
+  SHA256a93e7f8264d17dc41828c13936825abdbdba32fc3df65ecba23bcd5f80ab6dd9.
+  Base shim/DTB/sRGB ADT unchanged and checked against0119 manifest. Boot
+  tag sweetbuild=120. Unpacked kernel/DTB/ramdisk match; independent deterministic
+  mkpayload regeneration matches. Manifest research/gpu/0120-boot-manifest.json.
+  Redundant stalled whole-artifact gh downloader stopped after member verification.
+  Both builds passed with run_tests=false; no hardware boot/performance result.
+  Phone remains in OrangeFox. Explicit approval required before writing this
+  35chunk/18.9375MiB userdata delta and temporarily booting matching0120.
+  CPU fallback remains available with sweetgles=0. GMEM rendering is unqualified;
+  successful compilation is not evidence of a lag fix or full acceleration.
+
+
+- **ACTIVE: 0119 kernel and GLES builds succeeded; downloads/staging pending.**
+  User asked to fix the GPU regression and provided BLUETOOTH-SUMMARY.md.
+  Phone stays in the confirmed working CPU fallback; no new device writes.
+  New patch0117-sweet-gles-residency-cache-and-surface-padding adds an optional
+  ABI1 capability/method17 carrying the complete Mesa BO residency/access set.
+  It validates ownership/access and IB membership, pins every listed BO until
+  a real fence, publishes only that set, acquires only GPU-written BOs, and
+  retains resources on uncertain completion. Legacy submit stays supported.
+  Large requests are copied from IOKit's out-of-line descriptor before use.
+  Owned, nonplanar IOSurfaces get backing for A6xx's final4-row block; caller
+  memory is not extended. Userspace preserves READ/WRITE flags (DUMP is only
+  diagnostic) and requires the new capability, so the pair must be installed
+  together. Tight caller-owned sampled images use the existing upload path.
+  CORRECTION to earlier timeout diagnosis: method6 timeout on a zero-duration
+  poll is normal pending work, not proof of a GPU hang. New trace suppresses
+  those poll messages. Long glFinish calls remain observed, but they include
+  CPU submission/cache work, not just GPU execution. Entire-VM cache scans
+  are confirmed in the old source, not timed independently by0118's log.
+  macos-14 scheduled brownout has ended; use normal kernel runner, no IIG
+  substitution. Previous generated-file reuse experiment was discarded.
+  Core Submit/VM/UserClient C++ syntax compilation passed with host IOKit
+  type/allocation shims (no runtime tests). New patch applies to the actual0116
+  CI buildtree. Initial kernel run40058111623 on6733e9d dispatched after API TLS
+  failures. Follow-up adds OOL descriptor prepare/complete before copying and
+  independent GLES/kernel workflow concurrency groups. New source/build pair
+  superseded that initial run. Both replacements use23a1fc821e561c52d61279feda8920a1c7d977d6:
+  kernel40058371440 build jobSUCCESS (artifact12546134862,60572112bytes,
+  ZIP SHA256759ca7a3181cb5e6124cac3019f1fb056e14e83b7503665acd317a7566d07ba5),
+  GLES40058371530 SUCCESS (artifact12546685371,4553091bytes,
+  ZIP SHA25691573d9c7f978a420a211574cb945415a222481e76b4afe17f468a20ad05721f).
+  Normal gh artifact download timed out; first GLES range download failed at
+  offset1048576 after retries. Resumable64KiB GLES downloader now running,
+  saves verified-length chunks in research/gpu/gles-0119-download-ranges;
+  helper research/gpu/fetch-gles-0119-resume.py, output when fully verified
+  userspace/out/0119-gles-23a1fc8-range. Kernel member-only range helper
+  research/gpu/fetch-kernel-0119.py downloads kernel+SHA256SUMS to xnu/out-0119.
+  No downloaded artifact is accepted without final CRC/hash validation.
+  API TLS failures are intermittent; alternate process-local US API routing
+  retains TLS/SNI verification (research/gpu/github-read-us.py), no system DNS
+  changes. User asked to switch networks; reply pending.
+  Fresh research/gles-install-0119 directory prepared, no old block cache,
+  overlay or delta reused. User asked to enter OrangeFox for read-only staging;
+  no ADB device at last check. No0119 userdata writes or hardware boot.
+  Hardware rendering remains unverified.
+
+- **ACTIVE: CPU fallback reaches home screen; user confirms previous speed restored.**
+  Branch codex/adreno-power-audit, original iOS16.7.16 HFS+ / NativeAdreno ABI1.
+  CI39988038341 SUCCESS onb2cd6ea4b60eb151cd10a56b801a2337d21a4542.
+  Artifact12517400420 downloaded to userspace/out/0118-gles-b2cd6ea;
+  every SHA256SUMS entry passed. ARM64/iOS16.0/signature load command and
+  matching dyld-cache UUID verified. Library18791008bytes SHA256
+  c1af3c165dda6249b1125b3d9a65ee2e5790faaa3521ae32ab52f141149d1fcd.
+  Image shim/out/shim-boot-0118-gles-bo-size-120hz.img, SHA256
+  f35775f444e62765daabfa4041aad24032713c0920bc969d0ed8e03e645f99b5.
+  Same compiled0116 kernel and sRGB ADT; boot tag sweetbuild=118.
+  User reported FASTBOOT; product sweetin verified. Temporarily booted existing
+  OrangeFox recovery image, sendOKAY3.846s/bootOKAY0.130s; no recovery flashing.
+  Saved persistent0117 trace to logs/gpu-0117-after-20261023.txt(.bin), confirming
+  BGRA/pitch4608 plus Mesa layout failure and later fence timeouts.
+  Fresh staging research/gles-install-0118 uses new read-only ADB proxy/cache
+  /tmp/sweet-gles118-root.sock. Basic HFS reader could not hash the fragmented
+  old dylib (overflow extents); mounted guest verified actual0117 library and
+  record SHA256 before replacement. New library staged only in local qcow2,
+  final filesystem check/read-only remount/hash/executable checks passed.
+  User explicitly chose "Apply and temporarily boot0118". apply-delta.py
+  freshly matched all35 original chunks before writing20119552bytes and
+  verified ALL35 written chunks by readback SHA256. delta.json now
+  installed-readback-verified; before/after bytes remain under delta/.
+  adb reboot bootloader; product sweetin; temporary fastboot boot sent16992KB
+  OKAY0.515s and BootingOKAY0.130s. No boot/recovery/GPT flashing.
+  Live receiver logs/live-0118-usb.txt captured 456029 bytes in 240 seconds.
+  USB reconnection replayed startup messages, so do not count duplicate sections
+  as separate boots. A618 startup CP fence passed29/29; Mesa/EAGL starts and
+  main1125x2436 BGRA/pitch4608 buffers import with extent11239424bytes. This
+  resolves the main framebuffer size rejection, not the whole renderer.
+  Later method6 returns0xe00002d6 (fence timeout), GL finish blocks for hundreds
+  of milliseconds (maximum1804172us), and281x609/pitch1152 imports still fail
+  layout validation. Flush counts are NOT measured display FPS.
+  User explicitly reports significantly worse performance, no Wi-Fi, no haptic,
+  no sound. Treat0118 as a regression; do not call it an acceleration fix.
+  Those peripheral drivers remain unfinished, not enabled by this library.
+  Prepared shim/out/shim-boot-0118-cpu-fallback-120hz.img, SHA256
+  84c745e436a3095da8eb4821d557c00c4970cac5f7ab1c1433ea1f34a49e9a1f.
+  Same verified kernel/ADT/shim/DTB; sweetgles=0 and sweetgpu=0 disable injection
+  and the GPU worker. User returned phone to FASTBOOT to boot this fallback.
+  Product sweetin verified; temporary fastboot boot sent16992KB OKAY0.518s,
+  BootingOKAY0.130s. No partition flashing or raw userdata writes. Receiver
+  logs/live-0118-cpu-fallback-usb.txt started before boot (150s capture).
+  Live USB confirms correct sweetgpu=0/sweetgles=0 boot args, GPU worker
+  disabled, and launchd/SpringBoard exec; capture finished183787bytes. User
+  confirms "Home screen; back to previous speed". This establishes the fallback
+  as a working recovery option, not GPU acceleration. Phone remains in this
+  temporary CPU-rendering boot. Installed0118 library remains on disk, inactive.
+  Next GPU work must address submission/fence stalls and small-surface layout
+  separately. Do not remove glFinish without a real presentation fence or bypass
+  Mesa's allocation bounds checks. Preserve current live trace before changes.
+  Immediate raw rollback to0117 requires changed blocks still matching; no old
+  block delta may be replayed blindly after iOS has modified the filesystem.
+
+### 0117 runtime and source diagnosis (historical)
+- **ACTIVE:0117 installed and booted to userspace, still black UI;0118 fix staged.**
+  Original ios-sweet branch codex/adreno-power-audit, iOS16.7.16 HFS+.
+  User approved raw0117 install and temporary boot. All48 chunks/21233664bytes
+  matched before writing and passed readback after writing; delta state is
+  installed-readback-verified, originals retained in research/gles-install-0117.
+  Library SHA2562eb01550cbddc2619c7feaf36485935052c934acd577ee55eccaeedfafd83b09.
+  Boot image SHA256225203f037160ce67f549a1d11104eab97b22f86d58bfa73eff802184a8a8b17.
+  adb reboot bootloader, product sweetin, temporary fastboot boot sent16992KB
+  OKAY0.514s and BootingOKAY0.130s. No boot/recovery/GPT flashing.
+  Live USB capture now WORKS: logs/live-0117-usb.txt,312416bytes in210s.
+  Provider ready1, CP fence passes, Mesa FD618/EAGL loaded. Formats corrected
+  to BGRA1125x2436, pitch4608. Actual error now "mesa layout failed" on
+  surface2/3; user confirms black screen. No acceleration claim.
+  Pinned Mesa source confirms fd_screen_bo_from_handle passes0 size for KMS
+  handle imports; a6xx layout_resource_for_handle rejects layout.size greater
+  than fd_bo_size. Our new IOSurface handles were never Mesa BOs before import,
+  so need their real allocation size from the transport BO table. New Darwin
+  patch passes that extent into fd_bo_from_handle, with zero/UINT32 checks;
+  retain Mesa layout bounds checks. Prepared research/gles-0118-prepared.
+  Follow-up CI39988038341 dispatched onb2cd6ea (C-compatible size logging);
+  it supersedes canceled39987963423. This is a source correction, not
+  hardware-verified rendering.
+  Phone remains running0117 with black UI. Need recover/read trace as needed,
+  build/verify replacement library, stage fresh delta against current root
+  (do not reuse0117 before-state), obtain new raw-write approval before update.
+  Full Metal, Wi-Fi, audio and calibrated battery remain unfinished ports.
+
+- **Runner correction:** run39981853003 was queued on macos-14 during its
+  scheduled2026-10-23 14:00–00:00 UTC brownout (actions/runner-images#13518).
+  Move the GLES job to macos-15, preserve the pinned sources and iOS16 minimum,
+  cancel the queued run and dispatch its replacement. Fresh root snapshot and
+  local-overlay HFS check completed; no installed GLES library after user's
+  manual userdata restore. No device writes.
+
+- **0117 local staging:** fresh proxy and overlay inspected the restored root;
+  guest HFS+ check repaired its metadata in the local overlay and mounted it
+  read-only, confirming NO_GLES_LIBRARY and NO_GLES_RECORD. Guest exited with
+  VERIFIED_UNMOUNTED. Phone userdata remains unchanged. The first guest startup
+  had local initramfs ownership wrong; regenerated archive with owner0:0 and
+  reran successfully. Image integrity comparison confirms exact shim, DTB and
+  payload; firmware-bearing ADT differs only at product/artwork-display-gamut.
+  Last GitHub check: replacement run39982823642 queued, no runner assigned;
+  no library compilation/artifact yet. Watch transcript:
+  research/gpu/gles-0117-build-watch-macos15.log. Do not install old0116 library
+  as though it included the new non-planar metadata correction.
+
+- **Recovery log retrieved 2026-10-23:** read-only userdata-tail pull saved
+  logs/gpu-0116-return-20261023.txt(.bin), total1308564bytes flush4664.
+  Filename describes the collection intent, NOT proven kernel identity.
+  This trace's boot-args omit sweetgles=1 and sweetnull=backboardd (line274).
+  GPU GMU/HFI/SQE and CP29/29 fence0x618c0de pass (line2412), but render
+  gate still expects UCHE0xe19=0x81/read1 (line2414); provider stays ready0.
+  Thus this is a pre0116 configuration, not evidence the corrected0116
+  GLES pair failed. No sweetgl startup marker. Verified local0116 image
+  SHA2569ac29bf16277d7b41eb28690f6181832feabcb80def8d66b1cbb337c70f981c3
+  against saved manifest; its cmdline contains sweetgles=1. Need a fresh
+  temporary boot of this exact image and recovery/live log. Phone left in
+  OrangeFox; no writes, reboot, or new tests performed.
+
+- **0116 temporary boot explicitly authorized 2026-10-23:** verified image
+  SHA2569ac29bf16277d7b41eb28690f6181832feabcb80def8d66b1cbb337c70f981c3,
+  adb reboot bootloader from recovery, fastboot product sweetin. Temporary
+  fastboot boot sent16992KB OKAY0.530s, BootingOKAY0.130s. No flashing.
+  Await actual iOS startup and new GPU/GLES trace; transport success is not
+  proof of boot completion or acceleration.
+
+- **Fresh0116 black-screen evidence2026-10-23:** user reported no boot/black
+  screen. Host detected stockFASTBOOT; temporarily booted existing OrangeFox
+  recovery.img (send3.891s/boot0.130s), ADB recovery returned. Read-only saved
+  logs/gpu-0116-failed-20261023.txt(.bin),236720bytes flush34; different from
+  prior log. This DOES reach iOS userspace: SpringBoard/HID running. Cmdline
+  has sweetgles=1. PERFSEL selector1 accepted, NativeAdreno ready1, ABI1 opened,
+  Mesa screen ready and EAGL shim installed (lines2567–2596). Compositor fails
+  attaching surface2/3 b3a8 1125x2436 pitch0 (line2802+); framebuffer reports
+  same surfaces bpr4544 (line3040+). Later method6 returns0xe00002d6 and texture
+  copies reportGL0x506. No visible UI; this is userspace/render-path failure,
+  not evidence XNU failed to boot. Inspect IOSurface plane0 metadata retrieval
+  in Sailfish eagl.c bind_surface versus Sweet IOSurface implementation; do
+  not simply ignore format/fence errors. Phone left OrangeFox, no flashing.
+
+- **HackiOS reference port requested2026-10-23:** keep originalios-sweet
+  iOS16.7.16/HFS+/NativeAdreno; user asks GPU, battery, Wi-Fi, audio reference
+  adaptation and firmware collection. No original-root restore occurred (the
+  earlier erase request never confirmed). Existing sweetgl remains installed.
+  Current HackiOS kernel d82c64a3a31cd27a0a0afbf6e213e467e44b1b4c and
+  userland a79ff0772a3454fd1ef127e181e5b3bce6c9ce18. README still says GLES
+  compositor, Metal apps incomplete. Kernel changes since previous8e61187
+  onlycommon/setup.sh and xnuloader/loader.c, no new hardware drivers.
+  ConcreteGPU corrections taken from its loader/eagl: advertise sRGB for the
+  actual8-bitBGRA path (P3 requested unsupportedb3a8/w30r), and use ordinary
+  IOSurface metadata/base getters for non-planar images. Existing bridge
+  usedOfPlane0 and gotpitch/BPEzero. Preserve allfirmwareADT properties while
+  editinggamut withtools/sweet-gles-adt.py. NewGLES build pending; no hardware
+  rendering result yet. Recoverymodem/vendor mounted read-only forfirmware.
+  Sweet observesqcom,qpnp-qg gauge,ICNSS18800000,AW8624haptic/AW882xxamps;
+  Redwood usesPMICGLINK battery,WCN6750/WPSS,AW8697. Do notcopythoseaddresses
+  or a660 blobs toSweet. No phone writes, firmwareexecution or reboot.
+
+- **Firmware/port milestone2026-10-23:**103 files/88008754bytes pulled and
+  remote/hostSHA256verified toignoredresearch/sweet-firmware-20261023
+  (GPU7/audio31/WLAN34/modem29/haptic2). GPUidenticaltoearliercollection.
+  Temporaryread-onlymodemVFAT/vendorEROFS mounts unmounted. NoWLANMAC,
+  credentials,EFS/persist copied. PublicPMOSDTS confirmsWCN3990/ath10k,
+  notRedwoodWCN6750/ath11k. Batteryrecoverydriverqcom,qpnp-qg; PMOSampsAW88263S.
+  See docs/HACKIOS-SWEET-REFERENCE.md. Source00f535a pushed; generated
+  research/gles-0117-prepared andfirmware-bearingADT
+  shim/out/sweet-0117-gles-srgb.adt. GLESbuildNOTstarted:directgles.yml404
+  becauseworkflowisbranch-only,correctxnu.ymlgles_onlydispatchthen422
+  "Actions has been disabled for this repository". PermissionsAPIenabledtrue.
+  AskeduserforActionsUInotice; do notreportqueuedorsuccess. ExistingGPUlibrary
+  remainsinstalled, earlieroriginalrootrestorewasneverapproved/executed.
+  WiFi/audio/batteryhardwareportsremainunfinished; noMetalcompletionclaim.
+
+### Historical HackiOS detour and earlier installation records
+
+- **USER CHANGED PROJECT TO HACKiOS (2026-10-22):** user reports0116 booted
+  with zero improvement, initially stopped, then explicitly requested a new
+  HackiOS-based Sweet repository and compiled boot image. Original branch
+  and installed userdata preserved; no further device command performed.
+  New project /home/dan/hackios-sweet, https://github.com/DC28088/hackios-sweet.
+  Kernel/loader CI39773636216 succeeded on659167c; Sweet UEFI firmware job
+  CI39773154339 succeeded; HackiOS Mesa/EAGL CI39772020663 succeeded.
+  Package CI39774118533 succeeded. Image newrepo/out/boot-39774118533/
+  hackios-sweet-boot.img,7833600bytes,
+  SHA25614ab4eb6d16d503eabe3a67d037f24b83d3b6bc7b8a81d6c1dff176c74d83072.
+  This is the resident HackiOS USB loader + compiled XNU, not an iOS root.
+  Requires separate iOS16.5 APFS system/helper images. Current16.7.16 HFS+
+  userdata and its sweetgl library are not compatible with HackiOS ABI.
+  Root extraction not started (needs~8GB working space, host~4.7GB free).
+  Hardware boot/GPU acceleration NOT verified; no tests/device writes.
+  New repo NOTES.md and ports/sweet/README.md contain the current handoff.
+
+- **GLES LIBRARY INSTALLED AND READBACK VERIFIED (2026-10-22):** user
+  explicitly approved the staged userdata write. apply-delta.py freshly
+  matched ALL67 original chunks before the first write, applied22740992bytes
+  and verified every changed chunk by readbackSHA256. delta.json state is
+  installed-readback-verified;67/67 written_verified. Active root now has
+  /usr/lib/sweetgl.dylib SHA2560ae1789bb55795dec09edd3c741cba0687fdde0e36da1db2ad2dcc8fd377083d
+  and /private/var/db/sweet-gles-install.json. Exact original blocks retained
+  under research/gles-install-0115/delta; apply.log saved. Recovery/bootloader
+  partitions unchanged. Phone remains OrangeFox; NO reboot or runtime test.
+  NEXT: temporary boot shim/out/shim-boot-0116-gles-compositor-120hz.img
+  (not0115), then collect startup/provider/EAGL/submission evidence before
+  claiming acceleration. Existing Metal bundle retained; original boot
+  without sweetgles=1 does not inject the new library. All older pending
+  installation entries below are historical and superseded by this result.
+
+- **GLES INSTALLATION READY / WRITE APPROVAL PENDING:** fresh overlay full
+  fsck-fy passed, read-only mount verified library hash/executable mode and
+  install record. research/gles-install-0115/delta.json contains67 disjoint,
+  4KiB-aligned chunks totaling22740992bytes (21.6875MiB). ALL before/after
+  bytes and hashes saved under delta/. Both read-only NBD servers are up:
+  /tmp/sweet-gles-root.sock and /tmp/sweet-gles-edited.sock. No phone writes.
+  Asked user to approve this concrete raw userdata delta per AGENTS.md.
+  preflight.py currently freshly compares every original phone block;
+  apply-delta.py repeats all checks then writes/readback-verifies each chunk.
+  restore-delta.py refuses rollback after unrelated root changes. Current
+  phone remains OrangeFox. On approval, applydelta then update installed
+  status and offer matching0116 temporary boot; no runtime acceleration yet.
+
+- **0116 AND GLES PAIR BUILT (2026-10-22):** kernel CI39688634861 passed
+  on53b3f58c25d80fe318e2bbb8c01e564deaf84791. Artifact12387816032 checksum
+  verified. Image shim/out/shim-boot-0116-gles-compositor-120hz.img,
+  17399808bytes, SHA2569ac29bf16277d7b41eb28690f6181832feabcb80def8d66b1cbb337c70f981c3.
+  Local unpack checks: unchanged shim/DTB, payload match/deterministic repack,
+  required markers and stage9/120Hz/GLES/backboardd flags. Mesa/EAGL library
+  CI39688037690 on4e701be succeeded; userspace/out/0115-gles-4e701be/sweetgl.dylib,
+  18756112bytes, SHA2560ae1789bb55795dec09edd3c741cba0687fdde0e36da1db2ad2dcc8fd377083d.
+  Mach-O iOS platform2 minimum16.0; IOKit Versions/A installname is present
+  in the actual cache. Active phone root read-only inspection matches iOS
+  16.7.16/20H392/cacheUUID8f970452c9e33e88b114feb1864bc9e0, no prior GLES
+  library. Fresh qcow2 overlay contains library and install record; final
+  filesystem validation/delta preparation ongoing. NO phone writes or boot.
+  Recovery connected; read-only nbdkit /tmp/sweet-gles-root.sock running.
+  Host stage research/gles-install-0115 (freshcache). fsck540.1 -fn has known
+  header-cache false damage report; finalize with full-fy then read-only
+  mount/hash check, as documented in tools/mkiosroot.sh. See docs/GLES_0116.md.
+  No tests run, no runtime acceleration claim. Need concrete write approval
+  once block delta/rollback are fully prepared, per AGENTS.md.
+
+- **0114 LOG RECOVERED / GLES BUILD SUCCESS (2026-10-22):** user entered
+  OrangeFox with USB. Read-only recovery pull logs/gpu-0114-before-gles.txt
+  proves RPMh correction passed, GMU/HFI/SQE startup passed, CP29/29 and
+  fence0x618c0de completed. Actual provider blocker now UCHE_CLIENT_PF0xe19:
+  expected0x81, read1. Driver refused publication; zero improvement explained
+  by that log, not an inferred userspace-only fault. Pinned downstream
+  vendor-adreno_a6xx.c:943 writes1; XML names this8-bit field PERFSEL.
+  Patch0116 programs vendor selector1 and validates all8 field bits, retaining
+  the rest of the profile gates.0115 also gets an argument-space bounds check
+  after env-string copy. New companion build pending (will be image0116).
+  GLES CI39688037690 succeeded on4e701be. Artifact downloading to
+  userspace/out/0115-gles-4e701be. First companion kernel39687265147 passed
+  on266325e; packaged0115 image exists but is superseded by0116 before boot.
+  No phone writes/reboots performed. Current phone is OrangeFox; userdata
+  unmounted, HFS+ volume17179869184bytes in114970046464byte partition.
+  Fresh installer staging research/gles-install-0115; never reuse the older
+  Metal installer block cache for writes against this later filesystem.
+
+- GLES first build39687042106 compiled all Mesa static libraries and the
+  EAGL/dispatch frontend, then failed on sweet_native.cpp's IOSurface.h
+  include (iOS SDK provides IOSurfaceRef.h). Corrected. Source review also
+  removed user cache-maintenance assumptions: every Mesa BO now uses
+  task-owned VM pinned through Native BoImport, so publishMapped and
+  acquireImported maintain actual physical cache lines at submission/fence
+  retirement. This avoids nonexistent sys_dcache_invalidate and ineffective
+  user-level flushes on this ARM platform. Disabled unsupported PRIME/native
+  fence-FD capabilities, bounded logical queue IDs, real fault counters.
+  Companion kernel39687265147 builds266325e; GLES rebuild pending.
+
+- **0115 GLES KERNEL INTEGRATION STAGED:** patch0115 adds explicit
+  sweetgles=1 boot mode: backboardd-only fixed DYLD_INSERT_LIBRARIES,
+  scoped AMFI dyld policy, no MetalPluginName on the live A618 provider,
+  and IOSurfaceAddress/client-readonly memory wiring with exact bitmap rows.
+  Normal boots retain Metal discovery; GLES library is loaded only with
+  the new flag. Full ordered patch staging passed for all5 touched files.
+  GLES frontend CI39687042106 is building source1549316. Companion kernel
+  CI pending. No hardware test or root write. Source integration is not a
+  claim of successful compositor rendering; actual A618 service readiness
+  still needs the0114/0115 startup trace.
+
+- **GLES USERSPACE IMPLEMENTATION STARTED (2026-10-22):** user reports0114
+  booted with zero visible improvement and explicitly requests finished
+  Sailfish-style userspace integration. No0114 trace collected yet; do not
+  claim hardware readiness. Implemented userspace/gles/sweet_native.cpp
+  adapting Sailfish BO/import/submit/wait operations to our NativeAdreno
+  ABI1, real chip/GMEM/aperture query, cached CPU maps, resource cache
+  maintenance, retained IOSurfaces, fenced frees and ordered16-IB batches.
+  tools/prepare-sweet-gles.py fetch-source adaptation preserves the EAGL/GLI
+  frontend and shader fixes. Original iPhoneX root cache was read only:
+  UUID8f970452c9e33e88b114feb1864bc9e0. QuartzCore table/switch and12 prologues
+  match the Sailfish source at +0x4000; recorded userspace/gles/cache-profile.json.
+  Runtime UUID gate added before EAGL/QuartzCore changes. Mesa pinned to
+  f2a70d066e69c0ad62070d2f25e175a4198d273b, all3 Sailfish Mesa hunks apply.
+  Reproducible macOS builder tools/build-sweet-gles.py, GLES workflow, and
+  reversible offline root installer prepared. No source-level/hardware tests
+  added or run. Kernel GLES discovery/load policy and IOSurface source
+  wrapping still being implemented. Library compilation pending; nothing
+  installed and no new phone command beyond empty adb device listing.
+
+- **0114 BUILD SUCCESS / PACKAGED, NOT BOOTED (2026-10-22):** CI39683698934
+  passed on source231196d88d541ac7d43be007e5bce8c5b5f480f4. Portable tests
+  SKIPPED as requested by session instructions. Artifact12385946044 fetched
+  with ZIP CRC and published SHA verification. Kernel xnu/out-0114/
+  kernel.development.sweet SHA256
+  944f53f2a40edc65e7bf866e4c9cf43ee240443ac6be05b123bc3e9bc9d63b36.
+  Image shim/out/shim-boot-0114-rpmh-completion-120hz.img,17399808bytes,
+  SHA2564d16341c9c016f9c788a8aa4fc8a1e6aa86887c18c10d8be2cf56c741d327351.
+  Manifest research/gpu/0114-boot-manifest.json; watcher/package helpers
+  finish-0114.py/package-0114.py in research/gpu. Boot-v2 unpack verified
+  exact original shim+DTB, ramdisk==payload, deterministic repack from new
+  kernel+existing firmwareADT+cmdline. New RPMh marker present. Stage9,
+  120Hz scheduler, USB logging retained; old installed Metal bundle remains
+  ABI-compatible. No GLES frontend built/included, no hardware boot or root
+  changes; acceleration NOT established. Initial run39683486855 was cancelled
+  and superseded before packaging to preserve touchscreen regulator behavior.
+  Next: user-controlled temporary boot of this image and collect the fresh
+  latch/GIC/CX/GMU/CP/provider result, then port Mesa/GLES userspace transport.
+
+- **0114 GPU IMAGE BUILD PREPARATION (2026-10-22):** user requested a new
+  GPU image. Mesa documentation confirms Gallium freedreno supports Adreno
+  6xx GLES and Turnip supports 6xx Vulkan. Neither replaces our XNU hardware
+  transport. New patch0114 corrects RPMh completion polling: enable the
+  selected RSC completion source, require a fresh latch plus idle/command
+  completion, and preserve timeout quarantine. Verify GIC INTID37 is disabled
+  and inactive before enabling the RSC source; make no GIC writes. Addresses
+  verified against saved live FDT: apps_rsc SPI5, distributor0x17a00000.
+  This addresses the observed race hypothesis where masked IRQ_STATUS stays
+  zero and a short busy transition is missed; hardware success not proven.
+  Exact ordered patch application reproduces intended source. CI marker
+  added, portable tests will be disabled. Packaging helper prepared at
+  research/gpu/package-0114.py, retains stage9/120Hz/liveUSB and existing
+  ADT/firmware/shim. Existing installed Metal bundle ABI unchanged. This
+  kernel image does NOT include a ported GLES userland; do not claim GLES
+  or UI acceleration. No tests or device commands run; CI build pending.
+  Follow-up scopes the new completion mode to ARC/GPU only; preserve the
+  established ldoc11 touchscreen transaction path. Supersede initial
+  run39683486855 with the scoped version before packaging.
+
+- **PLAN CHANGED BACK: DIRECT SHIM + iOS16 + GLES (2026-10-22):** user
+  explicitly returned to main/adreno-power-audit and supplied the Pixel1
+  sailfish GPU reference. Active branch is `codex/adreno-power-audit`,
+  starting from 4e84f4e. Fetched myfork/main at 8cfc234; that main has no
+  commits absent from this branch, so no merge was needed. Preserve the
+  UniXNU branch at 8cba86f; its unfinished KPC edits were saved in stash
+  `Preserve unfinished UniXNU Darwin22 KPC edits before requested return to
+  Adreno branch`. No discard/reset, no device commands or new build.
+  Clean reference checkout research/ios-sailfish pinned to
+  ce637521bacc06fab5cc29cf144febee2fca9ff8. Public Mesa/EAGL/DRM source
+  exists, unlike the earlier private Topaz renderer. Author reports GLES
+  UI rendering at 15–35fps, up to60Hz presentation, NO Metal. These are
+  source/README findings, not measurements on sweet. New direction audit:
+  docs/sailfish-gles-port.md; selected source hashes:
+  userspace/gles/reference-inputs.json. No Mesa revision is pinned by the
+  reference setup script; resolve one before building.
+  Plan: retain our A618 kernel backend; port CoreAnimation GLES/EAGL through
+  Mesa Gallium freedreno, adapting Pixel scalar SweetGPU selectors to our
+  NativeAdreno structured ABI. Do not import A530 power/firmware/addresses,
+  or trust its dsc-8 QuartzCore patch addresses on our installed root.
+  First hardware blocker remains saved0113 RPMh cx.lvl completion timeout;
+  accepting stale CMD_STATUS is not a fix. Need fresh completion evidence
+  before GPUCC/provider initialization, then GLES BO/import/fence transport,
+  IOSurface/dispatch/cache ABI and reversible backboardd dylib loading.
+  No new acceleration image or dylib compiled/installed; no tests run.
+  Phone state was NOT inspected this turn. Most recent recorded operation
+  on the separate UniXNU branch was a temporary UEFI boot on2026-10-21;
+  current screen/USB state unknown. Installed HFS+iOS16 root preserved.
+
+- **0113 TEMPORARY BOOT / RPMh CX TIMEOUT (2026-10-21):** user authorized
+  boot; fastboot product sweetin verified, image SHA matched. fastboot boot
+  sent16992KB OKAY0.514s, BootingOKAY0.130s. No partition flashing/root writes.
+  User confirms iOS still running. Live capture logs/live-0113-usb.txt:
+  initial host helper crashed on udev usb0->enp0s20f0u3 rename (nmcli device
+  lookup exit10). Restarted receiver session11777, actual UDP data confirmed.
+  User unplugged/reconnected USB on request. USB reset/reconfiguration and
+  backlog replay worked; host new-link RX282packets/errors0 at inspection.
+  Replay shows current failure EARLIER than render profile: ARC READ mx.lvl
+  completes selector3/level321; following cx.lvl READ TCS0 times out (errno60),
+  TCS quarantined/no retry. CX preconditions fail; no GPUCC write, no GMU/SQE
+  or renderer publication. 0113 optional-register correction NOT REACHED, so
+  do not claim its runtime success. Need examine RPMh/TCS transaction lifecycle
+  and its CX request before another register/Metal change; preserve quarantine
+  semantics, do not blindly reset or reuse uncertain TCS.
+  Captured trace remains logs/live-0113-usb.txt; helper session11777 bounded
+  1800seconds active at last check. Host helper now retries nmcli discovery
+  failures so interface renaming cannot terminate capture; Python compilation
+  passed, no tests added/run. Running receiver is older loaded source; use
+  updated helper on next start. Phone left running0113, no further reboot.
+
+- **0113 BUILD SUCCESS / READY, NOT BOOTED (2026-10-21):** CI39630488384
+  succeeded on source133087d; portable test stepSKIPPED. Kernel artifact
+  12360100686 CRC/publishedSHA verified. KernelSHA25694c85d755f64520bb663356dd0dcba82c9cce6f5f2c05e56d0b5980411eade3c.
+  Imageshim/out/shim-boot-0113-native-adreno-renderer-120hz.img 17399808bytes,
+  SHA256d9ba2cc6091adb9062fe430d2550cc29a9a2f1f583b392ff61dea1d9dfee35ef. Manifest research/gpu/0113-boot-manifest.json.
+  Corrects inappropriate optional0x534 access and detects sentinel readbacks;
+  hardware outcome/provider publication/iOS acceleration remain UNVERIFIED.
+  Existing installed0110Metal bundle is still ABI-compatible; no root changes.
+  This turn changed no device state: phone remains running0112; live0112capture
+  receiver session85796 was still active at last check, bounded1800seconds.
+  Before any0113boot, ensure a receiver is active and separate capture by boot.
+  Topaz reference audit committed; useful IOSurface support remains to port with
+  memory ownership review and actual compositor trace. No complete public
+  Topaz GPU renderer was found. No sweet Wi-Fi driver was installed or enabled.
+
+- **Topaz source comparison detail:** reconstructed current SweetSurface.cpp:
+  sweet only0046+0068; lacks IOSurfaceAddress, client wrapping6/7 and real
+  values9..11/bulk27; release trap immediately drops maps. Topaz0131..0139
+  supplies these operations and detach-view lifetime handling. Concrete future
+  integration source identified; do not import Topaz scanout-pool addresses.
+  Public radio ready-hook declared/invoked but no consumer or IO80211 class
+  found in pinned tree. README reports working Settings Wi-Fi, but public
+  radio patches alone do not establish a complete iOS-facing interface.
+  Audit updated;0113 kernel still building. Phone remains running0112.
+
+- **Topaz reference refreshed /0113 source correction (2026-10-21):** fetched
+  origin/topaz89451b811a4e6cc5cdcf734c45887163d92c599e; clean local reference
+  checkout now detached at that exact revision. Public0113..0130 Wi-Fi code exists;
+  author README reports WPA2/HTTPS. Reported Topaz GPU uses private HackiOS
+  GLES patches; README explicitly excludes GPU source and lists Metal later.
+  Public0131..0139 are IOSurface support,0138 empty discovery service. Audit:
+  docs/topaz-reference-2026-10-21.md. Sweet WLAN MMIO/SID/reserved pool differ;
+  no radio initialization/root changes. Current GPU blocker resolved in source
+  by0113: downstream vendor a6xx_start only touches0x534 whenchannel==8;
+  sweet has no such override. Skip this optional access, preserve reset state.
+  Required registers now explicitly reject0xdeafbead before masked comparison.
+  No tests run; patch staging passed. CI39630488384 builds source133087dc748a2f3f9bb2b71df2b465ce7832e123.
+  finish-0113.py watches/downloads/packages; existing Metal ABI unchanged.
+
+- **0112 TEMPORARY BOOT / LIVE USB WORKING (2026-10-21):** user explicitly
+  authorized ADB/fastboot commands. adb reboot bootloader succeeded from
+  OrangeFox; fastboot boot0112 sent16992KB/BootingOKAY. No partition flashing.
+  Live UDP console receives real data from192.168.7.2, logs/live-0112-usb.txt
+  >216KiB. Host fixed-MAC interface has correct profile; capture session85796
+  remains active. Reset lifecycle across a subsequent replug is not yet proven.
+  GMEM validation now passes; CP still completes29/29, fence0x618c0de.
+  NEW BLOCKER live trace: SWEET RENDER reg0x534 expected0 read0xdeafbead
+  (RBBM_NC_MODE_CNTL). Render profile fails0xe00002ca; provider NOT published;
+  GMUstage9 ends errno5. Do not claim acceleration. Need determine A618
+  support/access for this macrotile-mode register against pinned Linux and
+  downstream/vendor configuration before changing its validation or access.
+  Phone left running temporary0112; home-screen state not visually confirmed.
+  No root image changes. Prior manual-boot preference superseded for this boot
+  by explicit user authorization. Existing Metal bundle stays compatible.
+
+- **0112 BUILD SUCCESS / READY, NOT BOOTED:** CI39625892744 succeeded on
+  sourcefbb439533ba3c0dc7bd84d4a6a883a576dc8d537; portable test stepSKIPPED.
+  Artifact12356753481 published checksum and ZIP CRC verified by fetch helper.
+  Kernel SHA256 044f900704fad68c0e4c030094b4aa36d2c84e695edf1c6589dffa7cd891b722.
+  Image shim/out/shim-boot-0112-native-adreno-renderer-120hz.img 17399808bytes,
+  SHA256 c31cb71ffe3d03ac395bf9b0df2e006919d591afa8c7cb375e84337a31662ef2.
+  Manifest research/gpu/0112-boot-manifest.json; staged source saved in
+  research/gpu/0112-work. No device writes/reboot; phone left OrangeFox.
+  Existing0110 installed Metal bundle remains ABI-compatible; do not reinstall
+  root. User prefers manual temporary fastboot boot. Bounded USB receiver
+  session85796 waits1800seconds onUDP5140, logs/live-0112-usb.txt and
+  logs/live-0112-capture.out/status. A listening socket is not proof of transfer.
+  After boot expect GMEM profile acceptance, provider publication, backboardd
+  client connection and ABI submit/wait results; none yet hardware-verified.
+  USB reset/reconnect correction and UI acceleration remain UNVERIFIED.
+
+- **0111 SAVED LOG FOUND /0112 correction staged (2026-10-21):** OrangeFox
+  confirmed, pulled logs/gpu-0111-paired-startup.txt600600bytes, flush121.
+  0111 S2CR quirk confirmed; live CB0 has1027pages/20bootstraptranslations.
+  SQE ME_INIT completes12/12; real CP timestamp fence completes29/29,
+  value0x618c0de, no CP fault. NEW BLOCKER: renderprofile reg0xe0d expects
+  inclusive0x17ffff but reads0x17f000. Provider publication stops here, so
+  installed Metal still has no GPU to open. 0112 preserves Linux's GMEM limit
+  write and validates upper20addressbits; low12RAZ inferred from hardware log.
+  USB log proves no endpoint reconfiguration after later bus resets. 0112
+  tracks data transfer resource IDs, ends active transfers before DMA reuse,
+  clears configuration/queues on reset/disconnect/SET_CONFIGURATION0, locks
+  setup against TX, ignores unconfigured RX completion. Failed stop disables
+  data path for rest of boot. Console replays last1MiB after a valid host frame
+  per configuration, bounded16datagrams/100ms, restores cursor on send error.
+  Host helper sends bounded subnet probe to initiate ARP. Added bounded actual
+  Metal compositor open/method-result telemetry. Kernel patch0112 applies to
+  reconstructed0072..0077USB and0110render/client sources. CI39625892744 builds exact
+  sourcefbb439533ba3c0dc7bd84d4a6a883a576dc8d537; finish-0112.py watches,
+  downloads the kernel with published SHA verification and packages0112.
+  No local ARM compiler, no tests run. No phone writes/reboots/root changes.
+
+- **User reports0111 booted, performance unchanged; live capture FAILED:** user
+  requested debug collection from current iOS. Old bounded receiver is gone,
+  logs/live-0111-usb.txt was0bytes. Restarted receiver; correct hostIPv4 exists.
+  USB1209:0001 enumerates, but RX/TX packets0, RX errors144900+ climbing,
+  TX errors climbing; no ARP/ping response. NM link down/up did not help.
+  User ran authorized sudo usbreset1209:0001; re-enumerated device9->11,
+  still zero RX/TX valid packets and thousands of new errors. Captured ZERO
+  GPU console bytes; do not claim0111 SMMU result or infer Metal discovery.
+  Source review identifies missing configured/queue reset onUSB bus reset:
+  0073 reset handles onlyDCFG address;0075 ud_configure returns immediately
+  when ud.configured remains true. Likely explains endpoint loss on reconnect;
+  not yet hardware-proven as sole cause. No new kernel patch/build this turn.
+  dumpcap launch denied by host capabilities; no usable PCAP captured.
+  Asked user to manually enterOrangeFox to pull0111 saved startup, await reply.
+  Active bounded receiver session2642 (600s) writes logs/live-0111-usb.txt,
+  logs/live-0111-capture.out/status. New helper now distinguishes receiver-ready
+  from first actual packet and reports no-data/RX-error status every30s.
+  No device writes/reboot or root changes this turn. Need actual saved GPU
+  trace before driver changes. A live connection needs USB reset/reconnect
+  handling and backlog replay, not just a desktop socket listener.
+
+- **0111 BUILD SUCCESS / READY, NOT BOOTED:** CI39537556638 success on exact
+  source6cf3c60c393a0ac5b82ef8fe311be5475d5d8d6e; portable testsSKIPPED.
+  finish-0111 helper verified published artifact checksum and packaged image.
+  Kernel SHA256 519ccd305ad132ca1b8dcacc54e319cb354ad5ba3e1d6666a241cea14df56a06.
+  Image shim/out/shim-boot-0111-native-adreno-renderer-120hz.img17383424bytes,
+  SHA256 eeb53575f3e316461d00656d2d77caf28a52ec2643b36aa30a2d6c72378fb5da.
+  Binary contains new S2CR probe/quirk and existing renderer publication markers.
+  Existing installed0110 Metal bundle remains matching (ABI unchanged).
+  Phone LEFT ORANGEFOX, no device writes/reboot this turn. User previously
+  preferred manual boots. Live USB receiver READY session96141,1800s bound,
+  logs/live-0111-usb.txt; stdout/tmp/sweet-usb-0111.out and statusfile. Dedicated
+  NM sweet-usb-log should assignIPv4 automatically when iOS re-enumerates.
+  Watch probe/readback, CB0 translation count, CP fence and provider publication;
+  then actual Metal discovery/commands. Hardware correction and acceleration
+  UNVERIFIED until boot. No root reinstall needed. Fresh diagnostic/persistent
+  log0110 SHA25674ce09c2f10e8edd21e4c0c860a9fc3270e6a715ca1298b385a1df89aa5e0c15.
+
+- **0110 STARTUP BLOCKER FOUND /0111 code correction:** user entered OrangeFox.
+  Pulled logs/gpu-0110-paired-startup.txt273477bytes, flush55. GMU/HFI succeeds,
+  then SWEET NATIVE VM route preflight failed0xa=ArmSmmu4KBusy; CP SMMU errno5,
+  stage9 ends, NO render-provider publication. Installed Metal cannot initialize
+  when provider never exists. Baseline invalid slots show S2CR0x200ff. Strict
+  upstream preflight expects0x20000; Linux qcom_smmu_cfg_probe/write_s2cr documents
+  firmware ignoring FAULT writes, rewriting BYPASS to FAULT with CBNDXff.
+  Added0111: probe ONLY the leased INVALID stream slot, determine firmware
+  encoding, normalize subsequent FAULT requests at board MMIO adapter. Require
+  actual FAULT readback, no global reset/no GMU CB1 changes. Exact sweetID and
+  polling profile permits ignored low CBNDX byte only for FAULT readback;
+  translated routes still exact. Better startup detail log before failure.
+  Vendor Streams C compilation with-Wall-Wextra-Werror and patch staging pass;
+  Full kernel CI39537556638 runs on6cf3c60c393a0ac5b82ef8fe311be5475d5d8d6e,
+  testsfalse. research/gpu/finish-0111.py polls/downloads/packages automatically
+  (session96448, finish-0111.log). No tests/hardware run. Bundle ABI unchanged.
+  Phone LEFT ORANGEFOX; do not reflash root. Source manifest in
+  docs/native-adreno-0111-sources.json. This fixes a measured initialization
+  blocker; it does not prove later Metal calls or acceleration work.
+
+- **0110 paired boot still slow; USB live logging NOW VERIFIED:** user says
+  installed bundle +0110 boots with unchanged performance. Current device iOS,
+  enumerated1209:0001, USB Ethernet MAC02:00:5e:77:ee:01. Host enp0s20f0u3 had
+  onlyIPv6, no UDP5140 receiver. sudo requires password, but nmcli device modify
+  succeeded as desktop user; assigned192.168.7.1/24 and ping192.168.7.2 answered.
+  Received actual console into logs/live-0110-usb.txt; now captures daemon execs,
+  FB timing and USB counters. Observed1200callbacks/10s but present_calls=0;
+  this is scheduler evidence, NOT GPU rendering proof or measured frame rate.
+  Created dedicated persistent NM profile sweet-usb-log, matches only phoneMAC,
+  manualIPv4/no default route/IPv6 disabled/autoconnect priority100. Replaced
+  sudo+nc shell helper with Python UDP receiver binding BEFORE configuring NM,
+  source-filtering phoneIP, append log, optional --duration and reconnect wait.
+  Current capture launched with300s duration; original90s capture also received
+  data. No kernel/root writes/reboot this turn. Startup already missed before
+  address setup; requested user manually enter OrangeFox withPower+VolUp to
+  pull full persistent0110 startup trace. Awaiting reply. Do not assume provider
+  published/Metal loaded from boot success, and do not build another speculative
+  driver image before reading startup result. NSLog is not automatically in
+  kernel stream; frontend diagnostic routing remains an instrumentation gap.
+
+- **METAL BUNDLE INSTALLED into phone userdata (2026-10-21):** user manually
+  entered OrangeFox with Power+VolUp after software recovery boot returned to
+  FASTBOOT. ADB recovery root now works. User explicitly authorized copying the
+  matching bundle into the installed root. OrangeFox has FUSE but no HFS kernel
+  driver; host sudo needs password. Used a read-only ADB-backed NBD export of
+  the first16GiB HFSX volume, Linux guest + qcow2 overlay, to install
+  /System/Library/Extensions/NativeAdrenoMetal.bundle from0110-1fae147.
+  Confirmed actual iOS16.7.16 /20H392 SystemVersion.plist. No old bundle existed.
+  Set root:wheel0:0, executable755. All53 bundle SHA256s passed twice, including
+  after a read-only remount; all guest mounts cleanly unmounted before applying.
+  fsck repair mode repaired preexisting hard-link metadata and post-copy volume
+  header, then reportedOK. Read-only -fn continues the known (1,0) header warning
+  documented for these journaled volumes; do not claim -fn clean.
+  Saved ALL before/after chunks in research/metal-install-0110/delta/ with
+  delta.json and guarded restore-delta.py (refuses unexpected changed blocks).
+  Live preflight matched every original chunk. Applied285 chunks,241303552bytes,
+  only inside first16GiB of userdata; every written chunk readback SHA verified.
+  Volume headers written last; final sync complete. No other partition writes,
+  no root reflash, no GPT change; persistent log tail outside volume untouched.
+  Full guest/stage/apply logs and helper sources under research/metal-install-0110/.
+  Local userspace/out/0110-1fae147/installation.json records evidence.
+  Device LEFT IN ORANGEFOX, not rebooted. Matching0110 boot image is ready.
+  GPU/Metal rendering performance still UNVERIFIED. Next step is paired kernel
+  boot with live log capture; user earlier preferred manual boot. Do not restore
+  raw before blocks after any subsequent iOS write without consistency analysis.
+
+- **Recovery boot attempted after sandbox disabled (2026-10-21):** user
+  asked to run fastboot directly. Device detected; fastboot boot
+  recovery/recovery.img sent131072KB OKAY3.965s, Booting OKAY0.130s,
+  total4.407s. Subsequent checks still detect FASTBOOT, no ADB recovery device.
+  This proves command acceptance only, not successful recovery startup.
+  Stopped the pending adb wait. No partitions flashed, no root writes, Metal
+  bundle NOT installed. Host sudo requires a password. Need determine why
+  temporary recovery returns/remains in fastboot before installing bundle.
+
+- **PAIRED0110 BUILD COMPLETE (not installed/booted):** kernel39532260702
+  and graphics39532264309 both SUCCESS on1fae147d3bcba8a2377b8bc3995ab0d66c97022f.
+  Graphics artifact12315364871 ZIP58511001bytes. Final bundle licensing precedes
+  codesign seal; codesign --verify --strict passed in CI. Downloaded to
+  userspace/out/0110-1fae147/; verified all53 recorded bundle file hashes,
+  SweetAdrenoMetalDevice principal class, included dylib/licenses/signature.
+  Same directory now contains0110 boot image, boot-build.json, metal-build.json,
+  paired-build.json and README.md. Kernel full build log saved under
+  research/gpu/build-0110.log (gh HTTP2 download failed twice; urllib GET worked).
+  Actual compiler invocations forClient/Render confirmed; no hardware/tests.
+  Frame acceleration/performance remains UNVERIFIED. Matching bundle must be
+  installed into active root /System/Library/Extensions before evaluating this
+  kernel. No root, USB, reboot or partition operations performed this turn.
+  docs/native-adreno-0110-deployment.md and docs/usb-live-logging.md record
+  deployment/rollback/logging; do not ask another kernel-only diagnostic boot.
+
+- **0110 kernel build and packaging SUCCESS:** CI39532260702 on exactsource
+  1fae147d3bcba8a2377b8bc3995ab0d66c97022f; portable test step SKIPPED.
+  Kernel artifact12315548449 ZIP60534401bytes; downloaded selected files and
+  verified published SHA256. Kernel SHA256
+  e7aee71d91fb4b9a51ff2ee353ca4b40adf3fb44849909753eae1528e284dbef.
+  Image shim/out/shim-boot-0110-native-adreno-renderer-120hz.img17383424bytes
+  SHA256 ed9a809ae4c5980c90c4ab2955e49325beb60f538daef98bf6759374b78029a8.
+  Existing0083 shim and0096 firmwareADT reused; XNU sweetgpu9,120Hz target,
+  sweetusb2,sweetusblog1. Manifest research/gpu/0110-boot-manifest.json.
+  Binary contains actual provider/Metal discovery/live VM strings. Paired
+  graphics CI39532264309 subsequently succeeded (see above). Do not boot the kernel
+  alone: matching root Metal bundle still required. No phone/root access.
+
+- **Build resumed, USB guide reviewed:** graphics run39472089044 on3ced921
+  succeeded. Kernel run39472076417 failed at SweetNativeAdrenoClient.cpp:196:
+  IOPlatformExpert was only forward declared. Pending local patch includes
+  IOKit/IOPlatformExpert.h to provide inheritance definition. Earlier missing
+  NativeAdrenoABI.h was fixed in3ced921. Fix bundle signing order: licenses
+  must be copied BEFORE sealing bundle; require codesign --verify --strict.
+  Rebuild both on the new commit, run_tests=false. No device access/boot.
+  User-provided USB-SHIM-GUIDE.md is an MSM8953 CDC-ACM design description,
+  not implementation sources. Existing sweet patches0072-0077 implement
+  CDC-ECM logging (sweetusb=2, sweetusblog=1, UDP5140); retain sweet addresses.
+  Transport has not been newly hardware-qualified this turn.
+
+
+- **0110 connected renderer implementation (2026-10-20, NOT booted):** new
+  SweetNativeAdrenoRender programs all A618 3D address modes,512KiB GMEM and
+  SM7150 UBWC2 (bank14/swizzle6/min32/four-channel) with register readback.
+  SweetNativeAdrenoClient publishes IOAcceleratorES/AGXAccelerator discovery
+  only after liveVM/CP/render profile connect; implements actual NativeAdreno
+  BO/import/map/IB/fence ABI and exact Darwin Turnip tunnel. One backboardd
+  connection, same GPU IOLock, real fence quiescence before maps/frees/submits,
+  retained original BO descriptors for CPU mappings; no fake render success.
+  Kernel imports actual NativeAdrenoUserClient/Timer/Status. Initial WC disabled
+  for explicit noncoherent cache maintenance; no process-isolation claim.
+  Added actual iOS16 Turnip+metal2vulkan/NativeMetal build and a minimal plugin
+  entry, removing target-specific QuartzCore probes by not compiling the old
+  plugin. Base528 static ABI guard is unqualified at runtime. Mesa build-script
+  pin85fda3b differs from survey pin c823a83: build follows compiler manifest.
+  New graphics workflow invoked through existing xnu.yml graphics_only=true;
+  run39469296081 onf56d421 currently compiling. First direct metal.yml dispatch
+  was404 because new workflows are not registered on defaultbranch.0109 kernel
+  run39468676639 was CANCELLED by old shared workflow concurrency when starting
+  graphics. Concurrency now separates kernel/graphics. New full0110 kernel build
+  pending. No root edits, installs, USB access or new boot images. User asked to
+  keep phone in FASTBOOT until the connected rendering path is ready.
+
+- **0108 user result /0109 connected-VM work (2026-10-20):** user confirms
+  0108 reached iOS with unchanged performance, now FASTBOOT. User explicitly
+  accepted implementation work without another unconnected-image boot. Do not
+  access the phone or request a boot until an actual rendering path exists.
+  Latest Topaz fetched d8c82d9dd5925136fa226e8e23bf773eeac2d69d: only new0139
+  IOSurface address publication; no public GPU driver/Turnip/Metal path found.
+  NativeMetal HEAD remains6dcd4cb.0109 now replaces pre-SQE fixed20-leaf CB0
+  setup with an owned2GiB4K BO arena (16K host), maps the same boot SQE/ring/
+  fence allocations, probes their20 translations plus guard, then connects
+  NativeVm to NativeSubmit after the proven CP fence/adopt. Adds an explicit
+  measured A618 context/polling profile; no unhandled IRQ enable or CB1 changes.
+  Boot storage borrowed NC with permanent owner, never freed or cache-remapped.
+  Portable SMMU compilation and patch staging passed; full XNU compile pending.
+  Not hardware qualified; still no userclient, Turnip or Metal deployment.
+
+- **0108 temporary boot sent (2026-10-20):** user reported FASTBOOT.
+  Approved direct fastboot boot of
+  shim/out/shim-boot-0108-native-adreno-core-120hz.img succeeded:
+  Sending16928KB OKAY0.510s, Booting OKAY0.130s, total0.662s. No partition
+  flashing or root edits. No /dev/bus/usb filesystem permission grants were
+  requested. Waiting for user's on-screen result; fastboot success does not
+  establish iOS boot or rendering. Full GPU acceleration remains unfinished.
+
+- **0108 kernel build SUCCESS / image packaged (2026-10-20):** CI39464554694
+  exactsource11e8daf2b57fa01c5e954eb3284aa095cf23e82a, testsSKIPPED. New
+  memory/CPU/VM/submit and SMMU compile commands confirmed in saved CI log
+  research/gpu/build-0108.log. Kernel artifact12283999169 ZIP60359513 bytes;
+  kernel17318512 bytes SHA256
+  84919178dc601d422abac875eb432f2a6f046a2a69b736b67ba91d7970ec406f,
+  matches published checksum. Image
+  shim/out/shim-boot-0108-native-adreno-core-120hz.img17334272 bytes SHA256
+  6809ac8ad2fb224649265364912bc61f7c0b1108b1101051fa476c9f4ca2b7a8.
+  Bootv2 kernel/payload unpack roundtrip matches. Manifest
+  research/gpu/0108-boot-manifest.json. No USB, hardware tests, flashes or root
+  edits. Full acceleration STILL UNFINISHED: the imported resource core is
+  compiled but not attached to live CB0; no userclient/Turnip/Metal renderer.
+  Do not expect UI lag improvement from this image alone. Next implementation
+  is pre-CP dynamic table arena plus live VM ownership, then NativeAdreno ABI
+  and iOS16 rendering frontend; docs/native-adreno-0108.md has exact boundaries.
+
+- **0108 full kernel CI running:** run39464554694 exactsource
+  11e8daf2b57fa01c5e954eb3284aa095cf23e82a, testsfalse. First run39464251721
+  on76a874a failed before compilation because source-list hunk began at1;
+  corrected full-file context in11e8daf. Actual patch staging outside the
+  parent checkout applies0107/0108 and matches all committed vendor bytes.
+  research/gpu/finish-0108.py fetches/packages exactsource only, log
+  research/gpu/finish-0108.log; exec helper session29223. No device access.
+  Do not describe the expected0108 native-adreno-core image as fullacceleration.
+
+- **0108 core implementation / build-only (2026-10-20):** execution restored
+  through approved repository/network commands; NO USB access. Imported MIT
+  NativeAdrenoMemory/Cpu/SmmuMemory/Vm/Submit and ArmSmmu4K into third_party;
+  patch0108 compiles the core into XNU. Ported complete16KiB CPU ownership,
+  separate logical4KiB GPU extents, padding-inclusive budgets/pool allocations,
+  PAGE_SHIFT cache attributes and guarded physical maintenance. A6xx framed
+  submissions use pinned Linux cache/CCU packets and legacy fences rather than
+  A7xx BR/BV state. Local portable SMMU C and ring C++ compilation passed;
+  ARM-only MMIO syntax compiled, no tests or hardware runs. Full XNU CI pending.
+  This is not a lag fix: dynamic BO arena is not bound to CB0, no userclient,
+  Darwin Turnip/Metal plugin or IOSurface rendering deployed. Keep0106 cold-SQE
+  fix and existing GMU CB1. docs/native-adreno-0108.md records exact gaps;
+  docs/native-adreno-0108-sources.json records source/adapted hashes. Original
+  mode-only working changes must remain unstaged. User boots manually.
+
+- **0107 build SUCCESS /image ready (2026-10-20):** CI39458079908 exactsource
+  cc09e1f4f779dbffdc3b4e92388aeddfd70b32a2; portable testsSKIPPED. Job118750074042,
+  kernel artifact12280989818 ZIP60138774. Kernel17243456 bytes SHA256
+  8f1c304069f7004568b4098b201fb2b7c0d6d3710d2bff1309441f43678bdd36,
+  published artifact checksum verified; both NativeAdreno adapter log markers
+  present. Image shim/out/shim-boot-0107-native-adreno-a618-120hz.img17276928
+  bytes SHA256 cb84c79382dd110734e2a37edba6870e4dfb1644dbdb655b82506507ba069148.
+  Boot v2 stub and payload roundtrip match. Manifestresearch/gpu/0107-boot-manifest.json;
+  finish-0107.log complete, helpersfetch/packageonly (no device commands).
+  sweetusb=2 added for existing live-console transport; sweetgpu9/fbtarget120.
+  NO0107hardwarebootyet: normal fastboot devices returns empty; asked user to
+  connectFASTBOOT or leavebuildunbooted. Wait for reply before dependent device
+  work; do not claim handoffreadyonhardware. No flashing/rootedits/radiopower.
+  Full GPU acceleration NOT implemented: next code is16KiB BO/IOSurface/VM,
+  A6xx context/IBs, NativeAdreno ABI userclient, Darwin Turnip and iOS16 Metal.
+  Before proceeding with hardware, check async answer and device visibility.
+
+- **0107 corrected build /Metal ABI:** CI39458079908 on exactsource
+  cc09e1f, testsfalse; first CI39457578705 failed during patch application.
+  finish-0107.py/package-0107.py updated source/run; first helper log preserved.
+  New payload adds sweetusb=2 for existing live-console transport. No device
+  action or root edits. Read-only Metal Objective-C class_ro inspection verified
+  _MTLDevice name, instanceStart8, instanceSize528 for20H392; upstream expects
+ 536 foriPadOS17.7.11. _MTLAddDevice exported. docs/native-metal-ios16-profile.json
+  records partial static evidence; do not merely change536to528 and publish.
+  Upstream plugin has hardcodediPadOS17 display probes that require replacement.
+
+- **0107 initial CI39457578705 failed before compilation:** required patch
+  application rejected the one-context-line files.arm64 insertion. Corrected
+  to the existing seven-line surrounding context; no hardware image resulted.
+  This was patch staging, not a C++/GPU execution result. Job118748365910
+  diagnostics saved research/gpu/build-0107-tail.log.
+
+- **UniXNU port started /0107 (2026-10-20):** user supplied NativeAdreno,
+  NativeMetal and MakrSas/ios-topaz. Cloned/read and pinned exact commits/hashes
+  in docs/unixnu-port-sources.json; details docs/unixnu-sweet-port.md. MIT ring,
+  ABI and PM4 imports in third_party/unixnu.0107 embeds adapted A618 ring and
+  SweetNativeAdreno adapter into XNU, adopting the completed0106 ring without
+  reset, halt, base reprogramming or clearing memory. Preserves sequence, uses
+  event4 CACHE_FLUSH_TS/WHERE_AM_I and separate fence/shadow, blocks A7 framing.
+  Private synchronous kernel submit only; no userclient/Metal renderer published.
+  No extra command submitted by adoption. Host ring C++14 and PM4 C compilation
+  passed-Wall-Wextra-Werror (ring upstream formatting warning suppressed); no
+  tests run. Need full XNU compilation. NativeMemory assumes4K CPU and cannot
+  run unchanged on sweet16K; NativeMetal build targets iOS17 and depends on
+  patched Turnip/metal2vulkan. No userspace/root edits or acceleration claim.
+  Topaz has newer station/WPA2 patches beyond README; sweet ICNSS18800000
+  differs from topaz c800000, so no hardcoded Wi-Fi register/firmware port.
+  Phone remains FASTBOOT per0106 handoff; no device action in reference audit.
+
+- **0106 hardware: CP startup and PM4 execution succeed (2026-10-20 09:00
+  UTC):** user booted the temporary image to the iOS home screen (performance
+  unchanged, expected without a renderer) and returned FASTBOOT; a temporary
+  recovery boot pulled logs/gpu-0106-cp-startup-trace.txt 257946 bytes flush62
+  SHA256 fd36a5767d03b269550140641992ff6316fe9daddc9f01b413c3275a65a67829.
+  All 14 CP SNAP steps show IRQ=0; phase2 reads SQECTL=0/INSTR=0/RB_CNTL=0, so
+  the guarded early halt correctly did not write 3 and no error latched. After
+  instr_base INSTR=0x70000000, RB_CNTL=0x800020c, auth clean, release SQECTL=1,
+  bootstrap CP2GMU=0x4 at 10us. ME_INIT errno=0 phase=3 12/12 submitted/
+  completed RPTR=WPTR=0xc status=0x1 IRQ=0 fault=0. leave-secure + fence
+  errno=0 phase=6 29/29 fence=1 value=0x0618c0de, proving CP consumed PM4 and
+  wrote memory, not merely fetched. CB0FSR=0x400 (previous builds 0x402),
+  FAR=0 FSYNR0=0 FSYNR1=0. Root cause confirmed: the unconditional
+  CP_SQE_CNTL=3 write to a cold (SQECTL=0) engine latched
+  CP_INTERRUPT_STATUS bit7; 0106's removal fixed startup. iOS still
+  software-rendered; no renderer or iOS graphics ABI work. Phone is in
+  FASTBOOT. Added research/gpu/analyze-0106.py. Live console is already
+  available via boot-arg sweetusb=2 + tools/sweet-usbnet.sh (patches
+  0072/0073/0077); future images should include it for live logs during boot.
+
+- **0106 built and temporarily booted (2026-10-20 09:45 UTC):** CI
+  39397948195 SUCCESS on 6f74eecc4e1527d6c88ca7ea0fcb88d14e393e30;
+  portable transitions SKIPPED. Kernel artifact 12253851262 (60101595 ZIP
+  bytes); xnu/out-0106/kernel.development.sweet 17241680 bytes SHA256
+  1f503f968984b061c5f7f6e344c97c9a4e2bc7fbfaae2d397f87a21f24816677,
+  artifact checksum verified. Image
+  shim/out/shim-boot-0106-cp-startup-trace-120hz.img 17272832 bytes SHA256
+  e10f2ab2d61c3b41a2b9e78cc2a349d1b9603312f1a7addb56299d4cc8f682f6;
+  manifest research/gpu/0106-boot-manifest.json. bootv2 unpack round-trip
+  matched payload 3a13828e9ad8114fef27362ceadc056245d9ef3695cff4e7c84e6c7d2a8aa23a
+  and stub kernel. `fastboot boot` Sending/Booting OKAY 0.656s, no flash/root
+  edits. Waiting for user iOS confirmation, then temporary recovery boot and
+  pull logs/gpu-0106-cp-startup-trace.txt; summarize with
+  research/gpu/analyze-0106.py (per-step CP SNAP tags, phase2 IRQ,
+  first_fault, CP2GMU/SQECTL/INSTR). Note: if phase2 SQECTL reads 0x3 the
+  guarded early-halt still rewrites 3; snapshots distinguish that from a
+  pre-existing latch.
+
+- **0105 hardware result /0106 implemented (2026-10-20):** user booted the
+  temporary image to the iOS home screen with unchanged slow performance and
+  returned FASTBOOT. Log pulled with a temporary OrangeFox boot:
+  logs/gpu-0105-sqe-bootstrap.txt, 224962 bytes, flush9, SHA256
+  95cb36a4aa5ee872ef558c558f04f4e2d7984b05b5ae691ea7939050a41230d4.
+  GMU clocks/HFI, SMMU CB0/CB1, CP firmware staging/readback and signed ZAP
+  PAS phase5/status0 all passed. The 0105 gate worked and localized the fault:
+  CP_INTERRUPT_STATUS bit7=0x80 was already latched before authentication and
+  before any CP_SQE_CNTL release (power=0 before_auth=0x80 after_auth=0x80,
+  sqe_started=0, bootstrap_us=0, CP2GMU=0), so this is an inherited setup
+  fault, not an ME_INIT execution failure. CB0FSR=0x402, FAR=0, FSYNR0=1,
+  FSYNR1=0x4030000, SID=0 again. Unconditional early `CP_SQE_CNTL=3` is now
+  the prime suspect; Linux uses 3 only to halt a running SQE, and the first
+  fetch in the disassembly still comes from CP_SQE_INSTR_BASE. 0106
+  (`xnu/patches/0106-sweet-adreno-cp-startup-snapshots.patch`) removes that
+  write, halts only when the phase-2 SQECTL readback says the engine is
+  enabled, and records IRQ/SQECTL/INSTR_BASE/RB_CNTL/CP2GMU after each setup
+  block plus a first-fault tag. It does not clear faults, reset, retry or
+  advertise a renderer. Host CP compile with -Wall -Wextra -Werror passed;
+  local patch application matches 0106-work byte for byte. No full XNU build
+  or hardware run yet. Phone is in FASTBOOT.
+
+- **0104 hardware result /0105 next:** user reached iOS with unchanged slow
+  performance and returned FASTBOOT. Temporary recovery boot OK; log pulled
+  logs/gpu-0104-sqe-zap.txt (304784 console bytes, flush117). Full8033-word
+  physical SQE alias verification passed. Signed ZAP PAS phase5/status0 passed.
+  CP local IRQ80, ME_INIT errno5 with0 submitted/completed, SQE_STAT PC0,
+  CB0FSR402/FAR0/FSYNR0=1/FSYNR1=4030000. SQE cache captured; first8 words0,
+  later SRAM contents do not establish valid firmware fetch. No rendering.
+  0105 adds IRQ snapshots after GPU power, before/after PAS and gates submission
+  on firmware CP_CP2GMU_STATUS bit2 (bounded10ms), distinguishing an inherited
+  setup/auth error from a post-release execution fault. Does not clear faults,
+  add reset/retry or advertise a renderer. Host C compilation-Wall-Wextra-Werror
+  passed, no regression tests run. Full XNU build pending.
+  Investigated ACTLR303 generic Qualcomm SMMU-500 profile: rejected because
+  pinned SM7150 qcom_smmu_v2_data has no client_match. ACTLR unchanged; prior
+  commentary proposing it was corrected before build. Phone left in recovery.
+
+- **0104 compiled and temporarily booted (2026-10-20 08:06:28 UTC):**
+  CI39389711266 SUCCESS onbcf90e4cf7b5593fefd61d74b389c256504716fb;
+  portable regressions SKIPPED. Selected artifact kernel CRC and published
+  SHA verified. Kernel xnu/out-0104/kernel.development.sweet17241656 bytes SHA
+  4fdfb29c48dd760498b8cf63625afc498a5faf93925a37d2e7737c9d5f793015.
+  Image shim/out/shim-boot-0104-sqe-zap-120hz.img17272832 bytes SHA256
+  d4c73f7726d9d9f0b57baa188a13b7b1253396345c869dac481bc94d7d3d74a3.
+  Manifest research/gpu/0104-boot-manifest.json; helper finish-0104.log after
+  transient metadata retry. Job118518552305; tail helper build-0104-tail.log
+  session24432 may still run. ADB reboot bootloader, temporary fastboot boot
+  Sending/Booting OKAY0.657s. No flash/root edits. Wait90s then user returns
+  FASTBOOT; boot recovery and pull logs/gpu-0104-sqe-zap.txt. Inspect full
+  physical readback words/heads, pre-SQE PAS attempted/error/phase/status,
+  local_irq, sqe_started, FAR, SQE_STAT and SQE_CACHE after a failure. If PAS
+  fails SQE stays halted; don't mistake that for instruction-fetch improvement.
+  CPU alias readback does not prove GPU fetch; cache/CP progress still required.
+  Full iOS renderer remains unimplemented; no lag/acceleration success claimed.
+
+- **Native iOS ABI investigation advanced during0104 build:** read-only HFS
+  cache indexing found actual AGXMetalA11 executable in dyld cache (standalone
+  file remains absent), plus IOAccelerator/IOSurface/Metal/GLEngine/GPUSupport.
+  2710 images across44 cache-format files; selected headers and export tries
+  parsed without extracting2.7GB cache. Local ios-abi/index-cache.py,
+  cache-exports.py, trace-ioaccel.py and JSON/disassembly outputs stay ignored.
+  Resolved ARM64 shared-cache adrp/add/br stubs to actual IOKit exports before
+  interpreting calls. GL client type0, Device1, CL3, Queue4; ContextSubmitExt2
+  selector2 input0x88 with variable output; Device info selector2 output0x258.
+  docs/ios-graphics-abi.md records verified partial contract and limitations.
+  No service stubs, resources/command ABI, shader translation or renderer were
+  implemented; no root changes. Capstone was already installed. Previous
+  standalone AGX lookup uncertainty is resolved by cached-image identification.
+  Helper finish-0104-first-attempt.log records transient GH network failure;
+  restarted finish-0104.py with metadata retries in finish-0104.log.
+
+- **0104 compiling:** CI39389711266 exactsourcebcf90e4cf7b5593fefd61d74b389c256504716fb,
+  run_tests=false. Host CP compilation-Wall-Wextra-Werror succeeds.0103 CI
+  39389309335 canceled, no0103 image booted. Helpers finish-0104.py/package-0104.py
+  fetch/hash/package exact source only; never device commands. Current phone
+  recovery, plan temporary boot of final signed-ZAP sequence after successful CI.
+
+- **0104 vendor ordering /0103 superseded before boot:** pinned matching
+  Lineage device kernel at e03e5ba22586be70673afb5d3c3f70510524e658,
+  drivers/gpu/msm/adreno_a6xx.c: a6xx_rb_start calls microcode_load including
+  signed ZAP subsystem load BEFORE SQE_CNTL1/CP_INIT. Source/hash recorded in
+  docs/adreno-vendor-startup-source.json.0104 follows that device vendor order:
+  fixed synchronous adapter callback after GPU_SET/DCVS/aperture/base programming
+  authenticates existing signed ZAP, then releases SQE only on success. Logs
+  attempted/error/PAS phase/status/response. Metadata/reserved mapping retained;
+  no repeat auth after ME_INIT, CP_SET_SECURE_MODE still occurs after ME_INIT.
+  0103 diagnostics/physical verification retained.0103 CI39389309335 superseded,
+  no0103 image booted. Need final0104 compile/result, full iOS rendering absent.
+
+- **0102 hardware: aperture succeeds; SQE illegal instruction at PC0:**
+  User reached iOS and returned FASTBOOT. Temporary recovery boot; pulled
+  logs/gpu-0102-cp-startup.txt225639 console bytes flush9. InitialTSB all0,
+  aperture errno0 phase3 status0 response0. ME_INIT still timed out:0/12words,
+  shadowRPTR0; CB0FSR402 FAR0, FSYNR0=1 FSYNR1=4030000. SQE_STAT PC0 and
+  all registers0 except word29=70000000. CP_STATUS1=81000006,
+  CP_INTERRUPT_STATUS=80 = CP_ILLEGAL_INSTR_ERROR (XMLbit7). RBBM IRQ0
+  masked summary failed to reveal this; CP backend must check local status.
+  This is failure before established firmware startup, not proof ME_INIT runs.
+  0103 stages SQE separately with full volatile CPU readback and independent
+  physical IO alias check before mapping/start; start rechecks without overwriting.
+  Moves optional SCM aperture before SQE/ring base programming as Linux order.
+  Adds CP local error mask f7, captures on any started-SQE failure, halts only
+  poisoned engine then captures bounded1024-word instruction-cache bank plus
+  ACTLR/HOST_AP/SQE_AP. No reset/retry, page-zero mapping or speculative SMMU
+  change. Optional availability-query transport failures now skip like Linux;
+  advertised configuration failure remains fatal. Full acceleration absent.
+  Phone currently recovery. Need CI/hardware result before claiming any repair.
+
+- **0102 compiled and temporarily booted (2026-10-20 07:39:45 UTC):**
+  CI39386882928 SUCCESS on478dd39d6543c3744662a3dcfee10ea3bec7c7bc;
+  portable regressions SKIPPED. Artifact12247599799 ZIP60126914 bytes,
+  selected kernel CRC and published SHA matched. Kernel17241536 bytes
+  xnu/out-0102/kernel.development.sweet SHA256
+  9408a441d344f4177cd9b6662cf5df93e320b33eab2e39450491d22b0e1e8fd4.
+  Image shim/out/shim-boot-0102-cp-startup-120hz.img17272832 bytes SHA256
+  2d247c903d7614175fcb14a57c256cffa9cb52b6d79c33ed9d938c0d75ab2170.
+  Manifest research/gpu/0102-boot-manifest.json; finish-0102.log. Job log
+  tail helper build-0102-tail.log may still be downloading (session27605).
+  ADB reboot bootloader; fastboot boot Sending/Booting OKAY0.693s. No flash
+  or root edits. Wait90s then user returns FASTBOOT; boot recovery and pull
+  logs/gpu-0102-cp-startup.txt. Inspect initialTSB, aperture phase/status,
+  CP progress/FAR and SQE_STAT[0..50] on failure. Decode captured PC against
+  local a630-sqe.disasm; do not infer CPU-shadow null fault was fixed without
+  evidence. PAS/fence remain unobserved. Native iOS renderer still absent.
+
+- **Offline SQE disassembly prepared:** cloned official Freedreno/envytools
+  revision9836b7b79233f038dd2159f7480417ea54290d12 into ignored research/gpu/.
+  Built afuc-build/afuc-disasm directly with GCC/rnn sources and system libxml2;
+  no assembler, Lua, Mesa full build or global package installation required.
+  Fedora libxml2-devel2.12.10-5.fc43.x86_64 RPM signature checked OK and headers
+  extracted only into research/gpu/host-tool-root (runtime2.12.10 matches).
+  Local build.py/compile.log and sqe-disassembler-manifest.json record tool/SHA.
+  Actual device a630_sqe.fw decoded to research/gpu/a630-sqe.disasm, all local.
+  Firmware bootstrap starts atPC0; PC16 reads CP_SQE_INSTR_BASE, PC1a..1d
+  reads that memory to locate the dispatch table.0102 SQE_STAT will locate the
+  null reader. Decoding is not proof that hardware executes those instructions.
+  Tool compile has a harmless old-source unreachable macro warning; no kernel
+  dependencies changed. DNF downloaded headers only, did not import rejected
+  unrelated repository key or install packages. Keep firmware/disassembly out of git.
+
+- **0102 compiling:** CI39386882928 exactsource478dd39d6543c3744662a3dcfee10ea3bec7c7bc,
+  run_tests=false.0101 CI39386538128 canceled/superseded, no0101 image booted.
+  Host CP-Wall-Wextra-Werror compilation passes. Helpers finish-0102.py and
+  package-0102.py only fetch/hash/package on exact CI success, never device actions.
+  Temporary boot planned after success; phone OrangeFox. Full rendering absent.
+
+- **0102 further startup audit:** pinned a6xx hw_init also initializes TSB
+  control/base/size and64-bit TSB mode before SQE.0102 adds that omitted step
+  under acknowledged GPU_SET, records initial values and requires zero range
+  plus address-mode readback1. Byte offsets3e000/4/8/c,3e040 from XML.
+  Does not write SECVID_TRUST_CNTL; authenticated ZAP remains required to
+  leave secure mode. Null reader cause remains unproved until hardware log.
+  Supersede0101 CI39386538128 with0102 so the execution attempt includes both
+  audited startup prerequisites and full failure-state capture. No0101 boot.
+
+- **0101 compiling:** CI39386538128 sourcebfb7028d1fdc0135c0c57c53cf9013af458af4cc,
+  run_tests=false. Host CP-Wall-Wextra-Werror compilation passes. ARM SCM
+  assembly and XNU adapter compile via CI (local ARM clang absent). Helpers
+  finish-0101.py/package-0101.py only fetch/hash/package exact source; no
+  device actions. Phone in recovery, temporary boot planned after CI success.
+
+- **0100 hardware: shadow fixed, null READ persists /0101 implemented:**
+  User reached iOS unchanged, FASTBOOT confirmed by read-only enumeration.
+  Temporary recovery boot; logs/gpu-0100-cp-shadow.txt239079 console bytes,
+  flush13. HFI passes; CP SHADOW70010100 is now correct. ME_INIT still errno60,
+  submitted12 completed0 shadowRPTR0 WPTR12; CB0FSR402 FAR0 FSYNR0=1
+  FSYNR1=4030000. Missing shadow was NOT established as the null reader.
+  0101 adds fixed CB0 SCM aperture: optional INFO availability query forMP0c/1b,
+  advertised call uses4 value args{ffff0000,ffffffff,ffffffff,ffffffff} inx2..5.
+  Normal STD64 SIP convention retained (0x42000000 base is correct; do not
+  accidentally change to FAST). Unsupported query/call availability skips as
+  Linux; advertised call failure stops SQE. Existing PAS calls gain zero fourth
+  arg; no generic SCM exposure or secure-register fallback. Logs phase/status.
+  After a submitted CP failure, captures51 SQE_STAT words (selector2420/data2424)
+  and directRPTR/CP_STATUS1/CP_INTERRUPT_STATUS. First SMMU FAR still captured
+  before selector writes. Need CI/hardware result; full rendering absent.
+  Phone currently OrangeFox; no partition writes or iOS root edits.
+
+- **0100 compiled and temporarily booted (2026-10-20 07:20:01 UTC):**
+  CI39384752447 SUCCESS on3a679fbe99902045b6fb34f4bf6be2f2a9950bc5;
+  portable regressions SKIPPED. Artifact CRC/published SHA verified.
+  Kernel xnu/out-0100/kernel.development.sweet SHA256
+  1d4c230cc82b7145219abb7829cd99cbf681cb610fada9354741ba67db641c32.
+  Image shim/out/shim-boot-0100-cp-shadow-120hz.img17272832 bytes SHA256
+  f14a66683795414bda2aa65b414adc8e86e58b1c1b0f194bc1548dde28b76cc9.
+  Manifest research/gpu/0100-boot-manifest.json; helper finish-0100.log.
+  ADB reboot bootloader; fastboot boot Sending/Booting OKAY0.697s. No flash
+  or root changes. Wait90s for worker then user returns FASTBOOT; boot recovery
+  and pull logs/gpu-0100-cp-shadow.txt. Compare FAR, SHADOW70010100, shadow
+  RPTR/WPTR12 and CB0FSR; if ME_INIT completes inspect subsequent PAS/fence.
+  Full renderer/native iOS ABI still absent; no acceleration/lag claim.
+
+- **Further CP audit, not implemented:** pinned adreno_hw_init optionally
+  queries and invokes qcom_scm_set_gpu_smmu_aperture(CB0) before SQE. Protocol
+  qcom_scm.h: MP service0x0c, command0x1b,4 value args{ffff0000,ffffffff,
+  ffffffff,ffffffff}; INFO query as usual. Current restricted PAS transport only
+  supports3 args and does not implement this prerequisite. If0100 still faults,
+  audit this path and capture SQE_STAT before changing mappings. Do not claim
+  that SHADOW0 caused FAR0: syndrome is a READ, and shadow writes alone are
+  not proof of the null reader. Linux CP progress shadow path is nevertheless
+  a real missing implementation fixed by0100. No SCM aperture call was attempted.
+  Local pinned a6xx_gpu_state.c documents indexed-register auto-increment;
+  use bounded51-word CP_SQE_STAT capture (addr0x2420,data0x2424) after failure
+  if needed, then decode PC with official Mesa qrisc tools. No raw memory probe.
+
+- **0100 compiling:** CI39384752447 source3a679fbe99902045b6fb34f4bf6be2f2a9950bc5,
+  run_tests=false. Host CP compilation-Wall-Wextra-Werror succeeds with latest
+  0089 core header and0097 DMA header (an initial attempt selected outdated
+  0088 header and failed on the missing GMU fence macro; corrected include path).
+  Helpers finish-0100.py/package-0100.py only fetch/hash/package exact source;
+  no device actions. Current device recovery, plan temporary boot after success.
+
+- **0099 hardware fault captured /0100 shadow fix (2026-10-20):**
+  User reached iOS unchanged, returned FASTBOOT. Temporary recovery boot and
+  logs/gpu-0099-cp-fault.txt pull:229110 bytes flush10. GMU/HFI still passes.
+  ME_INIT errno60, FAR0 FSYNR0=1(read,L1), FSYNR1=0x4030000, SID0;
+  SQE70000000/RING70008000 correct, SHADOW0, CB0FSR402, RPTR0/WPTR9.
+  Null access established, shadow as its cause remains a hypothesis.
+  Pinned Linux allocates shadow for WHERE_AM_I-capable SQE and reads its memory
+  instead of CP_RB_RPTR.0100 programs mapped shadow70010100 (CPUoffset14100),
+  initializes it before SQE, verifies register readback, appends WHERE_AM_I to
+  every publish and uses validated shadow for ring progress. Same20 mapped
+  pages, no zero-page mapping, no generic trust-register bypass. Records real
+  submitted/completed DWORDs including3-word WHERE_AM_I. Fence offsets0/4
+  stay separate. Need CI then hardware result; no rendering fix claimed.
+  Also audited preemption: pinned Linux returns immediately for single ring,
+  so no invented preemption records added. Phone currently OrangeFox.
+
+- **0099 compiled and temporarily booted (2026-10-20 07:03:13 UTC):**
+  CI39383140126 SUCCESS on6a4de0a69b69e146141ce92970429953ec357d2c,
+  portable tests SKIPPED. Artifact CRC and published SHA verified.
+  Kernel xnu/out-0099/kernel.development.sweet17241488 bytes SHA256
+  ed9798dddad9da9fc2ac12b686b42655c7b8fc04dd0320fb4d788408e5320cfc.
+  Image shim/out/shim-boot-0099-cp-fault-120hz.img17256448 bytes SHA256
+  cad9736b94b1652ee6db0a4ced5d5fa9cebcb56f06245e34555aa0f669d3f595.
+  Manifest research/gpu/0099-boot-manifest.json, helper finish-0099.log.
+  ADB reboot bootloader, fastboot boot Sending/Booting OKAY0.699s. No flash
+  or root edits. Wait90s then user must return FASTBOOT; boot recovery and
+  pull logs/gpu-0099-cp-fault.txt. Inspect first FAR/syndrome and SQE/ring bases
+  to resolve0098 CB0FSR0x402. This is a diagnostic image, not a lag fix.
+
+- **0099 fault capture compiling:** exactsource6a4de0a69b69e146141ce92970429953ec357d2c,
+  CI39383140126, run_tests=false. Earlier39383070320 canceled to ensure GPU
+  diagnostic register pairs use32-bit bus accesses. Includes all0098 changes
+  plus first-fault VA/syndrome/address readback; no speculative mapping changes.
+  Local helpers finish-0099.py/package-0099.py prepare integrity-verified image
+  only after exact CI success. They never boot the phone. Current device recovery.
+
+- **0098 hardware result: HFI passes, CP translation fault (2026-10-20):**
+  User reached iOS with unchanged performance and returned to FASTBOOT.
+  Temporary recovery boot succeeded; logs/gpu-0098-sqe-cp.txt contains234926
+  console bytes, flush13. GMU boot errno0 phase6, FW0x10110000; all5 HFI
+  replies succeeded, no drops, queue indices drained. CP map20 pages+guard
+  passed (CB0 slot1); ME_INIT timed out phase2, submitted9 completed0,
+  RPTR0 WPTR9 status0x800005 IRQ0 CPfault0. CB0FSR0x402 vs CB1FSR0x400:
+  actual GPU translation fault, not the earlier Format-only false failure.
+  Fault VA/syndrome were not logged by0098. Patch0099 captures FAR, FSYNR0/1,
+  stream SID, TTBR0/TCR/SCTLR and GPU SQE/ring/shadow register readback before
+  any clearing/probe. Do not infer which address faulted without this evidence.
+  PAS and fence path never reached; full acceleration remains absent.
+  Phone in OrangeFox; no partitions flashed, no root edits.0098 manifest updated.
+  Local build-0098.log fetch failed HTTP2; CI success and artifact hashes were
+  checked, but do not claim the incomplete file is a saved complete build log.
+
+- **0098 compiled and CP attempt booted (2026-10-20 06:45:06 UTC):**
+  CI39381215265 SUCCESS on d110d0d; includes0093 high-bank fix and0095-0098
+  SMMU/HFI/CP changes. Portable regressions SKIPPED. Kernel artifact12245856852
+  xnu-kernel ZIP60106156 bytes, selected entry CRC/SHA matched.
+  Kernel xnu/out-0098/kernel.development.sweet SHA256
+  97c6ad6496ef1ac9af374723c241299c1c18dfdac976ef3c2882fbea5c5e84b4 (17241488 bytes).
+  Stage9 shim/out/shim-boot-0098-sqe-cp-120hz.img SHA256
+  804c87ff169ca5a6857efcf2e3914b73635c07494821857ab1f66c44123fd613 (17256448 bytes).
+  Manifest research/gpu/0098-boot-manifest.json, build log build-0098.log,
+  helper output finish-0098.log. Firmware ADT sweet-0096-cp-firmware.adt.
+  ADB rebooted recovery to bootloader; fastboot boot returned Sending/Booting
+  OKAY (0.720s). No flash/root edits. **Await fresh driver log after90s**;
+  bootloader acceptance does not prove iOS boot, HFI, SQE/CP, ZAP or fences.
+  User requested attempting execution. Full graphics ABI/renderer and lag fix
+  remain unfinished; no accelerator service or performance success is claimed.
+
+- **0098 final CP audit build dispatched:** commit
+  d110d0d (full source hash in git) pushed; CI39381215265 compiles patches
+  through0098 with portable regressions skipped. Older0096 CI39380282997 and
+  0097 CI39380737829 superseded/canceled; no images from those runs booted.
+  Local firmware ADT shim/out/sweet-0096-cp-firmware.adt contains verified
+  device GMU/SQE/signed ZAP metadata/code. Helpers finish-0098.py and
+  package-0098.py prepare a stage9 image when the exact CI source succeeds.
+  Both helpers perform only download/integrity/packaging, never device commands.
+  Device is in recovery after reading0095. Native iOS integration investigation
+  confirms AGXMetalA11 and Apple Metal/OpenGLES bundle identities; a standalone
+  AGX executable is not resolved by the HFS reader. No userclient/renderer ABI
+  has been decoded, and no fake accelerator class is registered. Full rendering
+  and the requested lag fix remain unfinished.
+
+- **CP clock/fence audit (0098):** source audit added the required legacy
+  DCVS request selecting performance index1 (180MHz) before GPU_SET/GX access.
+  ARC voltage selection alone does not set GX frequency. Bounded OOB23/ACK31
+  handshake, DCVS_RETURN check. Fence visibility is polled separately after
+  ring drain; posted AXI writes cannot be assumed immediately CPU-visible.
+  Added post-ME_INIT SMMU fault snapshots. Host CP C compilation succeeds;
+  local ARM compile helper is unavailable because ~/swift/usr/bin/clang is
+  absent. Full compile must use macOS CI. Source3005b17 CI39380737829 is
+  superseded for CP hardware work by this final audit refinement. No CP
+  execution or native iOS acceleration has been observed yet.
+
+- **0095 hardware: GMU actually runs; HFI INIT blocked (2026-10-20):**
+  user reported iOS boot and returned toFASTBOOT. Temporarily booted recovery;
+  pulled logs/gpu-0095-gmu-hfi.txt (256695 console bytes, flush19), SHA256
+  b6f74f35c647c652f94c677f0024917c3d3d068bcebf07168d979f60a1809a64.
+  All16 SMMU pages/guard passed; FSR0x400 now correctly treated as metadata.
+  CB0 SCTLR=0, stream slots1..4 free, slot0 correctly routes5 toCB1.
+  xo.lvl cmdDB address confirmed **0x30090**, levels0,32,80,128.
+  MIN_SVS votes both0x400202. GMU boot errno60 phase5, HFICTRL_STATUS1:
+  M3 init, GX OOB and SPTPRAC passed; HFI INIT/version exchange did not.
+  No CP commands ran.0096 implements CP backend, initial CI39380282997.
+  Patch0097 aligns HFI ACK timeout with Linux's1s (ours incorrectly10ms),
+  matches echoed command ID+sequence (actual ACK type/length still checked),
+  and captures queue/doorbell/SMMU/response diagnostics. Rebuild before
+  attempting stage9. Phone currently in recovery; no flash/root modifications.
+
+- **SQE/CP backend implementation in progress (2026-10-20):** patch0096
+  adds private 96K wired GPU allocation, 4K tables for inactive CB0/exact SID0
+  (ASID0x62), 20 page probes + guard, RO/executable SQE and RW/NX ring/fence.
+  Separate PAS metadata page cannot overlap GMU/GPU data. Kernel-only CP path
+  waits for GMU GPU_SET acknowledgement, starts SQE with 32K ring and A618
+  protection ranges, submits ME_INIT, then requires signed ZAP PAS13 auth
+  before CP_SET_SECURE_MODE and memory-write/cache-flush fence readback.
+  No direct SECVID_TRUST_CNTL fallback, generic SCM access or userspace PM4.
+  Live reserved ZAP range is 0x97f15000/0x2000, not mainline's different range.
+  Firmware tool now accepts optional checksum-verified vendor SQE/MDT/B02;
+  blobs stay local. Host CP/SMMU C compilation succeeded; not yet exercised.
+  This is command-engine bring-up, not native iOS rendering. Do not register
+  IOAcceleratorES as a successful stub: backboardd expects an actual userspace
+  rendering/driver ABI. Captured log repeatedly matches IOAcceleratorES and
+  IOAcceleratorESLegacy -> none. Native graphics integration remains a real
+  separate implementation requirement; no lag fix is claimed.
+  0095 CI39379234572 succeeded on46ea342; image
+  shim/out/shim-boot-0095-gmu-hfi-120hz.img SHA256
+  1100ea6d93ed99a2cbebd58b18d76eea3232eb6907ddd979fc06f5077981ab5a.
+  Rebooted recovery to bootloader and temporarily booted0095 (Sending/Booting
+  OKAY,0.675s). Awaiting user return toFASTBOOT to read GMU result while
+  implementing CP. No flash/root changes. Earlier build-only direction was
+  superseded by user request to execute GPU commands and fix graphics.
+
+- **0094 booted iOS; SMMU false failure found (2026-10-20):** user reports
+  successful home screen, unchanged performance; now requests actual SQE/CP
+  execution and iOS graphics integration. User returned to FASTBOOT on request.
+  Temporarily booted recovery and pulled `logs/gpu-0094-gmu-hfi.txt`: 239956
+  console bytes, flush #15. DMA allocated PA=0x1047e8000; previous truncation
+  panic did not recur. All 16 pages translated and unmapped guard faulted.
+  Stage 8 stopped errno=5 because cleanup wrongly required the entire FSR to
+  clear; read-only Format[10:9]=2 leaves 0x400. ARM IHI0062D.c 16.5.9 confirms
+  Format is not a W1C fault. Patch0095 masks actual fault bits, keeps stalled
+  status fatal, and logs nonsecure CB0/stream baseline for the CP backend.
+  GMU stayed reset; no HFI transaction or GPU command executed on 0094.
+  The latest instruction authorizes attempting GPU command execution, superseding
+  the earlier no-test/build-only direction. Full acceleration is still absent;
+  do not claim a lag fix without rendering and iOS integration evidence.
+
+- **0094 temporary boot sent (2026-10-20):** user explicitly superseded
+  build-only direction and requested booting the new image from FASTBOOT.
+  Rechecked image SHA-256
+  `053fda6fa9e9515c05ef1006d6532e60914f05c7f63c5bf79111c789518cb31a`.
+  `fastboot boot shim/out/shim-boot-0094-gmu-hfi-120hz.img` returned Sending
+  OKAY (0.525 s), Booting OKAY (0.130 s), total 0.673 s. No partition flashed.
+  Bootloader accepted the image; iOS startup and GMU/HFI results pending.
+  Allow at least 90 seconds for the deferred GPU worker (scheduled after 60 s).
+  Need screen result and a fresh log before claiming startup success or that
+  the previous panic is resolved. Full GPU acceleration remains unfinished.
+
+- **0094 compile-only artifact complete (2026-10-20):** implementation
+  commits `ca70c43` and `4a6565767c523387f1fa3dbbdea3909ab16febeb` are pushed to
+  `myfork/codex/adreno-power-audit`. Includes existing 0093 high-bank repair.
+  CI `39377419088` **SUCCESS** on exact source 4a65657; kernel build/link and
+  embedded-code checks succeeded, portable test step **SKIPPED** (run_tests=false).
+  Kernel artifact `12243978150` (xnu-kernel, ZIP 60117274 bytes); selected kernel
+  entry CRC and published SHA-256 matched. Kernel
+  `xnu/out-0094/kernel.development.sweet` (17273616 bytes), SHA-256
+  `5cb7fcbe81ff39b06b7429dfe9bdcafb5da3a7f7c5ea6e2243dfb4d3ffbab69b`.
+  Local stage-8 image `shim/out/shim-boot-0094-gmu-hfi-120hz.img`
+  (17215488 bytes), SHA-256
+  `053fda6fa9e9515c05ef1006d6532e60914f05c7f63c5bf79111c789518cb31a`.
+  Manifest `research/gpu/0094-boot-manifest.json`; finish/package helpers
+  `research/gpu/finish-0094.py`, `research/gpu/package-0094.py` and log
+  `research/gpu/finish-0094.log`. Reused known shim/base DTB and unchanged
+  firmware ADT (SHA-256 73f9c127...76b320). Presentation target stays 120 Hz;
+  this proves neither panel scan rate nor rendered FPS. **No tests, temporary
+  boots or flashes; installed root image and phone untouched this turn.**
+  New opt-in sweetgpu=8 executes GMU/PDC/RSC cold boot plus HFI initialization;
+  it is untested on hardware. **Full GPU acceleration is still absent**:
+  ZAP/SQE, GPU stream mappings, CP submission/fences, host interconnect policy,
+  recovery/thermal management and the native iOS graphics ABI remain unfinished.
+  Do not present this artifact as a lag fix or as verified to boot. Next code
+  work is the protected firmware / SQE / CP hardware backend, then actual
+  rendering and iOS integration. User's latest direction remains build only.
+
+- **Current request: build only, no tests (2026-10-20):** user supplied a
+  phystokv_range panic photo after another agent's 0092 attempt. Reviewed new
+  commits through `9de2ec6` (also remote branch HEAD). Photo reports an illegal
+  low PA with physical base 0x100000000. The original cache-attribute flush
+  shifts a 32-bit ppnum_t before widening; `0093-sweet-highmem-cache-sync.patch`
+  correctly uses ptoa(), whose XNU macro casts to vm_address_t before shifting.
+  This explains a high-bank DMA allocation panic, but has not been confirmed
+  by a subsequent boot. Preserve this fix. Latest local stage-7 capture stops
+  after SMMU IDs, before TCM/DMA completion markers; it does not itself record
+  the pictured panic or prove an exact failing call stack. Stage-6 control
+  capture records 32768 verified TCM bytes and errno=0. Neither is evidence of
+  GPU execution. User explicitly requests implementation/build without tests:
+  **do not boot/flash, run portable regressions or device tests this turn.**
+  Implemented ordered patch 0094 (`ca70c43`, refinement follows): polled legacy HFI RPC with echoed-header
+  validation, bounded ACK/debug queues, fault/timeout poisoning, INIT/version/
+  performance/bandwidth/end-init exchange, and A618 PDC/RSC/M3/GX handshake.
+  Capture `gpu-0092-dma-hfi.txt`: 170228 bytes, SHA-256
+  `c84980e78eb2a8723aebfd7fcca806deedf903c3337c7aa4a024715613cc31b8`.
+  Capture `gpu-0092-stage6.txt`: 269447 bytes, SHA-256
+  `a93b8c64ef39395868f21900af29f2c2748c484dc5da26e1cdb322d36d96d213`.
+  New opt-in `sweetgpu=8`; stages 1-7 keep their prior behavior. Uses documented
+  minimum 180 MHz GPU / 200 MHz GMU OPPs and raw command-DB ARC votes. This is
+  GMU firmware startup infrastructure, **not CP/SQE submission or native iOS
+  graphics acceleration**. Host interconnect bandwidth, protected ZAP/SQE,
+  GPU stream mappings, command execution/fences, recovery/thermal management,
+  and the iOS graphics ABI remain unfinished. Editable sources:
+  `research/gpu/0094-work/`; CI tests are now separately selectable. Initial
+  build `39377178087` on ca70c43 was dispatched with run_tests=false; its test
+  step is confirmed skipped. Final source audit pinned the RPMh binding:
+  MIN_SVS=48 (GFX/CX raw tables round to64, MX to192); adjusted selector to use
+  the binding value, added RSC idle and AO/CM3 fault checks. Rebuilding that
+  refinement on `4a6565767c523387f1fa3dbbdea3909ab16febeb`, CI
+  `39377419088` (run_tests=false). C HFI/GMU compilation passed with
+  -Wall -Wextra -Werror; no binaries/tests were executed. Superseded initial
+  CI was explicitly canceled; no hardware operations. Older 0093-only CI `39375252490` on
+  9de2ec6 also succeeded, but no repaired hardware boot is recorded.
+
+- **0091 hardware pass / 0092 DMA backend (2026-10-20):** user reported
+  iOS boots but performance remains poor; requested working driver using
+  latest information. Temporarily booted OrangeFox and pulled
+  `logs/gpu-0091-gmu-tcm.txt` (229047 bytes, flush #13), SHA-256
+  `f2bc97421bb61a8dd1ceef684691360401cede2f8e991e30175ad23e631697ac`.
+  **All six GMU/SMMU clocks PASSED**, GMU SYSRESET=1, POWER_STATUS=0xd4,
+  AHB_FENCE_STATUS=0. SMMU IDR0=0x48016605, IDR1=0x20008005, IDR2=0x7511.
+  **All 32768 GMU firmware bytes uploaded and read back correctly.** M3
+  remains reset; no commands execute, so no performance increase expected.
+  Implementing patch 0092 with actual uncached wired DMA allocation, 4K
+  SMMUv2 translation tables and bounded legacy HFI queue transport.
+  Stage 7 maps only the 64K GMU shared region, using inactive CB1 and a
+  free exact-match stream slot for GMU kernel stream 5. CB0/GPU stream 0,
+  user stream 4 and protected banks remain untouched. Hardware ATOS must
+  verify all 16 pages and an unmapped guard before publishing stream 5.
+  Requires fresh M3 reset, GX collapse/clamp, measured ID profile, free
+  context and no existing matching stream. Buffers retained on failure.
+  HFI has bounds/space/packet checks; no firmware execution or accelerator
+  service is implemented. Also inspects `xo.lvl` read-only for PDC resource
+  identity (write whitelist unchanged). Host C compilation passed for
+  SMMU/HFI, source list and BSD patch application checks passed. Next:
+  CI `39352692300` rejected the new-file diff headers before compiling
+  (`dev/null: No such file or directory`). Added explicit new-file modes;
+  complete patch application including all new files now passes and matches
+  editable sources byte for byte. Replacement CI `39353002324` superseded
+  before boot: allocator now clears inhibited-cache memory with aligned
+  volatile words instead of bzero (avoids Device-memory DC ZVA faults).
+  Complete patch revalidated. CI `39353648283` also superseded before boot:
+  ARM SMMUv2 spec audit found AFE/TRE readback is UNK/SBOP for long
+  descriptors; compare only defined control fields, and test CB1.M for
+  inactive state rather than requiring every reset bit zero. Reject all-ones
+  PAR even on guard probes. CI `39354082431` succeeded on exact source
+  `f0c5dab` (kernel artifact `12233929276`, `xnu-kernel`); the artifact was
+  re-downloaded and its ZIP CRC passed. Kernel SHA-256
+  `1ff583218737c86ecac55ae829301671b51c6011ad4b33af9e6a303a1a1b73b7`
+  (17257032 bytes) matches `xnu/out-0092` byte for byte. An independent
+  `tools/mkpayload.py` rebuild produced payload SHA-256
+  `a4cec076aaaddb14f300a217075478095d2f3aa6d346cdfa82bec996ab07d822`,
+  and a fresh shim rebuild produced stage-7 image
+  `shim/out/shim-boot-0092-dma-hfi-120hz.img` (17215488 bytes, SHA-256
+  `325cae1dc265472941a67fdf7dbfb354c5f7e0c1ce867b8707d230adbd481750`);
+  both are byte-identical to the artifacts codex built. Bootv2 unpack round
+  trip matches the payload. Embedded ADT SHA-256
+  `73f9c127a087755491fe2cd01fdb81d8b6b35007fa0410bab2dafe928a76b320`;
+  GMU firmware CRC32 `0x574c0d4b`/SHA-256 `9ef10b2b...bbacbf2e` matches the
+  local 32768-byte blob and stored ADT properties. Manifest
+  `research/gpu/0092-boot-manifest.json`. Next: temporary boot on the
+  connected FASTBOOT phone, wait at least 90 s, then pull
+  `logs/gpu-0092-dma-hfi.txt`. Editable sources `research/gpu/0092-work/`.
+  Root image unchanged, no flash.
+
+- **0091 verified build / temporary boot (2026-10-20):** CI
+  `39350600573` succeeded on `2743562bdff764a27cccdb105d84577d5d1c8c4c`;
+  portable regressions, XNU compile and built-kernel markers all passed.
+  Kernel artifact `12232857474` (ZIP 60034907 bytes), CRC/SHA verified.
+  Kernel `xnu/out-0091/kernel.development.sweet` SHA-256
+  `913878692b86b2f37dd85fb8e75b4f55e8b1d54e04c6899a529a9c89e79930c2`.
+  Stage-6 image `shim/out/shim-boot-0091-gmu-tcm-120hz.img` SHA-256
+  `63de6f0be72a48a5856466f1919095e6ca94548ff1f2c49465430c3224dc61b3`.
+  Packaging kept the known shim/base DTB and 0089 firmware ADT; bootv2
+  unpack round trips passed. Manifest `research/gpu/0091-boot-manifest.json`.
+  Rebooted OrangeFox to bootloader and `fastboot boot` stage 6 returned
+  Sending/Booting OKAY (0.690 s). Await at least 90 seconds for the 60-second
+  worker and user boot result; return to FASTBOOT, temporarily boot OrangeFox,
+  pull `logs/gpu-0091-gmu-tcm.txt`. No flash or root-image changes. Hardware
+  clock/firmware results pending; rendering is still unimplemented.
+
+- **0090 hardware result / 0091 correction (2026-10-20):** user confirmed
+  iOS reached home screen and returned to FASTBOOT. Temporarily booted
+  OrangeFox and pulled `logs/gpu-0090-gmu-tcm.txt` (242594 bytes, flush #12),
+  SHA-256 `2e49f50db1c9e57e87adfb7df627387e4c16c1fc09d0f29cbe88da08f48cfbee`.
+  CX passed. GCC three branches, required GPUCC CXO and AHB passed
+  (`completed=5`). Next extra GPUCC CX_SNOC_DVM at `0x108c` returned zero
+  after enable: `errno=5`. No GMU/SMMU ID read or firmware upload.
+  Audited both full clock lists: GMU uses CX_GMU, CXO, DDRSS AXI, MEMNOC;
+  SMMU uses GPUCC AHB, GCC MEMNOC and GCC SNOC_DVM_GFX. Neither uses
+  GPUCC CX_SNOC_DVM. Patch 0091 removes this second extra dependency;
+  six unique required branches remain, including GCC SNOC. Host regressions
+  pass with both unused gates zero and assert no access to either; required
+  CXO failure still stops setup. Next: build and temporarily boot 0091,
+  capture `logs/gpu-0091-gmu-tcm.txt`. Commit `2743562`; CI
+  `39350600573` passed; stage-6 temporary boot underway, see above.
+
+- **0090 built and temporarily booted (2026-10-20):** CI
+  `39349325350` succeeded on exact source `2054211`, including portable
+  regressions, XNU compile and kernel marker checks. Kernel artifact
+  `12233165630` (ZIP 60034241 bytes) CRC/SHA verified; local kernel
+  `xnu/out-0090/kernel.development.sweet` SHA-256
+  `9e47bad1b65e5e0a2d5e207d966bc70557939dec0f609fe2193c02af0e843d30`.
+  Packaged images with preserved shim/base DTB and 0089 firmware ADT;
+  bootv2 unpack round trips passed. Stage-6 image
+  `shim/out/shim-boot-0090-gmu-tcm-120hz.img` SHA-256
+  `acf0b27a1a0870ab7a535ac2685bbba299ff990848ac74a8c06235442c9d134a`.
+  Manifest `research/gpu/0090-boot-manifest.json`.
+  Rebooted OrangeFox to bootloader and temporarily booted stage 6:
+  Sending/Booting OKAY (0.674 s). User reached iOS; retained log collected
+  in OrangeFox, see above. No flash; no rendering acceleration.
+
+- **0089 hardware log / 0090 correction (2026-10-20):** user confirmed
+  stage-6 image reached iOS and returned to FASTBOOT. Temporarily booted
+  OrangeFox and pulled `logs/gpu-0089-gmu-tcm.txt` (248135 bytes, flush #14),
+  SHA-256 `d6f20d210f4e295b35b1428893574a8e84d997720e16114dd8a601e3166f2705`.
+  CX passed again; GCC PLL checks and three bus branches passed. Clock setup
+  stopped with `errno=5 block=0 offset=0x1004 value=0 completed=3`:
+  CXO_AON enable did not read back. No GMU/SMMU status read or firmware upload
+  occurred. This is a failed clock-stage check, not a firmware failure.
+  Pinned SM7150 GMU DT lists GMU, CXO, DDRSS AXI and MEMNOC clocks; it does
+  not request CXO_AON. Patch 0090 removes that extra branch, retaining
+  required CXO/GMU and bus checks. Regression covers zero-valued unused AON
+  with no access, and required CXO stuck-off still failing. Portable checks
+  passed. Commit `2054211`; CI `39349325350` running on that exact source.
+  Next: capture the 0090 hardware log after its temporary boot; see above.
+
+- **0089 verified build artifacts:** CI `39347214431` succeeded on
+  `b1a4b3c`, including portable checks, XNU compile and kernel marker checks.
+  Kernel `xnu/out-0089/kernel.development.sweet` SHA-256
+  `6d0f9903c9c0f97c1ecce4c56e0d24955900af21b1669b23e5edfbd08549fda8`.
+  Tested stage-6 image `shim/out/shim-boot-0089-gmu-tcm-120hz.img` SHA-256
+  `c92cf13ed47b6fcb60f5559d1023cd836da3d1a7cadf2c181ac10fef57440911`.
+  Manifest `research/gpu/0089-boot-manifest.json`; firmware ADT
+  `shim/out/sweet-0089-firmware.adt`. Rendering remains unavailable.
+  Next execution research: `research/gpu/smmu-gmu-next.md`.
+
+- **0089 postmarketOS GMU port in progress (2026-10-20):** user requested
+  continuing toward full acceleration using postmarketOS's Redmi Note 10 Pro
+  sources. Pinned sm7150-mainline/linux revision
+  `fd78d17954a86ea6ceb0c535e618ea129e09f8dd` (v7.2 branch); reference files and
+  SHA-256 manifest in `research/gpu/pmos-pinned/`. Important correction:
+  Linux deliberately uses a no-op GX power-domain enable; the GMU owns GX
+  startup. Do not restore the old manual GX reset experiment.
+  Patch 0089 implements the GPUCC/GCC GMU 200 MHz clock sequence, validates
+  the inherited fixed GPLL0 rate, retains shared votes and checks branch/RCG
+  status with deadlines. `sweetgpu=5` runs CX plus clocks and reads only
+  CX-side GMU status and SMMU IDs; `sweetgpu=6` additionally uploads the raw
+  32 KiB firmware into TCM only while SYSRESET is already asserted, checking
+  CRC and every uploaded word. It never releases the M3. GPU core accesses,
+  firmware execution, SMMU configuration and rendering remain absent.
+  Firmware ADT packaging: `tools/sweet-adreno-firmware.py`, local blob only,
+  mandatory expected SHA-256; no blobs committed or included in CI.
+  `python3 tools/check-adreno-core.py` passed host checks for power/PLL
+  preconditions, bit preservation, stuck bus/RCG/UPDATE, invalid reads,
+  malformed/corrupt firmware, reset ownership and partial upload failure.
+  Patch applied to complete pre-0089 sources and host compilation passed.
+  First CI `39346823712` is superseded by the PLL-mode correction: follow
+  Linux ACTIVE polling in vote mode and accept an inherited running direct
+  mode without changing its controls. Both cases pass host checks. Replacement
+  CI pending; no 0089 hardware result. Phone absent from host ADB and fastboot
+  on this continuation; user was asked to connect it in FASTBOOT.
+  Editable sources: `research/gpu/0089-work/bsd/dev/`.
+
+
+- **0088 new core / fresh audit (2026-10-19):** user requested a new driver
+  based on Linux/Freedreno after repeated failed attempts. Pulled
+  `logs/gpu-reaudit-20261019.txt` from OrangeFox; SHA matches `gpu-cx-power.txt`
+  exactly, so there is no newer captured hardware result. Audited all seven
+  text logs: no GPU command completion, no accelerator service. Patch 0088
+  adds a separate portable A618 CX/PM4/ring core and XNU power adapter; removes
+  unsafe core aperture reads and disables the incomplete stage-5 GX sequence.
+  It adds fresh MX/CX resource checks, all-ones rejection and power settling.
+  PM4/ring code is not attached to hardware: firmware, SMMU, clocks and the iOS
+  graphics interface remain absent. **This is not full acceleration.** See
+  `docs/adreno-port.md` for exact reuse, audit and remaining dependencies.
+  Portable C host compilation succeeded (`gcc -Wall -Wextra -Werror`), and
+  patch application to the 0087 sources succeeded. Cross-GCC has no libc
+  headers here; first CI run `39298707871` rejected the short-context bsd/conf/files
+  patch hunk before compiling. Expanded it to the full surrounding entries;
+  replacement CI `39299055941` succeeded on `7321f15`, including the
+  built-kernel marker checks. Kernel artifact downloaded and checksum-verified:
+  `xnu/out-0088/kernel.development.sweet`, 17,240,104 bytes, SHA-256
+  `0d1750b798bb569ed6d7071b764c84782092052c2df77579f47d59fed8066439`.
+  Packaged `shim/out/shim-boot-0088-a618-cx-120hz.img` (stage 4, 120 Hz,
+  same ADT as 0087, cmdline ends `sweetfb_noconsole=1 sweetfb_hz=120
+  sweetgpu=4`), SHA-256
+  `9d495db439da798f2013cbc79b0d4da7a354aebf27b3f0b5735b0d2251fdedce`
+  (payload `634822b8862377c84349caba6b2626c70a5aac0c24277995f2dcf4ca050687ff`);
+  bootv2 unpack round-trip matches the payload.
+  **Booted 2026-10-19 ~23:53 local; stage 4 CX power PASSED on hardware.**
+  Touch worked (GT9896, pid 0x39383936 = "9896", fw 03.02.00.0c). At 60 s
+  the A618 core logged `SWEET ADRENO: CX result errno=0 control=0xf8228000
+  status=0x80001fe0 waited_us=1` (status bit 31 set) and finished; no panic,
+  display and touch survived. This is the first verified GPUCC CX power-up
+  under XNU. Rendering is unchanged: `backboardd` still matches
+  `IOAcceleratorES -> 0 found`; 0088 performs no GPU core access and stage 5
+  remains disabled. Log `logs/gpu-0088-a618-cx.txt` (277,866 bytes, flush
+  #25, SHA-256
+  `d2d9582d458b68a118db580a31e085f06acf17be7fa4826d47ed3e9c33e77946`,
+  ignored); raw ring `logs/gpu-0088-a618-cx.txt.bin`. Phone returned to
+  fastboot; no flash.
+  Sources: `research/gpu/0088-work/bsd/dev/` (editable), patch 0088 (tracked).
+
+
+- **0087 stage-4 attempt inconclusive (2026-10-19 ~23:07 local, read first):**
+  `fastboot boot shim/out/shim-boot-0087-cx-power-120hz.img` booted and
+  reached SpringBoard, but the 45 s SweetTouch probe read an all-zero Goodix
+  info page (`0x4022` zeros, `pid=00000000`) and logged
+  `SWEET TOUCH: no unique supported IC (goodix=0 fts=0 dead=0); stopping`;
+  touch was dead. The 60 s marker `GPUCC CX power v1 starting` is absent
+  from the log, so the CX GDSC write never executed: this is **not** a CX
+  gate result, and the touch code is unchanged from 0086 (whose probe
+  selected GT9896). No panic. The phone was force-rebooted before 60 s and
+  is now in OrangeFox. Read-only log: `logs/gpu-cx-power.txt` (167,754
+  bytes, flush #5, SHA-256
+  `daa90d47582dcd4f8decb37ea8792e667bb596c758853ee70d812ca972ee1876`).
+  Next: cold-boot and retry stage 4, or fall back to the 0086 image; stage 5
+  remains blocked.
+- **0086 hardware result: raise-only `gfx.lvl` passed (2026-10-19 ~21:35
+  local):** the 0086 image booted on the phone; iOS reached SpringBoard and
+  stayed usable (lag remains, as expected with no GPU). At
+  60 s the kernel re-read `mx.lvl` (`0x3`, level 321) and `cx.lvl` (`0x5`,
+  level 257) read-only, then read `gfx.lvl` (`0x0`, level 1), wrote selector
+  2 (consumer level 65, LOW_SVS), and read back `0x2`; the log records
+  `ARC gfx.lvl raise verified selector=2 vlvl=65`. No panic; touch and
+  SpringBoard continued after the write; GPUCC stayed collapsed and no
+  rendering changed. Read-only pull: `logs/gpu-gfx-raise.txt` (flush #27).
+  This proves the APPS ARC level vote is stored/readable on this board; it
+  does not prove the rail voltage moved. Patch `0086-sweet-adreno-gfx-raise`
+  commit `065acbd`, CI run `39277061501` succeeded. Kernel SHA-256
+  `f7f95c9f4ff87a0856e2b5149577cd974c1a292b2220ab524fed99503a31aa95`;
+  image `shim/out/shim-boot-0086-gfx-raise-120hz.img` SHA-256
+  `536da97e93168dfb361b4ceb9bf1c576fe2066a2a99035174734c188f735d8bc`.
+- **0087 built and packaged; stage-4 attempt made (2026-10-19 ~23:05 local):** patch
+  `0087-sweet-adreno-gpucc-power.patch` adds `sweetgpu=4` (CX GDSC power,
+  then a GPU-aperture register read only if the AHB CBCR reports a running
+  clock) and `sweetgpu=5` (raise-only `gfx.lvl`, then CX, then GX BCR pulse,
+  clamp release and GDSC poll). It mirrors the downstream `qcom,gdsc`
+  enables; there are no parent-rail, PLL, RCG, branch-clock, GMU or SMMU
+  writes. Editable sources: `research/gpu/0087-work/bsd/dev/sweet_gpu.c`.
+  The patch chain (0086 then 0087) was verified with `git apply` against
+  the pre-0086 sources. The old `RBBM_IDENTIFIER` name was wrong: the public
+  A6XX register database has no chip-ID register, so the aperture read logs
+  `RBBM_*`, `CP_RB_*`, `CP_HW_FAULT` and `VBIF_VERSION` and the live-DT
+  chip ID `0x06010800` stays the identity reference. CI run `39289968547`
+  is green on commit `f6f8624` (an earlier run `39286495743` compiled but
+  failed only because the CI stage-5 marker string was wrong; fixed in
+  `f6f8624`). Kernel `xnu/out-0087/kernel.development.sweet` is 17,239,704
+  bytes, SHA-256
+  `84e2df9780567378af72a955de421c05abb124df3c8d42c07ed02a860f7e8ae7`.
+  Images: `shim/out/shim-boot-0087-cx-power-120hz.img` (stage 4, SHA-256
+  `e492aada0c1c495fca92ca599b09c24427a3a3c04d6a38b40435fac2cbbcee59`) and
+  `shim/out/shim-boot-0087-cx-gx-power-120hz.img` (stage 5, SHA-256
+  `691a95865b237cff388b340097d2c08a1cfb38da9dbfcfc40b976f5b6244f728`).
+  **Stage 4 was approved and attempted once (see the top bullet); the
+  result is inconclusive because the CX write never ran. Stage 5 is not
+  approved and remains blocked until the CX gate passes.**
+- **0085 hardware result (2026-10-19 20:12):** booted
+  `shim/out/shim-boot-0085-arc-readback-120hz.img` with
+  `sweetfb_hz=120 sweetgpu=2`. Read-only pull:
+  `logs/gpu-arc-probe-agent.txt` (486,461 bytes, flush #432); the user's own
+  `logs/gpu-arc-probe.txt` may be a duplicate. iOS reached SpringBoard with
+  eight CPUs, touch and framebuffer updates; no panic. The 0084 ARC READ
+  path completed for all three rails: `mx.lvl` raw 0x3 (index 3 -> 321),
+  `cx.lvl` raw 0x5 (index 5 -> 257), `gfx.lvl` raw 0 (index 0 -> 1). The
+  reply encoding is not proven; raw 0 is consistent with the off selector or
+  no APPS vote. GPUCC remained collapsed, every GPU CBCR was off, and
+  `backboardd` still logged `IOAcceleratorES -> 0 found`; no GPU command,
+  firmware load or rendering occurred.
+- **120 Hz presentation result:** patch 0085 ran the software timer at
+  120 Hz (1200 callbacks/10 s), but the eight active windows showed only
+  4-86 `present_calls`/10 s (45-86 after the first partial window) and up
+  to 374 missed deadlines. Physical panel mode is inherited from ABL and
+  unchanged. This does not establish 120 fps or GPU acceleration;
+  `sweetfb_hz=30` remains the lower-rate fallback.
+
+- **Latest continuation / 0084:** the OpenCode/DeepSeek 0083 build booted
+  but remained slow; phone was returned to OrangeFox.
+  `logs/gpu-opencode-0083.txt` (220,473 bytes, flush 9) confirms `stage=1`,
+  three ARC tables,
+  CX/GX still collapsed, and no IOAcceleratorES. The read-only table gate
+  passed; no ARC write was exercised.
+- **Power-code correction:** 0083's fixed LOW_SVS votes could replace a
+  higher inherited APPS vote. DT regulator minimum/init constraints do not
+  establish ABL's current vote. Patch 0084 removes that write API and makes
+  `sweetgpu=2` deferred ARC READ transactions (MSGID WRITE clear, response
+  register 0x40), using the same lock/TCS ownership as touch. It waits 60 s
+  and requires successful L11C setup before issuing the first read. Timeout
+  quarantines the controller without retry. Replies are raw evidence, not
+  yet established local-vote indices. No GPUCC/core/GMU writes are added.
+- ARC aux parsing now requires even alignment and observed version 0x1000,
+  checks all trailing padding, and keeps consumer levels in u32 (65535+1
+  must not wrap). CI must contain the `ARC readback v1 starting` marker.
+  0084/0085's hardware readback passed (above). Full acceleration, firmware
+  execution, command submission, Metal compatibility and an iPhone 8
+  performance comparison remain unimplemented/unmeasured.
+
+- **Prior GPU hardware result (0082):** audit source d37d1ca boots to iOS
+  (user confirmed). `logs/gpu-audit-v2.txt` contains the complete v2 audit:
+  CX_GDSCR=0x222001, CX_HW_CTRL=0x5ff4, GX_GDSCR=0x222001,
+  GX_DOMAIN=1, GX_BCR=0; every sampled CBCR has CLK_OFF set. Both domains
+  collapsed; GX clamped. No GPU/core/GMU writes or acceleration implemented.
+- **Historical 0083 milestone (superseded by 0084 below):**
+  `xnu/patches/0083-sweet-adreno-arc-vote.patch` adds read-only ARC level
+  tables for `mx.lvl`/`cx.lvl`/`gfx.lvl` with `sweetgpu=1`, and LOW_SVS (65)
+  votes in order mx, cx, gfx with `sweetgpu=2`. It refuses selector 0 (off),
+  validates aux length/alignment/monotonic levels, and bounds each RPMH
+  transaction at 200 ms. It performs no GPUCC power/clock/reset writes and no
+  GPU/GMU access. Design, evidence and pass/fail gates are in
+  `docs/GPU_PROGRESS.md`. The read-only tables and the 0084 READ path were
+  booted on hardware; the 0083 fixed-vote mode remains unapproved and
+  unbooted.
+- GPU work now on branch `codex/adreno-power-audit`. The 0081 artifact was
+  incorrectly labeled as containing the GPU probe: CI run 39205190400 skipped
+  patch 0081 (bsd/conf/files and sweet_ufs.c context failures). Its kernel and
+  boot image contain no GPU strings. Treat earlier probe-build claims below
+  as superseded. The saved `logs/gpu-baseline.txt` confirms eight cores came
+  alive, framebuffer swaps and working touch, but has no GPU output.
+- Fixed 0081 against patches through 0080; new 0082 adds GPUCC-only CX/GX
+  power/reset and ten clock snapshots with `GPUCC audit v2` marker. No MMIO
+  writes, new GPU aperture accesses, firmware or rendering acceleration.
+  Workflow now rejects skipped project patches and requires marker in kernel.
+  Commit `d37d1ca` pushed to myfork; CI run `39228692751` succeeded,
+  including the GPU marker check. Local ARM64 and real XNU compiles passed.
+  Packaged `shim/out/shim-boot-0082-gpu-audit.img` and temporarily booted it
+  successfully via host fastboot. iOS boot and hardware audit were confirmed.
+- User clarifies lag: quick taps, animations below 20 fps, blur absent.
+  Do not rebuild/reflash the iOS root for this GPU diagnostic.
+- This user now reports iOS userland boots using
+  `shim/out/shim-boot-0081-gpucc.img` and the new root image, but is extremely
+  laggy. No boot log or timing measurements have been captured yet. The
+  historical v15/on-phone reports below belong to the original project.
+- The new iOS root is built and checked at
+  `research/ipsw-x/ios16-root-20H392.img` and `.simg`. Sparse size is
+  12,145,090,872 bytes; SHA-256
+  `42f6ac7c362651144bf138f3175604c2074aa76f633fe9a45dbecb377649e4f0`.
+- User authorized the userdata write ("write, phone is in fastboot mode") and
+  performed installation from their host terminal after sandbox USB access
+  failed. Their subsequent iOS boot report confirms progress; the exact flash
+  transcript is not available. Do not reflash or rebuild the root for lag.
+- Next performance comparison: temporary boot of
+  `shim/out/shim-boot-0081-gpucc-8cpu.img`. It changes only `cpus=6` to `cpus=8`
+  (enables the A76 pair supported by patch 0078). The saved baseline log
+  confirms all eight CPUs started. Rendering is still software; backboardd
+  repeatedly finds no IOAcceleratorES service. Keep the six-core image as fallback.
+
+## Agent handoff / active work (2026-10-15, latest)
+
+### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
+
+### >>> UPDATE 2026-10-19 (GPU probe and device-tree capture) <<<
+
+- Gesture navigation remains hardware-verified by patches 0070/0071.
+- The Adreno 618 work is still diagnostic phase 1, not a rendering driver.
+  XNU patch 0081 adds an opt-in, read-only GPUCC probe (`sweetgpu=1`); the
+  GitHub Actions `xnu #2` run on commit `8cfc234` succeeded. The downloaded
+  arm64 kernel is in `xnu/out/kernel.development.sweet`, SHA-256
+  `e2be0a0c4151207a82a1d77441c3e793acc0c2261deb1416480bca22be8dd580`.
+  The older kernel was preserved at `/tmp/kernel.development.sweet.pre-0081`.
+- OrangeFox read-only dumps are in ignored `backup/`: `boot.img` (128 MiB),
+  `dtbo.img` (32 MiB), and `live-fdt.dtb` (555,248 bytes). The boot image's
+  base DTB is `dtb/boot_unpacked/dtb`; extracted overlay is
+  `dtb/boot_unpacked/overlay-0.dtb`. The live FDT identifies GPUCC as
+  `qcom,gpucc-sdmmagpie` at `0x05090000`/`0x9000`, Adreno chip ID
+  `0x06010800`, GPU regs at `0x05000000`, GMU at `0x0506a000`, and KGSL SMMU
+  at `0x05040000`. The five probe offsets match Qualcomm's SDM Magpie source.
+- Extracted the D22AP DeviceTree from the iPhone10,3 iOS 16.7.16 IPSW into
+  `research/ipsw-x/d22ap.adt`; generated `shim/out/sweet.adt` with its `/product`
+  node. The raw Apple artifact remains under ignored `research/`.
+- The AArch64 cross-toolchain is installed; the `sweetgpu=1` shim image is now
+  built. See the later 2026-10-19 update for its checksum and device result.
+  Preserve Android partitions; use `fastboot boot`, never flash boot.
+
+**STATE at end of 2026-10-18 (evening):**
+- On the phone: userdata = **image v15** (`/run/media/dipa/android/ios-sweet-ipsw/ios16-root-20H392-v15.img/.simg`; = v14 + `/private/var/preferences/SystemConfiguration/preferences.plist` with one network service "USB Ethernet": Interface DeviceName ue0 Type Ethernet, IPv4 Manual 192.168.7.2/24 router 192.168.7.1, DNS 1.1.1.1 8.8.8.8, set "Automatic" as CurrentSet). Fallback image v14 (v12/v13 deleted).
+- Kernels: **0078** = all 8 cores (`cpus=8`, cpu6/7 = A76, homogeneous SMP; mkadt now emits 8 CPU nodes; ADT `shim/out/sweet-0078hi.adt`); **0079** = display off/on via IOMFB selector 12 kern_RequestPowerChange(state) (fade over 6 vsyncs, then black; verified: power button gives "SWEET FB: display off/on"); **0080** = `SWEET NET: <proc> route add/delete/change ...` and `... add/delete address ...` trace (built, `shim/out/shim-boot-0080s.img`, NOT booted yet).
+- **Internet over USB: not working yet.** Host side is ready (temporary iptables: FORWARD accept for 192.168.7.0/24 + MASQUERADE, comment "ios-sweet"; lost on host reboot). With v15 the phone sent no DNS and no outbound traffic (only mDNS/ARP) -> configd probably did not apply the service (or did, without default route/DNS). Next: boot 0080s on v15, watch `SWEET NET` lines (does configd add 192.168.7.2 / default route on ue0?). If configd ignores ue0 (not an IOKit IONetworkInterface; configd 1241.140.6 source in `research/configd-1241`, SCNetworkInterface createInterface needs IONetworkInterface -> controller (IOMACAddress, SelfNamed) -> bus), add IOKit stand-ins and/or rename the ifnet to en*.
+- Live log listener (`nc -ukl 5140`) may still be running, writing `logs/live-0078s.txt`.
+
+**LIVE LOG over USB (0077, boot 0077s): no more recovery round-trips.** Boot an image with `sweetusb=2`, run `tools/sweet-usbnet.sh logs/live-NAME.txt` on the PC: it waits for the phone's CDC-ECM interface, sets 192.168.7.1/24 (sudo) and prints/saves the kernel console the phone streams every 100 ms as UDP to 192.168.7.1:5140 (starts with the last 64 KiB). `ping 192.168.7.2` checks the link. Current image: `shim/out/shim-boot-0077s.img` (kernel 0077, ADT sweet-0069hi, cpus=6, sweetfb_noconsole=1, sweetfb_hz=30, sweetusb=2). The recovery pull (`tools/sweet-log-pull.sh`) is still the way after a panic/hang before USB comes up.
+
+**🎉 USB networking works (boot 0076s, 18:24 local): `ping 192.168.7.2` from the PC answers in ~1 ms, 0 % loss (200-packet burst, 1500-byte frames, 512/1024-byte frames).** 0075: CDC-ECM function (bulk 0x81/0x01, interrupt 0x82 NETWORK_CONNECTION; host MAC 02:00:5e:77:ee:01) + kernel ethernet ifnet `ue0` (legacy output, header strip like if_fake) with 192.168.7.2/24 set from the kernel (proto_plumb + SIOCAIFADDR on an in-kernel socket). 0076: received frames into one cluster mbuf (mbuf_allocpacket gave a first mbuf of length 0 -> panic "Failed mbuf validity check: len -14"). Host side (Linux cdc_ether, interface `enp0s20f0u3u1`): `nmcli dev set IF managed no; sudo ip addr add 192.168.7.1/24 dev IF; sudo ip link set IF up`. Boot image `shim/out/shim-boot-0076s.img` (`sweetusb=2`). iOS itself does not see ue0 yet (configd needs an IONetworkInterface in IOKit).
+
+**USB device mode works (boot 0074s, 17:45 local): the host enumerates the phone at high speed as `1209:0001 ios-sweet "Sweet iOS (USB bring-up)"`.** 0072 read-only probe: ABL leaves the USB30_PRIM GDSC and all 7 USB clocks on, DWC3 v3.20a (GSNPSID 0x5533320a) in device mode (GCTL 0x00112000), halted (DCTL RUN_STOP 0, DSTS 0x00d3de04), event buffer still at ABL's 0xfdfc8000, QUSB2 PHY alive. 0073 (`sweetusb=2`): DCTL soft reset, own event buffer (polled, interrupt masked), ep0 DEPSTARTCFG/SETEPCONFIG/SETTRANSFRESOURCE, setup TRB, RUN_STOP; control-transfer state machine as Linux ep0.c; descriptors: vendor class, no data endpoints. It ran but no event came: **0074** forces the VBUS session in the Qualcomm wrapper (QSCRATCH 0xa6f8800: HS_PHY_CTRL |= UTMI_OTG_VBUS_VALID(20)|SW_SESSVLD_SEL(28), SS_PHY_CTRL |= LANE0_PWR_PRESENT(24), as Linux dwc3_qcom_vbus_override_enable) -> connect + enumeration. Image `shim/out/shim-boot-0074s.img`. Black Phone app: main thread waits in -[VMVoicemailManager fetchAccounts] (sync XPC; voicemail needs the modem).
+
+**Navigation works (boot 0071s on v14, log `logs/boot-0071s.txt`):** swipe up from the bottom edge returns to the home screen; app switcher works. Two fixes: **0070** pid_hibernate (syscall 435 was nosys on the macOS config -> SIGSYS killed SpringBoard in -[SBToAppsWorkspaceTransaction _didComplete] when an app left the foreground; the only CONFIG_EMBEDDED-only entry in syscalls.master); **0071** touches starting within 48 px of an edge carry kIOHIDDigitizerEventFromEdgeTip (UIKit `_UIEventHIDTouchEdgeTypeForHIDEvent` reads the digitizer EventMask 0xb0007 bits 0x800/0x1000/0x2000/0x40000). Diagnosed, not fixed: Settings (Preferences) SIGTRAP in PodcastsUI func_1cdc47c58: force-unwrap of `URL.volumeTotalCapacity` (nil on our HFS+ root). Phone/Photos/Messages show black (MobilePhone launches, no crash) - next: stack samples via boot-arg `sweetsample=MobilePhone,MobileSlideShow,MobileSMS,SpringBoard` (image `shim/out/shim-boot-0071s.img`).
+
+**🎉🎉 MILESTONE 2026-10-18 ~15:30 local: iOS 16.7 SPRINGBOARD HOME SCREEN ON THE PHONE** (boot `shim/out/shim-boot-0069s.img` = kernel 0069 + ADT `shim/out/sweet-0069hi.adt`, image **v14**; log `logs/boot-0069s-v14-HOMESCREEN.txt`). Home screen with a few apps, Settings opens, Control Center / lock screen / notification center work, touch + buttons work, 6 A55 cores (`cpus=6`), `sweetfb_noconsole=1 sweetfb_hz=30`. Known issue: cannot leave Settings (home gesture / AssistiveTouch home do nothing) - to investigate.
+What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user client), 0059 iPhone X identity (hw.product etc.), 0060 SPMI keys + GENI touch, 0061 1125x2436 presented display, 0062 RPMh L11C touch power + IOPMPowerSource battery, 0063 GENI FIFO packing (Goodix GT9896), 0064 PRIV_WORK_INTERVAL grant (SpringBoard "Failed to create work interval"), 0065 SMP via PSCI (6 A55), 0066 crash map regions, 0067 console mute without cons_ops write, 0068 IOSurface lookup of an already-mapped surface returns base -1 (backboardd snapshot crash), 0069 UFS log flush 10 s. Image v13: CommCenter removed from launchd.plist, BKNoWatchdogs. **Image v14** = v13 + Setup skipped (`/var/mobile/Library/Preferences/com.apple.purplebuddy.plist` SetupDone/SetupFinishedAllSteps true, SetupVersion 11, daemonizeNeedsToRun false; purplebuddy.notbackedup mini-buddy flags false; managedconfiguration.notbackedup LockdownActivationIndicatesCloudConfigurationAvailable false; springboard MCForceShowCloudConfigurationUI false) + mobileactivationd data ark seeded (`/private/var/containers/Data/System/D90C94C4-F94E-4FCF-8A28-A93BE3846D8E/Library/internal/data_ark.plist`, -ActivationState Activated etc.) + MediaToolbox D22/D221/Default SubServerConfiguration StartRecorderServer=false (mediaserverd crash loop: portrait-filter prewarm called NULL GL). **Activation:** ADT /chosen certificate-production-status 0, effective-production-status-ap 0, certificate-security-mode 1, effective-security-mode-sep 1 -> mobileactivationd's native Hactivation branch (Codex `codex/activation/report.md`; alternative 4-byte daemon patch documented there). Fallback image v13; v12 deleted.
+
+**🎉 TOUCH WORKS (boot 0063u on image v13, 2026-10-18 ~13:15 local):** tapping (i) on Setup's Hello opens the device-info sheet; swipe-up is recognised (spinner, then back to Hello - under investigation). Chain: RPMh L11C vote (0062, `bsd/dev/sweet_rpmh.c`) -> GT9896 @0x5d on GENI SE7 (0063 fixed FIFO packing: register address went out byte-swapped) -> sweet_hid_touch -> SweetHIDTouch -> backboardd. Battery icon OK (0062 SweetBattery IOPMPowerSource, static 100 %). **Image v13** (= v12 + CommCenter jobs removed from launchd.plist + `BKNoWatchdogs`=true and `FBLaunchWatchdogExceptions{com.apple.purplebuddy:100}` in /var/mobile/Library/Preferences/com.apple.springboard.plist): Setup no longer killed by the scene-create watchdog (it blocked in CoreTelephony getSubscriptionInfo -> CommCenter, Codex `codex/setup/report.md`; that report also lists how to skip Setup: SetupDone/SetupFinishedAllSteps/SetupVersion=11 in com.apple.purplebuddy.plist + activation check). v9 deleted, fallback = v12. Input latency ~1 min with 1 CPU -> Codex task 11 = SMP via PSCI (`codex/smp/`).
+
+**INPUT WORKS (boot 0060u on a freshly flashed v12, log `logs/boot-0060u.txt`):** power, volume up, volume down reach iOS (PMIC -> sweet_keys.c -> SweetHIDButtons -> backboardd). Power locks/unlocks (screen "off" shows the kernel console because the panel never really turns off). **Device identity fixed: iPhone X** (home indicator, Face-ID-style Setup). Earlier test (0059u, `sweethidtest=15` fake Home presses) advanced Setup from Hello to the language list.
+- **0058** HID: `iokit/Kernel/arm/hid/`: IOHIDEventServiceUserClient + IOHIDEventServiceQueue + IOHIDEvent compiled UNCHANGED from Apple IOHIDFamily-1915.140.3 (= exact version of the iOS 16.7 IOHIDLib, clone in `research/iohid-1915`) over our minimal IOHIDEventService (SweetHID.cpp: SweetHIDButtons consumer page 0x0C power 0x30 / vol 0xE9/0xEA / menu 0x40; SweetHIDTouch digitizer collections). C hooks `sweet_hid_key(key, down)` (0 power, 1 vol+, 2 vol-, 3 home) and `sweet_hid_touch(finger, down, x, y)`. HID logs go to IOLog. Boot-arg `sweethidtest=N` = fake Home press every N s.
+- **0059** identity: hw.machine/hw.model/hw.target/hw.product from the ADT (macOS-config kernel used to answer "iPad8,6"/"Redmi Note 10 Pro"). mkadt: root compatible `D22AP|iPhone10,3|xiaomi,sweet|...`, model iPhone10,3, target-type D22, `/product` copied from the real D22AP device tree (`research/ipsw-x/d22ap.adt`, extracted from the IPSW, NOT in git), `/buttons home-button-type 2`. Codex report `codex/mg/report.md`: MG ProductType = sysctl **hw.product** (unrecognized -> iPod), HWModelStr = hw.target, HomeButtonType = `/buttons/home-button-type`; disk cache `/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist` (keyed by build + UUID only -> stale iPod answers survived; reflashed clean v12 to clear it).
+- **0060** drivers by Codex (`codex/input/hw-report.md`): `bsd/dev/sweet_keys.c` (SPMI arbiter v5 observer reads, PON 0x810 bits KPDPWR/RESIN SID0, PM6150L GPIO2 SID4 0xc110; works), `bsd/dev/sweet_touch.c` (GENI SE7 I2C @0xa84000, starts 45 s after boot). Touch result: SE7 fw ok (proto 3) but **0x5d and 0x38 both time out -> touch IC unpowered** (L11C LDO needs an RPMh vote). Codex task 8 = RPMh client (`codex/rpmh/`), task 7 = battery (`codex/battery/`).
+- **0061** (CI 39117078444): red status bar "rdar:45025538" = UIKit "No status bar visual provider for screen" (360x800 pt is no real iPhone). AppleCLCD now presents **1125x2436** (iPhone X) and shows the centered 1080x2400; touch mapped the same; ADT canvas 1125x2436. `sweetfb_native=1` reverts.
+- Images: `shim/out/shim-boot-0060b.img` (0060 + /buttons ADT `sweet-0060hi.adt`). Next: 0061 image with ADT from current mkadt.
+
+### >>> HANDOFF 2026-10-17 late (read this first) <<<
+
+**STATE: iOS 16.7 Setup.app "Hello" screen is ON THE PHONE** (boot `shim/out/shim-boot-0057u.img` on image v12). Photo `/run/media/dipa/android/ios-sweet-work/MILESTONE-setup-hello-2026-10-17.jpg`. SpringBoard + backboardd + Setup run; nothing crashes in the GUI path. Remaining crash/relaunch loops: installcoordinationd (should be fixed by 0057, unverified), mediaserverd (VirtualAudio removed in v12, unverified), mobileactivationd (~100/boot, not analysed), bluetoothd + fairplayd.H2 relaunch constantly (no hardware).
+
+**What is on the phone now:** userdata = image **v12** (`/run/media/dipa/android/ios-sweet-ipsw/ios16-root-20H392-v12.img` + `.simg` + `.sha256`; v9 kept as fallback, v8/v10/v11 deleted or superseded). Kernel **0057** (`xnu/out-0057`, CI `39067532732`). ADT **`shim/out/sweet-0057hi.adt`** (QEMU twin `research/q0057-hi.adt`). Boot image **`shim/out/shim-boot-0057u.img`**. Boot args: `debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1`.
+
+**Build a phone image** (kernel K, ADT A): `python3 tools/mkpayload.py $K $A shim/out/payload-X.bin --cmdline "$B" && (cd shim && ./build.sh ../shim/out/payload-X.bin && cp out/shim-boot.img out/shim-boot-X.img)` then check `python3 tools/unpack_bootv2.py shim/out/shim-boot-X.img shim/out/check-X && cmp shim/out/check-X/ramdisk shim/out/payload-X.bin`. QEMU smoke test: `python3 tools/mkpayload.py $K research/q0057-hi.adt $S/csq/payloadX.bin --ramdisk $S/csq/root-fork.img --cmdline "debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=md0"` + `PATH=~/swift/usr/bin:$PATH python3 tools/qemu-sweet.py ... --secs 40 --kernel $K --fail-on-panic` (S = scratchpad; root-fork.img lives in the session scratchpad csq/ dir and may be gone in a new session).
+
+**Kernel workflow:** edit `research/bt28/xnu/...` (keep the pre-edit copy in `research/preNNNN/`), syntax check `python3 tools/xnu-cc.py research/run28.log research/bt28 <file>`, make `xnu/patches/NNNN-*.patch` with `diff -u pre bt28 | sed` path rewrite, add new/changed files to `research/check-patch-order.py` list, run it (must say applied + MATCH), commit + push -> GitHub Actions `xnu` builds (~8 min) -> `gh run download <id> -R dipa-studio/ios-sweet -n xnu-kernel -D xnu/out-NNNN`. **Repo is PUBLIC since 2026-10-17** (private macOS runner minutes ran out: "recent account payments have failed"); public = free runners. Commit trailer: only `Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>`.
+
+**Phone workflow (user does buttons, Claude runs commands):**
+- Boot test kernel: phone in fastboot -> `fastboot boot shim/out/shim-boot-X.img`. NEVER `fastboot getvar`.
+- **Read logs WITHOUT filming:** after a test the user holds Power+VolDown -> fastboot -> `fastboot boot recovery/recovery.img` (OrangeFox, temp) -> wait for `adb shell true` -> `tools/sweet-log-pull.sh /run/media/dipa/android/ios-sweet-work/logs/<name>.txt` (reads the 4 MiB console ring the kernel keeps in the last 1025 blocks of userdata; patch 0047). Then `adb reboot bootloader` brings the phone back to fastboot without the user.
+- **Flash a root image:** `fastboot flash -S 512M userdata <img>.simg` (7 min, 25 chunks). After a big flash the Xiaomi ABL fastboot hangs: next `fastboot boot` stalls at "Sending" -> the USER must re-enter fastboot by hand (Power+VolDown). Do not retry commands against the hung ABL. A flash right after `adb reboot bootloader` once failed on chunk 1 (USB protocol error): just retry. User must NOT unplug during flash (once interrupted at 25/25 -> reflash).
+- **Edit the phone root without reflashing (same-length only):** find the file's raw offset in the local image (it is one extent; search the image for its first 4 KiB), compare with `adb exec-out dd if=/dev/block/sda34 ...`, then `adb push` changed 4 KiB blocks and `dd of=/dev/block/sda34 seek=... conv=notrunc,fsync`, read back. Recovery kernel has no hfsplus.
+- **Pull the whole phone root** (12 min): `adb exec-out "dd if=/dev/block/sda34 bs=1048576 count=16384" > img`; mount ro with udisksctl or `sudo mount -t hfsplus -o loop,ro`. To write into a pulled image: `sudo fsck.hfsplus -fy` first (volume is never cleanly unmounted -> Linux mounts ro even with -o force), then `sudo mount -t hfsplus -o loop,force`.
+- Making images: copy latest img with `cp --sparse=always`, mount rw with force, change, `sync; umount`, `sha256sum`, `img2simg`. Keep only the latest image + one fallback on the SSD (/home is ~98% full; big work files live in `/run/media/dipa/android/ios-sweet-work/`, old kernels/images archived in `.../ios-sweet-work/archive/`).
+
+**Diagnostics built into the kernel (all SWEET-only):** persistent console log (0047, boot-arg sweetlog=0 off; flush every ~1 s); `|name| text` copies of /dev/null writes for processes in `sweetnull` (default backboardd,SpringBoard; 0048); `IOK name:` IOKit lookup/open trace for `sweetiolog` (default backboardd,SpringBoard; 0049/0054, 400 lines max); `SWEET Sandbox: proc op N` (0050); `STR ...` heap text dump on SIGABRT/SIGTRAP for `sweetscan` (default backboardd,SpringBoard; 0051/0053) - this is how NSException/BSAssert reasons were found; `SMP name tN pc .. bt ..` user stack sampler for `sweetsample` (default SpringBoard,backboardd; first at 90 s then every 120 s, 40 samples, 16 frames; 0054/0055); `SWEET FB: N swaps` every 1000 swaps; `CRASH name ...` crash reports (0043/0044). Symbolicate cache addresses with `ipsw dyld a2s research/dsc/dyld_shared_cache_arm64 <addr - slide>`; main-binary addresses: addr - mh + 0x100000000.
+
+**Patches added today (0046-0057, all CI-built):** 0046 IOSurface (IOCoreSurfaceRoot) + IOMobileFramebuffer (AppleCLCD on /arm-io/disp0) + arm-io nubs; 0047 persistent log; 0048 /dev/null tee; 0049 IOKit trace; 0050 permissive "Sandbox" MAC policy; 0051/0053 heap text on crash; 0052 RENAME_SWAP via exchangedata on HFS; 0054/0055 sampler, swap counter, AKS selectors 35 (extended device state = 17) and 101; 0056 panel copy from the vsync timer at 10 Hz (sweetfb_hz) instead of every swap; 0057 no config_ext_resolver (ACL group entries resolve without memberd). ADT (tools/mkadt.py): /arm-io/disp0, /chosen/display-scale 3, /chosen/unique-chip-id (synthetic 0x5357454554000001) + chip-id 0x8015 -> IOPlatformUUID A9683613-3704-53F2-95D0-98A8FB574E78. Image v9-v12: /private/var/containers/{Bundle,Data/System,Shared/SystemGroup,Temp}; launchd.plist StandardOut/ErrorPath renamed to ...PatX (pointing jobs at /dev/console stops them launching: EACCES); v12: LastSystemVersion=20H392 in plain /var/mobile/Library/Preferences/com.apple.migration.plist (stops the 1-hour data migration that ran every boot), VirtualAudio.plugin moved to /Library/Audio/Plug-Ins/HAL.disabled/.
+
+**Codex helper** (`codex exec --skip-git-repo-check -m gpt-6.1-sol -c model_reasoning_effort=high -s workspace-write -C /run/media/dipa/android/ios-sweet-work/codex -o OUT "$(cat task.md)" < /dev/null`, run detached with setsid nohup; config already defaults to gpt-6.1-sol high). Reports in `/run/media/dipa/android/ios-sweet-work/codex/`: mediaserverd-report.md, installcoordinationd-report.md (-> 0057), ufs-performance.md (ranked UFS speed plan), **ufs/0058-sweet-ufs-faster.patch** (READY, not yet applied: ufslogsecs default 10 s log flush batching, optional ufscache=1 directional cache ops, optional ufswait=1 spin-then-sleep; syntax-checked, host-stub verified; see ufs/README.md). Apply it as patch 0058 after review.
+
+**Claude safety-classifier note:** several messages about QuartzCore renderer selection / writing an HFS reader tool were cut off by an automatic classifier (false positives, user agrees). Keep those topics short or let them be; they are not blockers now (rendering already works).
+
+**NEXT STEPS (in order):**
+1. **Input** (Setup stuck on Hello): touch + power + volume as IOHIDEventService/IOHIDDevice services backboardd matches (log shows backboardd matching IOHIDDevice with DeviceUsagePairs and IOService with HIDServiceSupport=true). Phone hardware: Goodix/Focaltech touch over I2C/SPI (check live DT `dtb/`), buttons via PMIC (pon) and GPIO keys. Start with a fake HID service (e.g. power button via a timer or boot-arg) to learn the ABI, then real drivers.
+2. **Device identity**: MobileGestalt reports iPod + Home button. Add /product node / product-type (iPhone10,3, D22AP), device class iPhone, home-button-less (Face ID) properties in mkadt; find exact MG keys (MGIOMFBSupport.c, `IODeviceTree:/product` lookups seen in backboardd trace).
+3. **Battery**: AppleSmartBattery/IOPMPowerSource style service (status bar shows empty red battery).
+4. Apply Codex 0058 (UFS speed), consider cpus>1, check whether installcoordinationd/mediaserverd loops are gone, analyse mobileactivationd.
+5. Hide kernel console over the GUI when not debugging: boot-arg sweetfb_noconsole=1 (but then panics are not on screen).
+
+- **🎉 MILESTONE: iOS GUI ON THE PHONE - Setup.app "Hello" screen (2026-10-17 ~21:30 UTC, boot 0057u on image v12).** Photo: `/run/media/dipa/android/ios-sweet-work/MILESTONE-setup-hello-2026-10-17.jpg` (animated "dobar d(an)" hello lettering, status bar "iPod" + battery icon, bottom "Pritisnite Home za otvaranje" = "Press Home to open" (locale hr), (i) button). Rendered by iOS 16.7 SpringBoard/Setup through CoreAnimation -> backboardd -> kernel IOSurface (IOCoreSurfaceRoot) -> kernel AppleCLCD swaps -> ABL panel memory. What made it: data migration finally skipped (v12: `LastSystemVersion` 20H392 in the plain `/var/mobile/Library/Preferences/com.apple.migration.plist`; ADT `/chosen/unique-chip-id` + `chip-id` for IOPlatformUUID), 0057 (no ext resolver -> ACL containers work), plus everything before (0046 display/IOSurface, 0050 Sandbox policy, display-scale 3, containers dirs, RENAME_SWAP, AKS 35/101, 10 Hz present).
+  **Missing (next work, in rough order):**
+  - **Input: no touch, no power button, no volume buttons** (no HID drivers; backboardd looks for IOHIDDevice / HIDServiceSupport services). Setup is stuck on "Hello".
+  - **Device identity: it thinks it is an iPod with a Home button** (status bar "iPod", "Press Home to open"): MobileGestalt has no product/model identity (no /product node, product-type, etc.) - give it iPhone10,3 / home-button-less (Face ID class) identity.
+  - **No battery detection** (no battery/charger/PMIC service; status bar battery shows empty/red).
+  - Locale came up Croatian (hr) - harmless.
+  - Performance: cpus=1, polled UFS (Codex UFS patch in progress: `codex/ufs/`), backboardd presents at 60 Hz.
+- **README refreshed (2026-10-17):** read the full notes and updated the public overview through patch 0045, v7 hardware observations and prepared v8 diagnostics. Documents real Apple userspace, the missing display/IOSurface GUI work, limited security services, highmem, persistent userdata root, current tooling and build examples. Documentation only; no kernel build, tests, flashing or phone boot performed.
+
+- **v11 still migrated (boot 0056u, 20:32 UTC, `logs/boot-0056u-v11.txt`).** On iOS kCFPreferencesCurrentHost lands in the plain plist: all DMEnvironment setters (setLastBuildVersionPref, setUserDataDispositionPref, ...) use CurrentHost and the phone's `/var/mobile/Library/Preferences/com.apple.migration.plist` holds DMUserDataDisposition; datamigrator's XPC service runs with `_RoleAccount: mobile`. **Image v12** = v11 + `LastSystemVersion` = 20H392 added to that plain `com.apple.migration.plist` (keeps DMUserDataDisposition, 501:501 0600) + `/Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin` moved to `/Library/Audio/Plug-Ins/HAL.disabled/` (Codex: stops the mediaserverd SIGSEGV loop; untested). **installcoordinationd loop explained (Codex `codex/installcoordinationd-report.md`):** os_crash "Failed to create data directory" EACCES for `/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.installcoordinationd/Library/InstallCoordination`: `Library`/`Library/Caches` in the container are ACL-only (uid/gid 0xfffffffe, mode 0000, ACE for group GUID ...012B = gid 299 systemusers); with `config_ext_resolver` the kernel asks an identity resolver (memberd/opendirectoryd) that iOS does not run -> EWOULDBLOCK -> ACE skipped -> EACCES. **Patch 0057**: drop config_ext_resolver from FILESYS_BASE (compatibility UID/GID<->GUID mapping is used instead), likely fixes other ACL-protected containers too. Codex task 3: UFS driver performance design (`codex/ufs-performance.md`).
+- **mediaserverd SIGSEGV loop explained (Codex report `/run/media/dipa/android/ios-sweet-work/codex/mediaserverd-report.md`):** the fault (FAR 0x390) is in the HAL plug-in `/Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin/VirtualAudio` (ApplyBeamFormerPreference <- VirtualAudio_PlugIn::SetPropertyData <- HALS_AHPPlugIn::ObjectSetPropertyData <- AudioObjectSetPropertyData <- MediaExperience vaemVADSerializationListener): the default virtual audio device ('vdef', VirtualAudioDevice_Default) does not exist (no audio hardware/driver, no /product/audio). Proposed workaround for GUI bring-up: move VirtualAudio.plugin out of /Library/Audio/Plug-Ins/HAL/ in the next root image (untested). v11 reflashed OK after an interrupted flash (USB unplugged at chunk 25/25). Codex task 2: installcoordinationd crash loop.
+- **ROOT CAUSE of the endless migration: no IOPlatformUUID (2026-10-17).** datamigrator's `-[DMMigrator isMigrationNeededWithBuildVersion:lastBuildVersion:clientPID:]` gets lastBuildVersion from `-[DMEnvironment lastBuildVersionPref]` = `CFPreferencesCopyValue("LastSystemVersion", "com.apple.migration", kCFPreferencesCurrentUser, kCFPreferencesCurrentHost)` -> a ByHost file. The phone had `/var/mobile/Library/Preferences/com.apple.migration.plist` (only DMUserDataDisposition) and NO `Preferences/ByHost` directory at all. On arm XNU publishes IOPlatformUUID (gethostuuid) only from `/chosen/unique-chip-id` (8 bytes) + `/chosen/chip-id` (4 bytes) (IOPlatformExpertDevice::generatePlatformUUID, called from IOPlatformExpert::start); the SWEET ADT had neither, so every CurrentHost preference write failed. Fix: mkadt adds `unique-chip-id` = 0x5357454554000001 (synthetic) and `chip-id` = 0x8015 -> UUID `A9683613-3704-53F2-95D0-98A8FB574E78` (same SHA1 namespace computation as the kernel). ADT `shim/out/sweet-0057hi.adt`, boot image `shim/out/shim-boot-0056u.img` (0056 kernel + 0057hi ADT, QEMU OK). **Image v11** = v10 + `Preferences/ByHost/com.apple.migration.<UUID upper and lower>.plist` {LastSystemVersion: 20H392} (501:501, dir 0755 files 0600). Flashing v11 2026-10-17 ~20:10 UTC. Codex (gpt-6.1-sol high) analysing the mediaserverd SIGSEGV loop in `/run/media/dipa/android/ios-sweet-work/codex/` (report `mediaserverd-report.md`).
+- **v10 did NOT stop the migration (boot 0056n on v10, 19:18 UTC, `logs/boot-0056n-v10.txt`):** datamigrator + migrationpluginwrapper ran again, backboardd drew the progress UI (13000+ swaps in ~5 min). So `com.apple.DataMigration.plist`/LastSystemVersion is not the deciding input. What is known about the decision (datamigrator XPC service `DataMigration.framework/XPCServices/com.apple.datamigrator.xpc/com.apple.datamigrator`, strings): `Migration sentinel present. Migration necessary.` (sentinel `/private/var/datamigrator/migrate`, created and removed by datamigrator itself; absent in v10), `System build version changed from %@ to %@. Migration necessary.` / `...unchanged... not necessary`, `Disposition dictionary with build version %@ is out of date relative to current build version %@`, `SyntheticDidUpgrade`, DMUserDataDispositionManager; previous build source not found yet (not in the binary's plain strings; likely in DataMigration.framework's DMUserDataDispositionManager / preferences domain `com.apple.migration`). backboardd calls `DMPerformMigrationIfNeeded` and holds SpringBoard in `checkInAndWaitForDataMigration` until it returns. NEXT: find where the previous build version / disposition dictionary is stored (disassemble DataMigration.framework DMUserDataDispositionManager + datamigrator's isMigrationNeeded path), write it into the image; or get datamigrator's os_log out (OS_ACTIVITY_DT_MODE needs a launchd env change).
+- **Data migration never records completion -> skip it (image v10, 2026-10-17).** Boot 0056n (18:16 UTC, `logs/boot-0056n.txt`, 30 min): 10 Hz panel copies, backboardd still presents at ~60 Hz (107k swaps), SpringBoard still in `BKSSystemShellService _checkIn` at sample 14. Every migration run takes 1+ hour on cpus=1 and repeats each boot. DataMigration decides from `/var/mobile/Library/Preferences/com.apple.DataMigration.plist` key `LastSystemVersion` (vs ProductBuildVersion 20H392); the pulled phone root (21:01 local) had NO such file. **v10** = that pulled phone state + fsck.hfsplus -fy (volume was marked not cleanly unmounted -> Linux mounts it read-only even with -o force; fsck found only hard-link counts + minor volume header, repaired) + `com.apple.DataMigration.plist` {LastSystemVersion: 20H392} (501:501 0600). `/run/media/dipa/android/ios-sweet-ipsw/ios16-root-20H392-v10.img` (+ .sha256, .simg); v8 files deleted, v9 kept as fallback.
+- **Repo made PUBLIC (2026-10-17, user request) so GitHub-hosted macOS runners are free:** the 0056 CI run was refused ("recent account payments have failed or your spending limit needs to be increased"). Checked before: no device dumps, serials, IMEI or Apple binaries in the history (.gitignore keeps backup/, dtb/, recovery/, research/ out); commit author emails are public now. 0056 rerun `39056660104` passed -> `xnu/out-0056`, QEMU OK, image `shim/out/shim-boot-0056n.img` booted 18:16 UTC.
+- **Boot 0055n (17:16 UTC, ~65 min, `logs/boot-0055n.txt`): migration bar reached 99% in ~30 min (was ~60), then crawled.** Root cause of the slowness: backboardd presents the progress UI at ~58 Hz (**167,000 swaps in ~48 min**) and AppleCLCD copied the full 10 MB frame into the panel on every swap -> ~600 MB/s memcpy on the single CPU (cpus=1), starving everything (polled UFS I/O too). Sampler (16 frames): **SpringBoard waits in `-[BKSSystemShellService _checkIn]`** (synchronous BSXPC call to backboardd, from FBSystemShellInitialize <- SBSystemAppMain) - backboardd holds the system shell check-in until the data migration ends, so the migration is the gate to SpringBoard UI. **Patch 0056**: swap only records the latest swap record; the vsync timer copies it to the panel every 60/sweetfb_hz ticks (default 10 Hz); `SWEET FB: N swaps` every 1000.
+- **Boot 0054n (16:53 UTC, ~12 min, `logs/boot-0054n.txt`, patch 0054 sampler):** the data migration runs AGAIN on every boot (it completed once in the 0053s run) - completion is not being recorded. backboardd keeps swapping the progress UI (3700+ swaps in ~10 min, `SWEET FB: N swaps`). Sample during migration: SpringBoard main thread blocked in a synchronous XPC call (`mach_msg2_trap <- dispatch_mach_send_and_wait_for_reply <- xpc_connection_send_message_with_reply_sync <- -[BSXPCServiceConnectionMessage _sendSynchronously:] <- BSXPCServiceConnectionProxy ...`). Unsupported AKS selectors seen: 101 `aks_assert_consume`, 93 `aks_get_internal_info`, 34 `_aks_stash_load` (datamigrator), **35 `aks_get_extended_device_state`** (SpringBoard, chronod, remindd, searchd, symptomsd...). **Patch 0055**: AKS 35 answered like 17 (same DER device state), 101 succeeds; sampler backtraces 16 frames, 40 samples (~80 min).
+- **MILESTONE: FIRST iOS PIXELS ON THE PANEL (boot 0053s long run, 15:33 UTC, ~60 min; photos IMG_20261017_183029/183222/183419; log `/run/media/dipa/android/ios-sweet-work/logs/boot-0053s-long.txt`, 407 KB, 1428 flushes).** The iOS data-migration boot screen (Apple logo + progress bar) was shown and the bar advanced to full in ~60 minutes. It is drawn by **backboardd through our kernel display path**: `SWEET SURF: backboardd create id 2/3 1080x2400 fmt 0x42475241 (BGRA) bpe 4 bpr 4352 size 10452992 keys 11`, IOSurface sels 9, 27, 5, 34 and traps 2/3 (lock/unlock), IOMFB SwapBegin (4) / SwapEnd (5, 1132-byte struct) / GetLayerDefaultSurface (3) / 68 / 55, then `SWEET FB: swap N layer 0 surface 2|3 1080x2400 ... a 0,0 1080x2400 b 0,0 1080x2400` alternating (double buffering; only the first 16 swaps are logged). Triggered by `com.apple.datamigrator` (AKS sels 101/93/34 return unsupported) and `com.apple.migrationpluginwrapper`. Probably ProgressUI-style CoreGraphics drawing into IOSurfaces (no GPU used). After the migration: SpringBoard and backboardd stay up (exec once each, no crash), nothing new drawn; crash loops only for mediaserverd, installcoordinationd, mobileactivationd (~108 each in the hour); bluetoothd and fairplayd.H2 relaunch constantly (no hardware). Kernel console text overlays the image (sweetfb_noconsole=1 would hide it).
+- **MILESTONE: SpringBoard and backboardd both stay up (boot 0053s on v9, 15:29 UTC, `logs/boot-0053s.txt`).** With /chosen/display-scale = 3: `exec SpringBoard` once, `exec backboardd` once, no CRASH for either; MobileGestaltHelper reads IOMFB size/dot pitch; backboardd opens AppleCLCD (sels 57,15,22,29,33,79,74 as before). No IOSurface creates and no swaps: backboardd keeps polling `IOProviderClass IOAcceleratorES` (-> 0 found) and AGXAccelerator/IOAcceleratorESLegacy - no GPU, so no CoreAnimation renderer yet. Log goes quiet after ~47 s (only 47 flushes): the system idles. NEXT WALL: CoreAnimation rendering without a GPU (CPU path) so the window server produces frames.
+- **SpringBoard's invalid mode = scale 0 (boot 0053n, 15:19 UTC, `logs/boot-0053n.txt`, heap scan):** `FBSDisplayMode cannot be configured as requested : <FBSDisplayMode: ...; infxinf@0x (1080x2400/0) 60Hz sRGB SDR>` - pixel size and 60 Hz are fine, scale is 0. libMobileGestalt (MGIOMFBSupport.c, sub_19c560a54) reads `display-scale` (u32, default 0) and `display-rotation` from **IODeviceTree:/chosen**, pixel size via IOMobileFramebufferGetDisplaySize (MobileGestaltHelper sel 8/28 in the log). mkadt now adds `/chosen/display-scale` = 3 (1080x2400 @3x = 360x800 pt). ADT `shim/out/sweet-0054hi.adt` (QEMU `research/q0054-hi.adt`), image `shim/out/shim-boot-0053s.img` = 0053 kernel + 0054hi ADT. Possible catch: MobileGestalt may have cached scale 0 in `/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/...`.
+- **MILESTONE: backboardd survives and opens the display (boot 0052n on v9, 15:07 UTC, `logs/boot-0052n.txt`).** No `CRASH backboardd`. It walks `IODeviceTree:/arm-io` children, matches IOMobileFramebuffer, `open AppleCLCD type 0 -> 0x0`, calls IOMFB selectors 57, 15, 22, 29, 33, 79 (GetBlock, out 1580/40), 74 (SupportedFrameInfo), 12, 6, 27, 17, 84, 50; opens IOCoreSurfaceRoot (sel 13); looks for AGXAccelerator / IOAcceleratorES / IOAcceleratorESLegacy (none, repeatedly), `IODeviceTree:/product` (none, repeatedly), `/buttons`, aop-smart-cover, IOPMrootDomain. No swaps yet. **SpringBoard now gets past display discovery** and dies (sig 5) in `-[FBSDisplayMode _initWithWidth:height:preferredScale:scaleOverride:refreshRate:gamut:hdr:rotation:virtual:validityCheck:]+580` <- `_initWithCADisplayMode:scale:rotation:` <- `FBSDisplayConfiguration _initWithImmutableDisplay:` <- `FBSDisplaySource initWithDisplay:` <- `FBSDisplayMonitor` (slide 0x14504000): "FBSDisplayMode cannot be configured as requested". Checks: width/height >= 2, preferredScale > 0, scaleOverride >= 0, refreshRate non-zero, valid gamut/HDR/rotation. Suspects: refresh rate 0 (IOMFB timing blocks answered with zeros) and/or scale 0 (MobileGestalt main-screen-scale; no /product node in the ADT). **Patch 0053**: heap text scan also on SIGTRAP and for SpringBoard (default sweetscan list backboardd,SpringBoard) to read the exact mode description.
+- **Image v9 (2026-10-17) = v8 + `/private/var/containers/{Bundle,Data/System,Shared/SystemGroup,Temp}` (root:wheel 0755; on iOS these live on the data volume, absent from the rootfs) + launchd.plist with StandardOutPath/StandardErrorPath renamed to ...PatX (the in-place phone fix; daemons' stdout reaches the log via the 0048 /dev/null tee).** `/run/media/dipa/android/ios-sweet-ipsw/ios16-root-20H392-v9.img` SHA256 aa9f9139...6e67, `.simg` 12,145,303,864 bytes; written through `sudo mount -t hfsplus -o loop,force`. **Patch 0052** (`xnu/patches/0052-sweet-hfs-rename-swap.patch`, CI `39042761826` -> `xnu/out-0052`, QEMU OK, image `shim/out/shim-boot-0052n.img`): vn_rename falls back to VNOP_EXCHANGE when VNOP_RENAMEX(RENAME_SWAP) returns ENOTSUP for two regular files on one volume (HFS exchange swaps data and cnode descriptors = swap semantics). Flashing v9 started 2026-10-17 ~15:00 UTC.
+- **backboardd EXCEPTION FOUND (boot 0051n, 14:41 UTC, `logs/boot-0051n.txt`, patch 0051 heap scan):** `*** Terminating app due to uncaught exception 'NSInvalidArgumentException', reason: '*** -[NSURL initFileURLWithPath:]: nil string parameter'`. First-throw stack (slide 0x337f0000): `+[NSURL fileURLWithPath:]` <- `-[BSSystemContainerForCurrentProcessPathProvider libraryPath]` <- `cachesPath` <- backboardd main+0x1d858 (StartWindowServer, shader cache path). BaseBoard: libraryPath = `BSSystemSharedResourcesDirectoryForIdentifier` = `BSSystemSharedDirectoryForIdentifier(id)` + "/Library"; that calls `container_system_path_for_identifier` (libsystem_containermanager -> `_container_legacy_lookup` -> containermanagerd XPC), which returned NULL (BaseBoard logs "Error getting shared system container ..."). With 0050 the sandbox denials are gone. containermanagerd.log.0 in the pulled (pre-0050) image: "Did not receive any persona attributes", "Expected to find at least one persona", notify_register_dispatch failed 9; `/private/var/containers` does NOT exist in the root image (on iOS it lives on the data volume). usermanagerd does create kernel personas 99/199/1000, but fails to save `/private/var/keybags/usersession.kb` and `persona.kb`: "Failed to atomically swap writing file: Operation not supported (45)" (HFS has no RENAME_SWAP). NEXT: create `/private/var/containers` (and check what containermanagerd needs for system group containers), fix or emulate RENAME_SWAP on HFS, then re-check backboardd.
+- **Disk housekeeping (2026-10-17):** /home was at 4 GiB free. Moved (not deleted) `xnu/out-0010..0044` and old `shim/out/*.img`/`payload-*.bin` (everything before 0046) to `/run/media/dipa/android/ios-sweet-work/archive/{xnu,shim-out}` (6.3 GiB); /home now 8.7 GiB free. Large work files (phone-root.img 16 GiB, logs, tracev3 dumps) live in `/run/media/dipa/android/ios-sweet-work/`. **Patch 0051** (`xnu/patches/0051-sweet-crash-heap-strings.patch`, CI `39041440935`): on SIGABRT of a process in boot-arg `sweetscan` (default backboardd) the crash log prints heap text runs as `STR ...` (to find the NSException reason). Boot 0051n 14:41 UTC.
+- **Boot 0049n (14:11 UTC, `logs/boot-0049n.txt`, patch 0049 trace): backboardd's IOKit lookups before it dies** (each run): `IODeviceTree:/arm-io/pearl-sep` -> none, matching ApplePearlSEPDriver -> none, `IOService:/IOResources/AppleKeyStore` open OK, matching IOHIDDevice (DeviceUsagePairs) / `HIDServiceSupport` notifications, `usb-drd,t8027` notification; **never any IOMobileFramebuffer / display lookup** - the exception happens before display detection. launchd (tracev3) shows backboardd's mach lookups denied with `error = 159: Sandbox restriction`: com.apple.mobilegestalt.xpc, com.apple.iohideventsystem, com.apple.system.notification_center, com.apple.logd, containermanagerd, ACCHWComponentAuthService, oscard. libsystem_sandbox uses `__mac_syscall("Sandbox", op, arg)` (ops: 1 init, 2 check, 3 note, 4 container path, 5/6/7/8 extensions, 0x15 check_bulk, ...); with no policy named "Sandbox" every call gets ENOPOLICY. **Patch 0050** (`xnu/patches/0050-sweet-sandbox-policy.patch`): built-in permissive MAC policy "Sandbox" in sweet_amfi.c (mpo_policy_syscall returns 0, container/extension ops ENOENT; logs first use of each op as `SWEET Sandbox: proc op N`).
+- **Phone root pulled (16 GiB, 12 min, `adb exec-out dd if=/dev/block/sda34`) to `/run/media/dipa/android/ios-sweet-work/phone-root.img` (loop-mounted ro at /run/media/dipa/iOSRoot).** No .ips crash reports. logd tracev3 (Persist, LZ4 `bv41` blocks, decompressed strings in `ios-sweet-work/tracev3/all.txt`): /private/var/db/uuidtext is EMPTY so only launchd's own messages are readable. Findings: v8 launch failure = `Service could not initialize: posix_spawn(/usr/libexec/backboardd), error 0xd - Permission denied` (xpcproxy exit 78) - /dev/console not openable for the mobile user; backboardd[98] spawned `com.apple.MTLCompilerService` before SIGABRT; **launchd denies many mach lookups with `error = 159: Sandbox restriction`** (mediaserverd -> com.apple.backboard.display.services, remoted, mobiletimerd -> sleepd, identityservicesd -> apsd) and **tccd exits OS_REASON_SANDBOX "profile not found"** - no Sandbox kext/profiles on SWEET; likely cause of many daemon crash loops (next wall after the display). CF's uncaught-exception text never reaches stderr for daemons (no CF handler; libc++abi prints only the type). **Patch 0049** (`xnu/patches/0049-sweet-iokit-trace.patch`): `IOK name: ...` console lines for registry path lookups, child iterators, matching (with result count/class), matching notifications and IOServiceOpen of the processes in boot-arg `sweetiolog` (default backboardd), max 400 lines.
+- **CONFIRMED: launchd StandardOut/ErrorPath=/dev/console stops backboardd from launching.** After the in-place rename (boot 0047n-b, log `logs/boot-0047n-b.txt`) backboardd launches again and dies as on v7: sig 6, `___pthread_kill <- abort <- demangling_terminate_handler <- _objc_terminate <- std::terminate <- _dispatch_client_callout <- _dispatch_once_callout <- main+0x9334` (window-server dispatch_once). It never opened AppleCLCD or IOCoreSurfaceRoot (no `SWEET FB/SURF: backboardd` lines) -> throws before/at display detection. **Patch 0048** (`xnu/patches/0048-sweet-devnull-tee.patch`, CI `39037749668` -> `xnu/out-0048`, image `shim/out/shim-boot-0048n.img`): writes to /dev/null by processes named in boot-arg `sweetnull` (default `backboardd,SpringBoard`) are printed as `|name| text`. Boot 0048n (13:48 UTC, log `logs/boot-0048n.txt`): only `|backboardd| libc++abi: terminating due to uncaught exception of type NSException` (CF's reason line goes to os_log, not stderr, despite CFLOG_FORCE_STDERR/OS_ACTIVITY_DT_MODE). Next: pull the whole 16 GiB root from recovery (`adb exec-out dd if=/dev/block/sda34`) to `/run/media/dipa/android/ios-sweet-work/phone-root.img` and read ReportCrash .ips files / logd tracev3 for the exception reason.
+- **Persistent log WORKS (boot 0047n on v8, 13:31 UTC; pulled from OrangeFox: 70 KB, 111 flushes, `/run/media/dipa/android/ios-sweet-work/logs/boot-0047n.txt`).** In 3 min **backboardd was never exec'd** (v7 ran it), ~70 bare `exec xpcproxy`, SpringBoard loops on FBSDisplayMonitor (no display), mediaserverd sig 11 loop, locationd, lockdownd sig 5. Suspect the v8 plist (StandardOut/ErrorPath=/dev/console on backboardd). **In-place plist edit from recovery (no reflash):** launchd.plist is one extent at image/partition byte offset 0x1e025f000 (195 blocks; verified bytes identical on phone vs local v8 mount); renamed StandardOutPath->StandardOutPatX and StandardErrorPath->StandardErrorPatX (same length, both jobs) in blocks 68 and 105 via `adb push` + `dd of=/dev/block/sda34 seek=... conv=notrunc,fsync`, read back VERIFIED. Phone now differs from local v8 image in those 2 blocks (files in `/run/media/dipa/android/ios-sweet-work/`). Test boot 0047n 13:38:42 UTC. Recovery kernel has no hfsplus (raw block edits only).
+- **Patch 0047: persistent console log (CI `39036478663` -> `xnu/out-0047`, QEMU no panic; phone image `shim/out/shim-boot-0047n.img` = 0047 + sweet-0046hi.adt + 0045n cmdline).** `_cnputs` (all console output: kernel printf + daemons' /dev/console) also appends to a 4 MiB ring in sweet_ufs.c; after the UFS partition is ready and writable (ufsrw=1) a thread writes new ring blocks + header to the LAST 1025 blocks (4 KiB) of userdata every ~1 s and SYNCHRONIZE CACHE (prints `SWEET LOG: console log to the last 4100 KiB ...`). Read: phone to fastboot -> `fastboot boot recovery/recovery.img` (OrangeFox) -> `tools/sweet-log-pull.sh OUT.txt` (adb dd of that area + `tools/sweet-log.py`). Not yet verified on the phone. Panics after the last flush are not in it (screen still shows them). 2x font attempt reverted: XNU's v_scale only scales the progress icon.
+- **Boot 0046n on v8 (13:05 UTC, VID_20261017_150522_HSR_120):** phone prints `SWEET SURF: IOCoreSurfaceRoot registered` and `SWEET FB: AppleCLCD 1080x2400 stride 4320 at 0x9c000000, default surface 1` (nubs + match work on hardware). Visible userspace: early boot tasks, launchd_cache_loader, `exec SpringBoard`; no `exec backboardd` / `SWEET FB: backboardd` line seen in the readable frames (video blurry). Frame 00:47: lower half of the screen shows OLDER console text (16:01:12) below newer lines -> unconfirmed hint that a swap copied an old snapshot of the panel (CA reads the default/displayed surface = panel memory). SpringBoard still dies in `-[FBSDisplayMonitor _initWithBookendObserver:transformer:]+1160` (sig 5, slide 0x30960000). **Shim: 2x console font** (`shim/loader.c` Video.v_depth scale field = 1) so phone videos are readable; image `shim/out/shim-boot-0046b.img` = 0046n + 2x font.
+- **Patch 0046: built-in IOSurface + IOMobileFramebuffer (2026-10-17, offline, NOT phone-tested).** `xnu/patches/0046-sweet-iosurface-iomfb.patch`: new `iokit/Kernel/arm/SweetSurface.{h,cpp}` (IOCoreSurfaceRoot + IOSurfaceRootUserClient: sel 13/0/4/34/35, traps 0-5, wired buffers mapped into the caller, per-client refs) and `SweetFramebuffer.cpp` (AppleCLCD : IOMobileFramebuffer on /arm-io/disp0: sizes, swap = CPU copy of enabled layers into the ABL panel memory, 60 Hz vsync via sendAsyncResult64WithOptions(CanDrop), panel memory published as the default IOSurface, kernel text console paused on the first swap only with `sweetfb_noconsole=1` (default keeps the console: pausing switches it to serial and would hide panics)); SweetPlatformExpert creates nubs for /arm-io children (not gic) attached to the platform expert (IOPlatformDevice::compareName casts its provider to IOPlatformExpert, so nubs under the arm-io nub never matched - first CI build showed that in QEMU). mkadt: /arm-io/disp0 {device_type display-subsystem, compatible sweet,display, canvas-width 1080, canvas-height 2400}. CI `39021572169` -> `xnu/out-0046`. **QEMU** (`research/q0046-hi.adt`, RAM disk init, msgbuf): `SWEET SURF: IOCoreSurfaceRoot registered`, `SWEET FB: AppleCLCD 1080x2400 stride 4320 at 0x9c000000, default surface 1`, init alive, no panic. Phone image **`shim/out/shim-boot-0046n.img`** (SHA256 9c4d2fe9..., CI `39024108588` with the review fixes: swap bounds check, zeroed 64-bit async ref, port release, 1.5 GiB wired budget, ref leak/race fixes; QEMU re-checked) = 0046 kernel + `shim/out/sweet-0046hi.adt` + the 0045n cmdline; boot it on image v8 (backboardd/SpringBoard log to console) and film. Expected new console lines: `SWEET SURF: <proc> create id ...`, `SWEET FB: backboardd sel N ...`, `SWEET FB: swap ...`. Open question for the next wall: QuartzCore's IOMFB server builds its renderer from Metal first (`CAMetalContextCreate`), GLES only when enabled; how the CPU renderer gets selected on a device without a GPU is not yet established.
+- **IOSurface values ABI (offline RE, `/run/media/dipa/android/ios-sweet-work/iosurface-values.md`) - TODO in SweetSurface (0046 only accepts and drops values, so IOSurfaceCopyValue always returns NULL):** sel 9 SetValue in = {u32 id, u32 pad, IOCFSerialize([value, key]) or ([dict] = merge)}, sel 0xb RemoveValue in = {u32 id, u32 pad, key\0} (empty key = remove all); both out 4 bytes = new generation, client accepts only (gen+2)|1. Kernel after each change: gen = (gen+2)|1 (odd, never 0) -> state+0x20, serialized size (>=1) -> state+0x28. sel 0xa in {u32 id, u32 0, u8 0}, out {u32 ?, u32 gen, serialized non-bulk dict}; too small -> 0xe00002db + needed size (client retries x16). sel 0x1b in 0x88: bulk struct 0x70 @0, u64 valid size @0x70, u64 changed mask @0x78, u32 id @0x80 -> copy masked fields into state+0x30 (bit0 32B @0, bit1 16B @0x20, bit2 8B @0x30, bits3-10 1B @0x38..0x3f, bits11-14 24B @0x40/4B @0x58/8B @0x5c/1B @0x64).
+- **IOMFB display matching confirmed (offline RE, `/run/media/dipa/android/ios-sweet-work/iomfb-match.md`):** the framework never matches on "AppleCLCD"; any registered IOMobileFramebuffer subclass works. `iomfb_match_callback` reads only `dfr`/`AppleTV`/`external` (CFBoolean, service itself, no parents); internal main display = all absent/false (type 0, name "primary"). Display count = /arm-io children whose device_type starts with "display-subsystem" (count 0 -> CreateDisplayList returns NULL; more nodes than services -> 30 s wait). IOMobileFramebufferOpen fails only on IOServiceOpen failure; canvas-width/height read as 4-byte CFData from the IOService-plane parent (optional). CopyProperty = IORegistryEntrySearchCFProperty on the service only. Patch 0046 (disp0 node, `external`=false, AppleCLCD : IOMobileFramebuffer) fits all of this.
+- **IOMobileFramebuffer swap + notification ABI (2026-10-17, offline).** Swap record = fb+0x18, **0x46c bytes**, zeroed by SwapBegin and sent whole by `kern_SwapEnd` = IOConnectCallStructMethod(sel 5, rec, 0x46c, no output). **SwapBegin** = sel 4, no input, 1 scalar out = swap id (stored at rec+0x50). `kern_SwapSetLayer(fb, layer<4, IOSurfaceRef, CGRect a, CGRect b, flags)`: rec+0x54+4*layer = **IOSurface id**; rec+0x104 bit layer = layer enabled (rec+0x108 bit cleared); rect a (int x,y,w,h, scaled) at rec+0x64+16*layer, rect b at rec+0xc4+16*layer; rec+0x114+4*layer = transform from flags&0xf; flag bits 5/31/6/7/8/9 set bytes rec+0x2ca/0x2cc/0x2e3/0x2e5/0x2e6/0x467+layer. A NULL surface only sets the enable bit with zero id. SwapWait = sel 6 scalars [swap id, timeout, 0].
+  - **Notifications**: `IOMobileFramebufferScheduleWithDispatchQueue`/`GetRunLoopSource` create an IONotificationPort and `IOConnectSetNotificationPort(conn, type, port, 0)` (kernel `registerNotificationPort`). `kern_EnableNotifications(fb, type, cb, ctx)` = **sel 72 scalars [NotifyCallbackFuncs[type], fb, type, 0]** -> the kernel keeps an async reference {port, func, refcon=fb} per type and fires it with `sendAsyncResult64`. Types: 0 HotPlug, 1 Power, 3 FrameInfo (args[0] = mask of 31-bit keys, args[1] u32, then values), 4 CRC, **5 Vsync**: 6 args, each a 32-bit half in a u64 slot: (ts lo, ts hi), (t2 lo, hi) passed through the time-ingest helper, (t3 lo, hi); the framework then calls the client's vsync callback(fb, ts, t2', t3, ctx). Vsync callbacks are dropped while the notification port has queued messages.
+
+- **IOSurface.framework user-client ABI reversed (2026-10-17, offline, step 2 of the GUI plan).** `ipsw dyld disass research/dsc/dyld_shared_cache_arm64 --image IOSurface` (selector scan script: scratchpad `selscan.py`).
+  - Connect (`_iosConnectInitalize`, pthread_once): `IOServiceGetMatchingService(IOServiceNameMatching("IOCoreSurfaceRoot"))`, retried with sleep(1) up to 241 times (a missing service stalls every client ~4 min, no crash); `IOServiceOpen(type 0)`; then **sel 13** (no inputs, struct out 0x18 bytes = `_ioSurfaceLimits`) and requires u16 at out+0x16 == 1 (ABI version); out+0 = offset/plane-base alignment mask, out+4 = bytes-per-row alignment mask (used as (x+m)&~m), +0..+0x14 also copied into IOSurface remote-method init, otherwise logs and closes the connection.
+  - **Create = sel 0**: scalar in [parent id or 0], struct in = `IOCFSerialize(props, kIOCFSerializeToBinary)` (OSUnserializeBinary format; keys IOSurfaceWidth/Height/BytesPerRow/BytesPerElement/PixelFormat/AllocSize/PlaneInfo/CacheMode/IsGlobal/...), struct out **0xa68 bytes** ("lock result"). **Lookup = sel 4**: scalar in [id], same struct out. LookupFromMachPort = sel 0x22 (scalar in [port name]); CreateMachPort = sel 0x23 (scalar in [id, options], scalar out [port name]).
+  - Lock result (copied to client+0x68, size 0x68 + planes*0x80, min 0xe8): 0x00 u64 base address **mapped in the caller's task**; 0x08 u64 task VA of a per-surface shared state page (+0 u64 registry id, +8/+0xa u16 bound accel ids, +0xc u32 seed, +0x14 u8 tiled, +0x20 u32 value generation, +0x24 YCbCr matrix, +0x28 u32 non-bulk values size, +0x2d u8 displayable, +0x2e u8 sysmem-only, +0x30 0x70 bytes bulk attachments); 0x10 u64 task VA of timestamp page (4 u64 indexed timestamps, +0x20 detach code); 0x18 u32 surface id; 0x1c u32 alloc size; 0x20 width; 0x24 height; 0x28 bytes per row; 0x2c buffer offset; 0x30 pixel format; 0x34 u32 (dcache flush length); 0x38 plane count; 0x40 u16 bytes/element; 0x42 u8 element width; 0x43 u8 element height; 0x44 cache mode; 0x4c u8 subsampling; 0x4d u8 prohibit-use count; 0x50 parent id; 0x54 slice count; 0x58 u64 trace id; 0x60 u64 protection options; planes[n] at 0x68+n*0x80 (+0 width, +4 height, +8 bytes/row, +0xc offset, +0x14 size, +0x18 u16 bpe, +0x1a/+0x1b u8 element w/h, +0x1c u8 component count, +0x1d address format, +0x54 u8 compression type (non-zero -> no CPU base address)).
+  - **Traps** (IOConnectTrapN -> `IOUserClient::getTargetAndTrapForIndex`): 0 IncrementUseCount(id, category), 1 DecrementUseCount(id, category), 2 **Lock**(id, options, &seed_out), 3 **Unlock**(id, options, &seed_out), 4 Release(id), 5 Release after a failed create/lookup setup (id).
+  - Other selectors: 5 SetYCbCrMatrix, 6 WrapClientImage, 7 WrapClientMemory, 9 SetValue (serialized), 0xa UpdateNonBulkValueCache (struct in 9), 0xb RemoveValue, 0xc BindAccel, 0x11 SetSurfaceNotify (async), 0x12 RemoveSurfaceNotify, 0x13 Log, 0x14 SetPurgeable, 0x15 SetOwnership, 0x16 SetTiled, 0x18 SetTimestamp, 0x19 GetTileFormat, 0x1a CopyDataValueBytes, 0x1b SetBulkAttachments (struct 0x88), 0x1e/0x2e-0x31 (via outlined helpers), 0x1f SetCompressedTileDataRegionMemoryUsed, 0x20 GetGraphicsCommPageAddress, 0x21 SetIndexedTimestamp, 0x24-0x26/0x2d IOSurfaceAccelerator, 0x27-0x29 shared events, 0x2a SignalEvent, 0x2b Set/InitDetachModeCode, 0x2c SetOwnershipIdentity, 0x32-0x34 data properties.
+  - => SWEET kernel service: class/name **IOCoreSurfaceRoot** + IOSurfaceRootUserClient; minimum = sel 13, 0, 4, 9/0xa/0xb (values), traps 0-5, 0x22/0x23 later for cross-process surfaces (CA sends surfaces to backboardd by mach port). Memory: IOBufferMemoryDescriptor per surface, mapped into each task with createMappingInTask; ids from a global table.
+
+- **Image v8: daemon logs on the console.** `tools/patch-launchd-plist.py IN OUT LABEL...` rewrites launchd.plist (binary, plistlib): renames every `_PanicOnCrash` to `_PanicOnCrasX` and gives the listed jobs `StandardOutPath`/`StandardErrorPath` `/dev/console` (devfs console is 0622, writable by mobile) plus `OS_ACTIVITY_DT_MODE=YES` (os_log mirrored to stderr) and `CFLOG_FORCE_STDERR=1`. v8 = v7 + that plist for com.apple.backboardd and com.apple.SpringBoard, written through the mount (796310 bytes, root:80 0644), SHA256 in `ios16-root-20H392-v8.img.sha256`, `.simg` ready; boot with `shim/out/shim-boot-0045n.img`. Goal: see backboardd's uncaught exception text and the window server's display probing. ODDITY (unresolved): the v5 raw-image rename at offset 0x1e025f000 is present in the v5-v7 image bytes, but the plist read through a Linux mount of v7 still had the original `_PanicOnCrash` keys; filefrag shows the file as one extent. Never patch file contents through raw offsets again; write through the mount.
+- **IOMobileFramebuffer.framework reversed (step 1 of the GUI plan).** `ipsw dyld disass research/dsc/dyld_shared_cache_arm64 --image IOMobileFramebuffer`.
+  - Display discovery (`IOMobileFramebufferCreateDisplayList` -> `getDisplayListNumber`): iterates children of `IODeviceTree:/arm-io`, counts nodes whose `device_type` is "display-subsystem" or "ext-display-subsystem" (or `compatible` "paravirtualizedgraphics,gpu"); then `iomfb_populate_display_infos` adds an IOServiceAddMatchingNotification(IOServiceFirstMatch, **IOServiceMatching("IOMobileFramebuffer")**) and runs the run loop up to 30 s until that many services matched. `iomfb_match_callback` reads service properties `dfr`, `AppleTV`, `external` (CFBoolean) and names displays (external ones "%s-%d").
+  - `IOMobileFramebufferOpen(service, task, type, &fb)`: `__ioMobileFramebufferAlloc` (CFPreferences com.apple.iokit.IOMobileGraphicsFamily: canvas_width/height, override_display_width/height, override_panel_width/height, benchmark, enable_ktrace), `IOServiceOpen(service, task, type)` (GetMainDisplay passes type 0), `getEDTProperty` reads `canvas-width`/`canvas-height` from the service's IODeviceTree parent, then fills a table of `kern_*` function pointers.
+  - User client selectors (`kern_*` -> IOConnectCall*): 3 _kern_GetLayerDefaultSurface[ScalarMethod_stub]; 4 _kern_SwapBegin[ScalarMethod_stub]; 5 _kern_SwapEnd[StructMethod_stub]; 6 _kern_SwapWaitWithTimeout[ScalarMethod_stub] _kern_SwapWait[ScalarMethod_stub]; 7 _kern_GetID[ScalarMethod_stub]; 8 _kern_GetDisplaySize[ScalarMethod_stub]; 10 _kern_SetTVOutMode[ScalarMethod_stub]; 11 _kern_SetWSSInfo[ScalarMethod_stub]; 12 _kern_RequestPowerChange[ScalarMethod_stub]; 13 _kern_EnableStatistics[ScalarMethod_stub]; 14 _kern_SetFlags[ScalarMethod_stub]; 15 _kern_SetDebugFlags[ScalarMethod_stub]; 16 _kern_SetTVOutSignalType[ScalarMethod_stub]; 17 _kern_SetGammaTable[StructMethod_stub]; 18 _IOMobileFramebufferIsMainDisplay[ScalarMethod_stub]; 19 _kern_SetWhiteOnBlackMode[ScalarMethod_stub]; 20 _kern_SwapSignal[ScalarMethod_stub]; 22 _kern_SetDisplayDevice[ScalarMethod_stub]; 23 _kern_SetDigitalOutMode[ScalarMethod_stub]; 24 _kern_GetHDCPDownstreamState[StructMethod_stub]; 25 _kern_GetDigitalOutState[ScalarMethod_stub]; 26 _kern_printDisplayRegs[ScalarMethod_stub]; 27 _kern_GetGammaTable[StructMethod_stub]; 28 _kern_GetDotPitch[ScalarMethod_stub]; 29 _kern_GetDisplayArea[StructMethod_stub]; 30 _kern_EnableDisableDithering[ScalarMethod_stub]; 31 _kern_SetUnderrunColor[ScalarMethod_stub]; 33 _kern_EnableDisableVideoPowerSavings[ScalarMethod_stub]; 34 _kern_SetVideoDACGain[ScalarMethod_stub]; 35 _kern_SetLine21Data[ScalarMethod_stub]; 41 _IOMobileFramebufferEnableMirroring[ScalarMethod_stub]; 42 _IOMobileFrameBufferGetMirroringCapability[StructMethod_stub]; 43 _IOMobileFramebufferSetRenderingAngle[StructMethod_stub]; 44 _IOMobileFramebufferSetMirrorContentRegion[StructMethod_stub]; 47 _kern_HDCPSendRequest[ScalarMethod_stub]; 48 _kern_HDCPGetReply[ScalarMethod_stub]; 49 _kern_SurfaceIsReplaceable[ScalarMethod_stub]; 50 _kern_SetBrightnessCorrection[ScalarMethod_stub]; 51 _kern_SetColorRemapMode[ScalarMethod_stub]; 52 _kern_SwapCancel[ScalarMethod_stub]; 53 _IOMobileFramebufferSetCanvasSize[ScalarMethod_stub]; 54 _IOMobileFramebufferGetMatrix[Method_stub]; 55 _IOMobileFramebufferSetMatrix[Method_stub]; 56 _IOMobileFramebufferKernelTests[StructMethod_stub]; 57 _kern_GetColorRemapMode[ScalarMethod_stub]; 66 _kern_SPLCSetBrightness[ScalarMethod_stub]; 67 _kern_SPLCGetBrightness[ScalarMethod_stub]; 68 _kern_SetParameter[Method_stub]; 69 _kern_SwapSetColorMatrix[StructMethod_stub]; 72 _kern_DisableNotifications[ScalarMethod_stub] _kern_EnableNotifications[ScalarMethod_stub]; 73 _kern_ChangeFrameInfo[ScalarMethod_stub]; 74 _kern_SupportedFrameInfo[Method_stub]; 75 _kern_FactoryPortal[StructMethod_stub]; 77 _kern_GetCurrentAbsoluteTime[ScalarMethod_stub]; 78 _kern_SetBlock[Method_stub]; 79 _kern_GetBlock[Method_stub]; 80 _kern_GetLinkQuality[ScalarMethod_stub]; 81 _kern_SwapCancelAll[ScalarMethod_stub]; 82 _kern_GetProtectionOptions[ScalarMethod_stub]; 83 _kern_CopyLayerDisplayedSurface[ScalarMethod_stub]; 84 _kern_SetContrast[StructMethod_stub]; 85 _kern_GetBufBlock[Method_stub]; 86 _IOMFBGainEncoderFinishEncoding[Method_stub]; UNKNOWN {}
+  - => Kernel needs: an `/arm-io` child node with device_type "display-subsystem" (+ canvas-width/height) and an IOService of class **IOMobileFramebuffer** (subclass name match) attached under it, opened with type 0, implementing at least GetDisplaySize(8), IsMainDisplay(18), GetID(7), GetLayerDefaultSurface(3), SwapBegin(4)/SwapEnd(5 struct)/SwapWait(6), Enable/DisableNotifications(72), frame info(73/74), CopyLayerDisplayedSurface(83), plus IOSurface for the swapped buffers. NEXT: CoreAnimation's AppleDisplay/IOMFBDisplay usage of these (constructor, first swap, vsync), then IOSurface.framework's IOSurfaceRoot selectors.
+- **GUI PLAN (decided 2026-10-16): CPU rendering + kernel IOMobileFramebuffer.** User: CPU rendering is fine for now (goal = prove the GUI runs), may later research an Apple-style GPU driver for the Adreno 618 -> keep display output and renderer separable. QuartzCore findings (symbols from the cache's .symbols subcache: `ipsw dyld symaddr research/dsc/dyld_shared_cache_arm64 --image QuartzCore`; strings: `ipsw dyld macho ... QuartzCore --strings`):
+  - Renderers: `sw_new_context` (CA::OGL::SWContext, full CPU renderer incl. blur, images, IOSurface-backed surfaces, make_buffer_current(WindowServer::Surface)), `gles_new_context`, `metal_new_context`, `new_null_context`. Env knobs include CA_ENABLE_OGL, CA_DISPLAY_TYPE, CA_FORCE_LOCAL_SERVER, CA_FORCE_TIMER, CA_CANVAS_WIDTH/HEIGHT, CA_MAIN_DISPLAY_SCALE/ORIENTATION, CA_DISABLE_RENDER, CA_ALWAYS_RENDER (selection logic not traced yet).
+  - `-[CAWindowServer _detectDisplays]` (0x1884e3150) iterates static tables `open_funcs`/`count_funcs` = AppleCLCDDisplay, AppleRGBOutDisplay, AppleWirelessDisplay only; each `count()` = `display_count_of_type(IOMFBDisplayType)` over **`IOMobileFramebufferCreateDisplayList()`**, `open(i)` = `create_display_of_type` -> `CA::WindowServer::AppleDisplay(CFString name, ..., IOMFBDisplayType)` (an IOMFBDisplay driven by IOMFBServer: vsync_callback, frame_info_callback, swaps). `CA::WindowServer::VirtualDisplay` exists but is never auto-detected (explicit API only). => the main display MUST come from an IOMobileFramebuffer kernel service.
+  - NEXT: reverse IOMobileFramebuffer.framework: IOMobileFramebufferCreateDisplayList / IOMobileFramebufferOpen (service matching, display type property), the user-client selectors used by IOMFBServer (display size/modes, swap begin/set-layer/end with IOSurface ids, vsync notifications), then the IOSurface kernel side (IOSurfaceRoot user client: create/lookup/lock, memory mapping) that both IOMFB swaps and CA surfaces need. Kernel: SWEET IOMobileFramebuffer service that copies the swapped IOSurface to the 1080x2400 framebuffer at 0x9c000000.
+- **logd fixed; backboardd = DISPLAY WALL (boot 0045n on v7, 21:08:57 UTC, frames VID_20261016_230850 00:55-01:28, slide 0x4c3ec000, `research/crash-0045n-v7.txt`).** No `CRASH logd` any more; new daemons run (runningboardd, WirelessRadioManagerd, networkserviceproxy, dasd, cloudpaird, magicswitchd, atc, askpermissiond, ManagedSettingsAgent, containermanagerd uses AKS 0/17). New: locationd sig 11 at CFRunLoopAddSource+132 (NULL source) from its main+0x2af138 in a dispatch_once. **backboardd** sig 6: abort <- std::terminate <- _objc_terminate <- dispatch_once <- main+0x9334 = the "start %{public}@..." wrapper (0x100009264) for **"window server"** (block 0x10000a770 -> dispatch_once body 0x10001d7f0 = StartWindowServer): MTLSetShaderCachePath, `[CAWindowServer serverWithOptions:@{kCAWindowServerDisableUpdatesOnMainDisplay: @YES}]`, `setRendererFlags:`, **`mainDisplay`** -> `displayId` -> `[CADisplay displayWithDisplayId:]`, setWindowServerDisplay:, bounds, pointScale, currentMode, preferredScale, nativeOrientation, touchScales... With no display, mainDisplay is nil and it throws. (HID system and GS start fine before it.) SpringBoard dies on the same missing display (FBSDisplayMonitor). QuartzCore display backends (from the cache's .symbols subcache, `ipsw dyld str`): `CA::WindowServer::AppleCLCDDisplay` (IOMobileFramebuffer hardware) and **`CA::WindowServer::VirtualDisplay`** (open(), new_server, clone_update). `CA_DISPLAY_TYPE` and `CA_FORCE_LOCAL_SERVER` strings exist in QuartzCore but have no direct xref (likely read via a table of CA_* env names). NEXT: find how CA::WindowServer::Server enumerates displays (IOMobileFramebuffer services vs VirtualDisplay / CA_DISPLAY_TYPE) and choose: (a) kernel IOMobileFramebuffer service + IOSurface, or (b) a VirtualDisplay rendered by CA's CPU path (CA::OGL::SW) and copied to the framebuffer.
+- **watchdogd + CommCenter + identityservicesd fixed (boot 0045n on v6, 20:41:30 UTC, frames VID_20261016_224133 00:39-01:13, slide 0x20fec000).** `SWEET WDT: watchdogd sel 0 in 0/0 out 1/0 -> ok`, no watchdogd/CommCenter/identityservicesd crashes (CommCenter/identityservicesd now call AKS 0/17/7). usermanagerd boot task runs (UMD_INIT creates primary session uid 501 "mobile", personas 99 System and 199 Default registered with the kernel); `Failed to atomically swap writing file /private/var//keybags/usersession.kb: Operation not supported (45)` (HFS lacks the atomic swap rename; non-fatal so far). Remaining: SpringBoard (FBSDisplayMonitor, no display), backboardd (uncaught exception), mediaserverd, lockdownd (crash inside obfuscated code, main+0x4c1b4?), logd. **logd**: main+0x18160 = `BUG IN LIBTRACE: Failed to migrate directory` from 0x10001801c(dir 0): 0x100016538 requires the dir to exist with uid/gid/mode from the table at 0x10002df14 (0: /private/var/db/diagnostics 272:272 0751, 1: /private/var/db/uuidtext 272:272 0755, 2: /private/var/db/diagnostics/timesync 272:272 0755) plus a `.migrated` file, else XPC "operation 6" to a helper and crash. **Image v7** = v6 + those dirs/markers (also in mkiosroot.sh), SHA256 in `ios16-root-20H392-v7.img.sha256`, `.simg` ready. Boot with `shim/out/shim-boot-0045n.img`.
+- **Exit-reason text works (boot 0044n, frames VID_20261016_221726 00:32-00:53, slide 0x22d5c000).** CommCenter/identityservicesd: `couldn't dlopen libobjc-trampolines.dylib: dlopen(/usr/lib/libobjc-trampolines.dylib, 0x0106): tried: '/usr/lib/libobjc-trampolines.dylib' (no such file, not in dyld cache)`: the file only exists in the OS cryptex and dyld does not search cryptexes at ignition_level=1. 19 cryptex files have no root counterpart (OS: DriverKit dyld cache + .symbols, VisualTestKit, libffi-trampolines, libobjc-trampolines, libstdc++ 6.0.9 + 2 symlinks; App: SafariSupport.bundle, AuthenticationServicesAgent, com.apple.Safari.History, passwordbreachd, safarifetcherd, webbookmarksd, webinspectord, webpushd) -> hard-linked (symlinks copied: Linux hfsplus cannot hard-link symlinks); `tools/mkiosroot.sh` does it generically. watchdogd still crashed: the `-wdt_no_pmu` / `/arm-io/wdt no-pmu` check (0x10000a01c) only runs when os_variant_has_internal_diagnostics; otherwise 0x100009b18 looks up IOServiceMatching("IOService") + IOPropertyMatch {IOPMUPrimary: 1} (NSConstantDictionary) and crashes if absent, then IORegistryEntrySetCFProperty(boot stage 0xff) (failure only logged). Patch **0045**: IOWatchdog sets IOPMUPrimary = 1 and accepts setProperties; CI `38961814194` -> `xnu/out-0045`. **Image v6** = v5 + the 19 cryptex links, SHA256 7c610c6a...297a, `ios16-root-20H392-v6.simg` (full flash needed). Boot image `shim/out/shim-boot-0045n.img` (0045 + sweet-0044hi.adt). Still open: SpringBoard (no display), backboardd (uncaught exception, reason none), mediaserverd (Fig NULL dict), logd (main+0x18160), lockdownd (main+0x4c1b4).
+- **System survives daemon crashes (boot 0043p, video frames VID_20261016_215006 00:25/00:42/00:54).** With the v5 plist patch no panic: launchd keeps launching (runningboardd, powerd, tccd, healthd, peopled, cryptexd, routined, aksd, mediaremoted, familynotificationd, nanoprefsyncd, navd, cloudpaird, passd, amsaccountsd, accessoryupdaterd, wcd ...). Shared cache slide that boot 0x406b4000 (`research/crash-0043p.txt`). watchdogd still crashed at main+0xb82c from the PMU step: `-wdt_no_pmu` is only honored when os_variant_has_internal_diagnostics; customer builds read `no-pmu` from IODeviceTree:/arm-io/wdt (IORegistryEntrySearchCFProperty) -> mkadt adds /arm-io/wdt {no-pmu}. **cryptexd** sig 6: abort_with_payload <- os_crash_fmt <- `__darwin_arm_secure_boot_chip.cold.7` ("panic: failed to get crypto algorithm") <- `_img4_chip_select_personalized_ap`: reads /chosen use-ddi-secure-boot, allow-ecid-mismatch, crypto-hash-method ("sha1" | "sha2-384"), /chosen/asmb lp-smb0/1 -> mkadt adds crypto-hash-method "sha2-384". **identityservicesd** sig 6 = same `_objc_fatal` in imp_implementationWithBlock as CommCenter (block trampolines; message needed). lockdownd sig 5 at main+0x4c1b4. Patch **0044**: crash report adds `CRASH name reason ns N code X: text` (exit reason description = abort_with_payload text). CI `38959096811` -> `xnu/out-0044`, QEMU OK. Image `shim/out/shim-boot-0044n.img` = 0044 + `shim/out/sweet-0044hi.adt` (wdt no-pmu, crypto-hash-method) + cmdline (wdt=-1, no -wdt_no_pmu).
+- **First symbolicated daemon crashes (boot 0043u on journaled v4, 19:38:53 UTC; video frame chat image 36; transcribed in `research/crash-0043u.txt`; shared cache slide 0x40d60000 for every process).** (Gemini's video transcription invented values, use frames only.) `tools/sweet-crash.py research/dsc/dyld_shared_cache_arm64 x research/crash-0043u.txt`:
+  - **watchdogd** pc main+0xb82c (`_os_crash` trap helper) from 0x100009bb0 = set PMU boot stage via IORegistry (no PMU) -> fix: boot-args `wdt=-1 -wdt_no_pmu` (Apple's own test mode writes "%s wdt=-1 -wdt_no_pmu"; watchdogd logs "skipping setting PMU boot stage because -wdt_no_pmu found in boot-args or no-pmu found in EDT"). Kernel effect of wdt=-1: sched hygiene debug off, zone_exhausted_timeout -1 (harmless).
+  - **SpringBoard** sig 5 in `-[FBSDisplayMonitor _initWithBookendObserver:transformer:]+1160` <- `+[FBDisplayManager sharedInstance]` <- `FBSystemShellInitialize` <- `SBSystemAppMain`: no main display. GUI WALL: display service (IOMobileFramebuffer / CoreAnimation display).
+  - **backboardd** sig 6: abort <- std::terminate <- _objc_terminate (uncaught exception; message not shown).
+  - **CommCenter** sig 6: `_objc_fatal` in `imp_implementationWithBlock` (from `+[_PFRoutines initialize]`, CoreData): objc block trampolines cannot be allocated -> likely kernel gap (trampoline page remap); will hit many processes.
+  - **mediaserverd** sig 11: CFDictionaryGetValue(NULL) in FigNotificationListenerStartNotifications (routing session manager).
+  - **logd** sig 5 at its main+0x18160 (bt main+0x9dfc); lockdownd sig 5 (not yet symbolicated).
+  - Image v5 = v4 + launchd.plist (`/System/Library/xpc/launchd.plist`, contiguous at image offset 0x1e025f000, 1456980 bytes) with the 7 `_PanicOnCrash` keys renamed `_PanicOnCrasX` in place (raw image patch, no metadata change) -> `diff-v4-v5.simg` = 7 blocks; v5 SHA256 78f96974...185a. Boot image `shim/out/shim-boot-0043p.img` = 0043 + `wdt=-1 -wdt_no_pmu`.
+- **0043 console crash reports (QEMU verified); image `shim/out/shim-boot-0043u.img`; NEXT: flash v4 + boot 0043u.** Boot 0042u (video photo IMG_20261016_211646): short exec lines work; watchdogd crashes with NO `SWEET WDT:` line (fails before its first IOWatchdog call: lookup or IOServiceOpen, or elsewhere); lockdownd, SpringBoard, mediaserverd, CommCenter, identityservicesd, backboardd, watchdogd all crash repeatedly ("Too many corpses being created" = corpse limit, no crash reports). AKS callers: lockdownd (0, 7), imagent/sleepd (0, 17, 7), backboardd (0, 17), UserEventAgent (0, 7, 102, 103 -> unsupported). Patch **0043**: `sweet_crash_log` (osfmk/kern/exception.c, called from proc_prepareexit for crash exits on the current proc) prints `CRASH name[pid] sig S code (exc<<32|code) sub X slide SR mh MH`, `CRASH name pc lr sp fp far`, `CRASH name bt` (10 fp frames); AKS sel 103 notify_state_is_set -> 0. CI `38954520419` -> `xnu/out-0043`. QEMU test: init forks, child `brk #1`: `CRASH launchd[2] sig 5 code 0x600000001 sub 0x1000004f0 slide 0x0`, pc correct, parent keeps running (pid 1 crashes panic before proc_prepareexit, so test with a child). `tools/sweet-crash.py CACHE ROOT [report]` symbolicates typed-in CRASH lines (`ipsw dyld a2s` with addr - slide; main binary offsets = addr - mh + 0x100000000).
+- **v3 reflashed 18:50-18:55 UTC (`research/flash-userdata-v3b.log`, 24/24 OKAY); 0042u booted 19:01:17 UTC on the clean disk (`research/boot0042u-2.log`), SLOW MO VID pending (watchdogd failure reason).** ABL hangs on the first `fastboot boot` after every big flash; user re-enters fastboot. User gave standing approval to reflash/boot without asking (memory standing-flash-approval). Commits now end with `Co-Authored-By: dipa-studio <183933817+dipa-studio@users.noreply.github.com>` (user request; never a Claude trailer).
+  - watchdogd flow: connect_to_kext (0x100005408): IOServiceGetMatchingService("IOWatchdog") fails -> "failed to discover" + _os_crash; IOServiceOpen(type 1) fails -> "IOServiceOpen failed with error : 0x%x" + _os_crash. Then sel 0 (out 1 scalar): 0 -> "userspace monitoring disabled", 0x100009bb0, sleep 2, exit(0); nonzero -> "userspace monitoring enabled", normal operation.
+  - **Image v4 (JOURNALED):** `tools/mkiosroot.sh` now does `mkfs.hfsplus -J`, mounts with `-o loop,force`, adds the /System/Library/Caches/com.apple.dyld hard links (44) and /private/var/keybags/systembag.kb (0700/0600 root). Built from the IPSW dmgs (OS 087-86698-044, SystemOS 087-86593-047, AppOS 087-86715-047) -> `/run/media/dipa/android/ios-sweet-ipsw/ios16-root-20H392-v4.img` SHA256 fba4aeae...ec0f9 + `.simg`. Header: attr 0x80002100 (unmounted, journaled), journal info block 129, journal 8 MiB at 532480 flagged need-init. Linux `fsck.hfsplus -n` reports "Volume header needs minor repair" on any fresh journaled volume even after -y (quirk). QEMU: 64 MB journaled test root (`rd=md0 rootrw=1`, 0042 kernel): `hfs: Initializing the journal (joffset 0x3000 sz 0x80000)` -> mounted -> init runs, no panic. NEXT: flash v4 (full), boot 0042u.
+- **SPRINGBOARD STARTS (boot 0041u 18:39:53 UTC, photo IMG_20261016_204142).** backboardd, bluetoothd, fairplayd.H2, SpringBoard (pid 111, crashed: "Too many corpses"), xpcproxy run; `SWEET AKS: backboardd sel 0 -> 0`, `sel 17 in 1/0 out 0/4096 -> 0`. Panic: watchdogd[113] exited, namespace 2 subcode 5 (SIGTRAP = its _os_crash): watchdogd crashes on purpose when IOServiceGetMatchingService("IOWatchdog") fails ("connect_to_kext() unexpectedly failed") or IOServiceOpen(type 1) fails ("IOServiceOpen failed with error"); IOWatchdog DOES register (QEMU msgbuf: `SWEET WDT: IOWatchdog registered`), cause not on screen yet -> need video. Note `wdt_test=no_user_checkin` makes watchdogd log "detected testing boot-args to not run, exiting" (path not reached here?). **HFS CORRUPTION:** `hfs_swap_BTNode: offset #0 invalid (0xBC1D) (blockSize 0x2000 numRecords 81)`, `node=19677 fileID=4` (catalog), `hfs_mark_inconsistent` repeated. Likely cause: non-journaled HFS + unclean panics while writing (0038e wrote a 2.7 GB core then panicked; every boot since ends in panic). Plan: reflash v3 (clean), longer term HFS journaling. Patch **0042**: one short `exec NAME` console line instead of the 3-line "Allowing spawn of iOS binary" notice; CI `38949451276` -> `xnu/out-0042`; image `shim/out/shim-boot-0042u.img` (same cmdline as 0041u).
+- **LAUNCHD DAEMONS RUN (boot 0039u, 18:29:13 UTC, photo IMG_20261016_203052).** With `launchd_unsecure_cache=1` all boot tasks pass and launchd starts LaunchDaemons (pids > 100: identityservicesd 114 and lockdownd 106 crash, "Too many corpses being created"). Fatal: `watchdogd: ERROR: failed to discover watchdog KEXT service` -> exit (namespace 2 = signal, subcode 5) -> `_PanicOnCrash` panic. watchdogd: IOServiceMatching("IOWatchdog"), IOServiceOpen type 1, IOConnectCallScalarMethod sel 0/1 (check in)/3/4 (disable/enable userspace monitoring)/5, IOConnectCallStructMethod sel 2 (1 KiB in) and 9 (small out); VM path ("detected virtual machine environment and no watchdog KEXT found, exiting...") only when it detects a VM. Console also flooded with `hfs: set hardlink bit on vol=iOSRoot cnid=321318` (Linux-made hard links lack kHFSHasLinkChainBit; repaired only in memory on each lookup). Patches **0040** (`iokit/Kernel/arm/SweetWatchdog.cpp`: IOWatchdog + IOWatchdogUserClient, all selectors succeed with zeroed outputs, each logged once as `SWEET WDT: ...`) and **0041** (sweet_hfs hfs_catalog.c: the three link-repair printfs limited to 8 per boot); CI `38948245372` PASSED -> `xnu/out-0041` (QEMU regression OK). Image `shim/out/shim-boot-0041u.img` (0041 + sweet-0038hi.adt + ufsrw rootrw + launchd_unsecure_cache=1) booted 18:39:53 UTC (`research/boot0041u.log`), photo pending.
+- **v3 FLASHED + keybag passes; next wall AMFI (launchd_cache_loader).** User said "flash, nothing to lose": `fastboot -S 512M flash userdata ios16-root-20H392-v3.simg` 17:51:52-17:57:01 UTC, 24/24 chunks OKAY (`research/flash-userdata-v3.log`). userdata = v3 (SHA256 fa84274c...22df) until the next rw boot. ABL fastboot then hung ("Sending" forever, `reboot bootloader` timed out) until the user re-entered fastboot by hand (common Xiaomi ABL crash). Boot 0038e 18:06:15 UTC (`research/boot0038e-3.log`), photos IMG_20261016_200812/200838: keybag OK, then boot tasks tzinit (`Bad zoneinfo link`, resets to system partition, OK), finish-restore, finish-demo-restore, sysstatuscheck, prng_seedctl (`failed to load kernel prng seed`, `failed to load virtual random (-147)`, AllowCrash), auearlyboot, then **launchd_cache_loader: `abort: Unable to find AMFI`** -> 2.7 GB core written to /cores in 91 s -> launchd panic `launchd_cache_loader[22] exited -- exit reason namespace 7 subcode 0x1`. launchd_cache_loader: SecStaticCodeCheckValidity of /System/Library/xpc/launchd.plist with detached .sig, then IOServiceMatching("AppleMobileFileIntegrity") + IOServiceOpen type 0 + IOConnectCallMethod sel 6 (1 scalar = 1, struct in = cdhash) = trust the cdhash, then sends the cache to launchd. Boot-arg `launchd_unsecure_cache=1` skips signature + AMFI ("Using unsecure cache"); the value is parsed with strtoul base 10 (helper 0x100002da8), so a path = 0 = off: boot 0039w (18:17:13 UTC, `=/System/Library/xpc/launchd.plist`, photo IMG_20261016_202008) still aborted `Unable to find AMFI` (core dump now skipped: `Failed to generate core file ... error 14`, so 0039 works). Image `shim/out/shim-boot-0039u.img` uses `launchd_unsecure_cache=1`. Patch **0039**: do_coredump = 0 on SWEET (kern.coredump sysctl still works); CI `38945267341` -> `xnu/out-0039` (_do_coredump now in __common). Image `shim/out/shim-boot-0039w.img` = 0039 + sweet-0038hi.adt + ufsrw rootrw + `launchd_unsecure_cache=/System/Library/xpc/launchd.plist`. TODO later: real AppleMobileFileIntegrity IOService (sel 6 trust cdhash etc.).
+- **Image v3 ready, awaiting user "flash".** Boot 0038w 17:38:10 UTC, photo (chat image 30): `SWEET AKS: keybagd sel 0 -> 0x0`, `sel 14 out 1/0 -> 0x0` (x2), `MKB_INIT: mount is with NO CPROTECT ... does not support Data Protection`, `System Keybag loaded`; then keybagd still opens /private/var/keybags/systembag.kb (0x100012d3c, for BackupKeyBagKeys) -> ENOENT, `no-effaceable-storage` not set -> `Can't load the keybag. tears in rain... Time to die` -> `FATAL KEYBAG ERROR: kb_load` -> reboot -> Halt/Restart Timed Out panic. Fix: ADT `/defaults/no-effaceable-storage` (mkadt.py; `shim/out/sweet-0038hi.adt`, `research/q0038-hi.adt`, QEMU OK) + file `/private/var/keybags/systembag.kb` (0600 root, dir 0700; XML plist {KeyBagKeys: data}). **v3 image** `/run/media/dipa/android/ios-sweet-ipsw/ios16-root-20H392-v3.img` = v2 + that file, fsck OK, SHA256 fa84274c...22df; `ios16-root-20H392-v3.simg` (img2simg: zero blocks become FILL chunks, so a full flash overwrites every block the rw boots changed). Flash: `fastboot -S 512M flash userdata ios16-root-20H392-v3.simg`, then boot `shim/out/shim-boot-0038e.img` (0038 + sweet-0038hi.adt + ufsrw=1 rootrw=1).
+- **0038 AppleKeyStore (CI 38938744130 PASSED -> `xnu/out-0038`; QEMU msgbuf: `SWEET AKS: AppleKeyStore registered (no passcode, unlocked)`; phone image `shim/out/shim-boot-0038w.img` booted 17:38:10 UTC, `research/boot0038w.log`, photo pending).** QEMU full kernel log trick (fb.txt is only the last screen): `llvm-nm KERNEL | grep _msgbufp` -> `--hmp "x /1gx ADDR"` gives struct msgbuf address (static, 0xfffffe0007b56678 on 0038) -> `--hmp "x /3gx STRUCT"` gives bufc (3rd quad) -> `--hmp "memsave BUFC 0x20000 \"FILE\""` (quote the file name), `tr -d "\0" < FILE`. Same inputs give the same addresses. Boot 0037w 17:08:35 UTC, photo IMG_20261016_191052: bindfs fixed mount; mount-phase-1/2 pass; `cc_fips_test` boot task: all corecrypto FIPS POST tests PASSED in userspace; then keybag boot task `keybagd --init`: `MKB_INIT: FATAL KEYBAG ERROR: failed to load system bag`, `Could not get options entry from the device tree` (x2, IODeviceTree:/options = NVRAM, non-fatal), `REBOOTING INTO RECOVERY MODE` -> reboot -> panic `Halt/Restart Timed Out @IOPlatformExpert.cpp:884` (no restart path on SWEET).
+  - keybagd (static libaks): load_devicebag (0x100012c30) calls aks_get_system (sel 14, 0-1 scalar in, 1 out) and loads /private/var/keybags/systembag.kb only if the result is 0xe00002f0 (NotFound); any other error -> fatal; SUCCESS -> skip the file (userspace-reboot path). systembag.kb is a plist {KeyBagKeys}; decrypted with effaceable storage unless IODeviceTree:/defaults has `no-effaceable-storage`. Image has no /private/var/keybags. has_data_protection: statfs of /private/var; no cprotect on our HFS -> device-bag volume mapping skipped.
+  - libaks connection: IORegistryEntryFromPath / IOServiceMatching("AppleKeyStore"), IOServiceOpen type 0, then selector 0 (no args) must succeed.
+  - **AppleKeyStore selector map (iOS 16.7 AppleKeyStore.framework, via `ipsw dyld disass`):** 0 open, 2 create_bag, 3 save_bag, 4 unload_bag, 5 set_system_with_passcode, 6 load_bag, 7 get_lock_state (1 in, 1 out; bit 2 = unlocked since boot), 9 unlock_device, 10 wrap_key, 11 unwrap_key, 12 unlock_bag/test_stashed_kek, 13 lock_bag, 14 get_system, 15 change_secret_se, 16 internal_state, 17 get_device_state (1 in, struct out <=4K: DER SET of SEQUENCE{UTF8 key, INTEGER}: ss state, sls lock_state (MKBGetDeviceLockState returns it), sb backoff, sbo, sfa failed attempts, sfao, sgs generation, sas assertions, sgpe grace, srcd countdown, sr reserved), 18 recover_with_escrow_bag, 19 obliterate_class_d, 20 drain_backup_keys, 21/22 set/clear_backup_bag, 23 get_bag_uuid, 24 rewrap_key_for_backup, 26/27 assert_hold/drop, 30/31 set/get_configuration, 33-37 stash, 38 auth_token_create, 40 generation, 41 fdr_hmac_data, 42 verify_password, 43 _aks_operation, 44 remote_session, 49/50 signing keys, 51/53/54 stash enable/persist/escrow, 55 unload_session_bags, 57/58 remote peer, 59-62 smartcard, 63 migrate_s_key, 65 set_keybag_for_volume_with_cookie_persona, 66/67 sync bags, 68 copy_volume_cookie_persona, 69-73 se_*, 74-79/84/85/99 fv_* (FileVault/VEK), 80/81 absinthe, 82 make_public_backup_bag, 83 drop_auxiliary_auth, 86 kext get/set options, 87 invalidate_bag, 88-91/94/95/106/107 se_*, 92 lower_iteration_count, 93 get_internal_info, 96-98/117 keybag_persona create/list/delete, 100/101 assert promote/consume, 102/103 notify_state set/is_set, 104 fairplay, 105 change_secret_epilogue, 108 delete_xart_leak, 110-113 backup volume, 114 sealed_hashes_set, 115 prewarm_sps, 118-128 AKSIdentity*/AKSGetLastUser.
+  - Patch **0038**: `iokit/Kernel/arm/SweetKeyStore.cpp` (class AppleKeyStore on IOResources, IOUserClientClass AppleKeyStoreUserClient; personality in KernelConfigTables.cpp): 0/4/5/9/12/13/26/27/55/102 success, 14 -> handle 0, 7 -> 0x4, 17 -> DER state (ss 4, sls 0), others kIOReturnUnsupported; logs `SWEET AKS: <proc> sel N arg0 in a/b out c/d -> ret` for every call.
+  - Tools: shared cache copied to `research/dsc/` (git-ignored; ipsw needs a writable dir for its .a2s symbol cache); `ipsw dyld disass research/dsc/dyld_shared_cache_arm64 --image AppleKeyStore|MobileKeyBag`; scratchpad `annot2.py BIN DIS FIXUPS` annotates llvm-objdump output with strings and import names (`ipsw macho info --fixups`).
+- **0037 bindfs (phone boot 0037w pending photo).** Boot 0036mw 16:57:47 UTC, photo IMG_20261016_190102: WRITABLE ROOT WORKS: `/dev/ufsroot0 on / (hfs, local, noatime)` after mount_hfs update (GetMasterBlock EBUSY harmless), coredump of mount written to /cores (rw). Then `mount: failed to mount /private/preboot/5CBE3601.../usr/standalone/firmware -> ...: Operation not supported by device (19)` -> exit 74 -> launchd panic `mount[2] exited`. Cause: the macOS-derived config had nullfs but no bindfs (ENODEV = unknown fs type). Caller passes env 0 -> bind not required, ENOENT (missing source dir) tolerated. Patch **0037** adds `bindfs` to FILESYS_BASE in MASTER.arm64.sweet; CI `38936550483` -> `xnu/out-0037` (bindfs_vfsops present; QEMU probe regression OK). Image `shim/out/shim-boot-0037w.img` (0037 + sweet-0036hi.adt + ufsrw=1 rootrw=1) booted 17:08:35 UTC (`research/boot0037w.log`). NOTE: userdata has now been modified by rw boots; it no longer equals the v2 image, so sparsediff with v2 as OLD is not safe any more (full reflash or a new baseline needed).
+- **0036 phone: launchd boot tasks run; mount -P 1 needs /chosen/boot-manifest-hash.** Boot 0036hr 16:15:32 UTC, photo IMG_20261016_185236: platform check passes; fsck boot task runs (`fsck: not booting main or diagnostic OS. Skipping fsck on OS container`); mount-phase-1: `failed to get filesystem info` x2 (no IODeviceTree:/filesystems/fstab, non-fatal), `mount: data volume missing, but not required in env: 0`, mount_hfs update of /: `GetMasterBlock: Error 16 opening /dev/ufsroot0` (EBUSY, mounted block dev, non-fatal) then mount() EROFS (read-only boot) -> `mount: / failed with 1`; then `failed to get boot-manifest-hash` -> errx exit 66 -> launchd panic `mount[3] exited`. /sbin/mount: fn 0x100005f90 reads IODeviceTree:/chosen boot-manifest-hash (hex), bindfs-mounts /private/preboot/<HEX>/usr/standalone/firmware (ENOENT tolerated unless required). `tools/mkadt.py` now adds `boot-manifest-hash` = SHA-384("sweet boot manifest") (5CBE3601...5205). ADTs `shim/out/sweet-0036hi.adt`, `research/q0036-hi.adt` (QEMU probe OK, csops 0x26000001). Image `shim/out/shim-boot-0036mw.img` (0036 + new ADT + ufsrw=1 rootrw=1), booted 16:57:47 UTC (`research/boot0036mw.log`): FIRST WRITABLE BOOT of userdata (restore source: v2 image on SSD).
+- **0036 CS_SIGNED (phone boot 0036hr pending photo).** Phone boot 0035hr 2026-10-16 15:57:02 UTC (`research/boot0035hr.log`, photo IMG_20261016_180249): highmem works on hardware; shared cache maps (trust-cache warnings only), Apple launchd runs (`Darwin Bootstrapper Version 7.0.0`, `entering ondemand mode`), starts boot task fsck, then userspace panic `boot task is not a platform binary (fsck, /sbin/fsck)`. launchd+0x3fea0: `csops(pid, CS_OPS_STATUS)` must have bit 0x04000000. Cause: nothing set CS_SIGNED (AMFI does it in vnode_check_signature), so csproc_get_blob() returns NULL for every process and csops never reports CS_PLATFORM_BINARY (also breaks per-process cdhash/entitlement queries). QEMU probe init (`csops` status printer, scratchpad csq/) on 0035: `0x02000001`; patch **0036** (`*cs_flags |= CS_SIGNED` in the SWEET AMFI hook), CI `38929635791` -> `xnu/out-0036`: `0x26000001`. Images `shim/out/shim-boot-0036hr.img` / `-0036hw.img` (same cmdlines as 0035). 0036hr booted 16:15:32 UTC (`research/boot0036hr.log`). Next launchd boot tasks (embedded __config plist): fsck -qL and mount -P 1/2 (RequireSuccess); no /etc/fstab on the image.
+- **0035 ENTITLEMENTS + PLATFORM BINARIES (QEMU verified).** `xnu/patches/0035-sweet-amfi-entitlements-platform-binaries.patch`: new `iokit/Kernel/arm/SweetEntitlements.cpp` (OSObject subclass: OSDictionary from OSUnserializeXML of the signature's XML entitlements + original XML for CS_OPS_ENTITLEMENTS_BLOB); `bsd/kern/sweet_amfi.c` answers queryEntitlementBoolean/String(+WithProc, string also matches array members), copyEntitlementAsOSObject(+WithProc, retained), asdict (retained), get_xml (kalloc_data copy); built-in MAC policy "SWEET AMFI" (registered from bsd_init before vfs/exec) with mpo_vnode_check_signature: every signed binary on the MNT_ROOTFS mount gets CS_PLATFORM_BINARY (stand-in for AMFI's static trust cache: iOS system binaries are ad-hoc, cd_flags 0x2, platform byte 0), and attaches entitlements ONLY for the writable copy (cs_blob != csb_ro_addr; revalidation passes the RO blob). LESSON: first version attached in adjustContextWithoutMonitor -> QEMU `unable to adjust OSEntitlements context without monitor: 53` because ubc_cs_convert_to_multilevel_hash (4K-page signatures on 16K kernel) sets csb_entitlements_blob = NULL; ALL iOS 16 binaries (launchd, backboardd, SpringBoard) use 4K code pages, so this would have broken launchd on the phone. Boot-arg `sweet_amfi_debug=1` logs `SWEET AMFI: <ident>: N entitlements (test: ...)`. `tools/mkinit.py OBJ OUT [ENTS.plist]` adds an XML entitlements blob (special slot -5; default output byte-identical). QEMU `research/q0035-ent` (RAM disk `research/root-hfs-ent.img`, init with 3 test entitlements, highmem): `org.sweet.init: 3 entitlements (test: bool 1 string 1 array 1)` then init PID 1. MAC policies loaded: 0034 = 1, 0035 = 2 (QMP `mac_policy_list`). CI `38909807230` -> `xnu/out-0035`. Phone images: `shim/out/shim-boot-0035hr.img` (highmem, ro), `-0035hw.img` (highmem, +ufsrw=1 rootrw=1), `-0035r.img` (low mem fallback).
+- **PHONE TEST ORDER (updated):** 0035hr -> if instant reset, 0035r -> then 0035hw.
+
+- **HIGHMEM: XNU in the upper DDR bank, ~3.95 GiB (was 1.2 GiB).** Live FDT memory = <0x80000000 2G> + <0x1_00000000 0xfcc00000>; all fixed reserved-memory carve-outs are in the low bank (highest: ramdump_fb 0xaf000000, rmtfs ~0xfde01000), dynamic pools have alloc-ranges <= 0xffffffff, UFS node has no `iommus` (Linux DMAs anywhere). `tools/mkadt.py --highmem` sets /chosen dram-base 0x100000000 dram-size 0xfcc00000; `tools/mkpayload.py` now takes phys_base/mem_size from the ADT (default payloads byte-identical, verified); `tools/qemu-sweet.py` sizes -m from the payload (8G for highmem). Patch **0034** (`0034-sweet-ufs-dma-above-4g.patch`): UFS refuses DMA memory above 4G without UFSHCI CAP.64AS (bit 24), logs `DMA at 0x...`. CI `38905889883` success -> `xnu/out-0034`. **QEMU verified** (`research/q0034-hi`, ADT `research/q0034-hi.adt` --qemu --highmem, HFS RAM disk): phys_base 0x100000000, init PID 1 heartbeat, no panic; `max_mem` = `mem_size` = 0xfcc00000 read via QMP (`research/q0034-hi-mem`). Phone images: `shim/out/shim-boot-0034hr.img` (read-only) / `-0034hw.img` (+ufsrw=1 rootrw=1), ADT `shim/out/sweet-0034hi.adt` (asmb SIP + sweet-ufs + highmem). PHONE RISK: unknown runtime TZ/XPU protection in the upper bank would show as an instant reset; fall back to 0033r/w. Watchdog ruled out for the overnight reset: msm-watchdog bark is 20 s (qcom,bark-time 0x4e20) yet panic screens stay up for many minutes.
+
+- **Offline research 2026-10-16 (user away, phone unavailable). Images rebuilt** `shim/out/shim-boot-0033r.img` / `-0033w.img` now also carry `wdt_test=no_user_checkin`. NEXT ON PHONE: boot 0033r (expect past in6_nigroup), then 0033w (first writes: rw root fixes HFS link-chain bits itself and gives /var for launchd sockets /var/run/syslog, /var/run/lockdown.sock).
+- **launchd.plist** (`/System/Library/xpc/launchd.plist`, compiled; 532 daemons, 66 RunAtLoad/KeepAlive, list in scratchpad `early-daemons.txt`). `_PanicOnCrash` daemons: containermanagerd/usermanagerd (InternalOnly), lockdownd/remoted/trustd/remotepairingdeviced (AutomationOnly), **watchdogd unconditional** (KeepAlive SuccessfulExit=false). watchdogd needs IOKit `IOWatchdog` kext service; if absent it exits only when `kern.hv_vmm_present` (ADT `/defaults/vmm-present`, hvg_sysctl.c) or with boot-arg `wdt_test=no_user_checkin` ("detected testing boot-args to not run, exiting"; reads kern.bootargs). Using the boot-arg (vmm-present would change many daemons; keep as an option).
+- **GUI path research (QuartzCore in the shared cache, `ipsw dyld str CACHE STR`, ~10 s/search):** CA::WindowServer has IOMFBServer/IOMFBDisplay (Apple DCP/IOMobileFramebuffer), AppleCLCDDisplay, AppleRGBOutDisplay, **VirtualServer/VirtualDisplay** and **MemorySurface**, EAGLServer. Renderers: CA::OGL::MetalContext, GLContext and a **CPU software rasterizer CA::OGL::SW** (samplers/blend modes; "image is too large for software renderer"). Env knobs: `CA_ENABLE_OGL`, `CA_DISPLAY_TYPE`, `CA_FORCE_LOCAL_SERVER` (249 CA_* vars). Hypothesis (unverified): backboardd's render server could run a VirtualServer/MemorySurface with the SW renderer and we copy the surface to the ABL framebuffer -> needs disassembly of CA::WindowServer server creation. Expected other GUI walls: IOSurface (closed-source kext; needs a reimplementation), IOMobileFramebuffer user client, IOHID touch events, AppleKeyStore/keybag (SEP) for lock state, MobileGestalt answers (AppleCLCD etc.).
+
+- **0032r RESULT (boot 05:07:50 UTC, `research/boot0032r.log`, photo IMG_20261016_071200): SHARED CACHE MAPPED, LAUNCHD RUNS.** With SIP relaxed (ADT asmb) the `not in trust cache` lines are only warnings for every subcache (.31 ... .42.dyldlinkedit); no SIP rejection; libSystem loads; launchd configures networking (`skip attaching fsw to lo0 using legacy TX model`) -> kernel data abort far 0x28 in `SHA1Init` (symbolized as sha1_init) from `in6_nigroup` (IPv6 on lo0): g_crypto_funcs NULL. Kernel addresses are unslid: `~/swift/usr/bin/llvm-symbolizer --obj=KERNEL ADDR` works directly.
+- **0032** BearSSL SHA-1 (`0032-sweet-bearssl-sha1.patch`), **0033** BearSSL SHA-384/512 (`0033-sweet-bearssl-sha384-sha512.patch`, BearSSL ctx stored in SHA512_CTX, static-asserted to fit; ubc_subr.c uses SHA-384 for code directories). `0020-stage-bearssl.sh` now also stages hash/sha1.c, hash/sha2big.c, codec/{dec,enc}{32,64}be.c. CI `38854909053` success (0032-only run `38854802073` superseded). Kernel `xnu/out-0033` (SHA1Init -> _br_sha1_init verified by disassembly; nm symbols have a leading underscore). Images (ADT sweet-0032): `shim/out/shim-boot-0033r.img` (read-only), `shim-boot-0033w.img` (+ufsrw=1 rootrw=1). Still NULL g_crypto_funcs users: des, chacha20poly1305, rsa, aesxts, rand, flow_divert.
+- `research/check-patch-order.py` now skips patches touching CI-staged sweet_hfs sources (0031) instead of stopping.
+
+- **0031r RESULT (boot 05:03:52 UTC 2026-10-16, `research/boot0031r.log`, photo IMG_20261016_070508): SHARED CACHE FOUND.** dyld now opens `dyld_shared_cache_arm64` (v2 image hard links), kernel refuses to map it: `shared_region: ... map(...'dyld_shared_cache_arm64'): not in trust cache` -> `vnode is not SIP-protected` (vm_unix.c: macOS arm64 path needs trust cache, else root-owned + SF_RESTRICTED unless CSR_ALLOW_UNRESTRICTED_FS) -> `dyld cache '(null)' not loaded: syscall to map cache into shared region failed` -> libSystem not loaded -> coredump to /cores fails error 30 (EROFS) -> panic initproc failed -> "MACH Reboot" (spins; screen kept). Lots of `hfs: set hardlink bit on vol=iOSRoot cnid=... linkid=...` spam (Linux-made hard links lack the link-chain bit; read-only mount cannot persist the fix). FIX: ADT `/chosen/asmb` with `lp-sip0`=0x6f (u64; incl. CSR_ALLOW_UNRESTRICTED_FS) and `lp-sip1`=1 (unauthenticated root), `tools/mkadt.py` -> `shim/out/sweet-0032.adt`. Images with kernel 0031: `shim/out/shim-boot-0032r.img` (read-only) and `shim-boot-0032w.img` (+ufsrw=1 rootrw=1).
+
+- **2026-10-16 morning:** userdata now = **v2** image (`diff-v1-v2.simg` flashed 21:06:50 UTC 2026-10-15, OKAY, `research/flash-userdata-diff-v2.log`); future diffs use `ios16-root-20H392-v2.img` as OLD. Booted `shim-boot-0029k.img` (ignition_level=1) right after (`research/boot0029k-v2.log`); **no photo** (user asleep). Next morning the phone was in PixelOS recovery = some hardware reset (ABL then booted Android, which cannot use userdata). OBSERVATION: our kernel cannot reset the SoC itself (`PE_halt_restart` is never set; reboot/halt print "MACH Reboot"/"CPU halted" and spin), so the reset came from outside XNU: Qualcomm watchdog or a TZ/XPU violation. Unknown which; re-boot 0029k and watch/video until the reset. Do NOT tap factory reset/format data in recovery (would wipe the iOS image).
+- **0030** (`xnu/patches/0030-sweet-ufs-writes.patch`, CI `38852655542`): UFS WRITE(10) + read-modify-write for partial 4 KiB blocks + SYNCHRONIZE CACHE (DKIOCSYNCHRONIZE), only with boot-arg `ufsrw=1`; `ufs_write_blocks` re-checks partition bounds before every write (only place data goes out).
+- **0031** (`xnu/patches/0031-sweet-read-write-root.patch`, CI `38852837176`): boot-arg `rootrw=1` clears MNT_RDONLY before the root mount (no data volume on sweet: /private/var is on the root; image has no /etc/fstab); Apple HFS accepts a dirty non-journaled ROOT read-write on SWEET (logs "mounting dirty non-journaled root read-write"). Later: journaled HFS for crash safety. Kernel `xnu/out-0031` (CI `38852837176` success, 5m31s; 0030 run cancelled by the newer push). Boot images (phone ADT `sweet-0028.adt`, ramdisk byte-matched): `shim/out/shim-boot-0031r.img` = 0029k args (read-only, ignition_level=1) and `shim/out/shim-boot-0031w.img` = same + `ufsrw=1 rootrw=1`. PLAN: boot 0031r first and film until the reset (diagnose overnight reset), then 0031w (first ever writes to userdata; v2 image on the SSD is the restore source). `research/check-patch-order.py` cannot check 0031 (staged sweet_hfs files are not in its index); CI stage scripts run first, so CI is the check.
+
+- **ignition_level=1 result** (boot 21:01:39 UTC, `research/boot0029k.log`, photo IMG_20261015_230308): preboot/cryptex stages skipped (need >= 2/3), `dylib_cache: finding shared cache on system volume: ignition level = 1, search root fd = 4, subpath = System/Library/Caches/com.apple.dyld/` -> not found -> `ignition boot failed: 19` -> no shared cache -> libSystem not loaded. FIX IN PROGRESS: image v2 = copy of the flashed image + `/System/Library/Caches/com.apple.dyld/` with HARD LINKS to the 44 cryptex cache files (no extra space; avoids symlink-following doubts), then `tools/sparsediff.py ios16-root-20H392.img ios16-root-20H392-v2.img diff.simg` and flash only the diff. Boot with `ignition_level=1` (shim-boot-0029k.img).
+- **ignition_level=0 result** (boot 20:58:07 UTC, `research/boot0029j.log`, photo IMG_20261015_230037): all stages skipped as "ignition level insufficient" (hello/preboot/cryptex1 sniff >= 2, select os cryptex path/graft >= 3, **dyld_cache >= 1**), `ignition boot failed: 89`, "ignition partially disabled", then same `Library not loaded: /usr/lib/libSystem.B.dylib (no such file, no dyld cache)`. => dyld gets the shared cache directory from ignition's dyld_cache stage. Next: `ignition_level=1` (`shim/out/shim-boot-0029k.img`) to skip preboot/cryptex stages but run dyld_cache; its log "finding shared cache on %s ... subpath = %s" will show where it searches. If it searches rootfs /System/Library/Caches/com.apple.dyld, add a symlink there (image rebuild; consider a diff-only sparse flash tool to avoid rewriting 12 GB).
+- **APPLE dyld/launchd RUNNING (libignition) with `unentitled_ios_sim_launch=1`** (boot 20:53:24 UTC, `research/boot0029i.log`, photo IMG_20261015_225617): kernel prints "Allowing spawn of iOS binary ... boot-arg set to true"; `shared_region: ... check_np ... vm_shared_region_start_address() failed` (no region yet, normal); dyld's built-in **libignition** (Darwin Ignition Sequence 1.0.0, libignition-51~1974; prints rd=ufsroot0, hardware target sweet, ignition level 0x5, platform 0x2, boot spec local, 7 stages): `hello from launchd.1` -> `preboot: mounting preboot` -> `failed to lookup preboot: 25` (ENOTTY: looks for a separate Preboot volume by role) -> ignition fails -> dyld `Library not loaded: /usr/lib/libSystem.B.dylib ... (no such file, no dyld cache)` -> launchd exit -> panic initproc failed. dyld boot-args found via strings: `ignition_level`, `ignition_force_dylib_root` (forced rootfs/livefs/cryptex fallback), `ignition_halt_after`, `ignition_live_app_graft`; dyld cache search paths include /System/Cryptexes/OS, /System/Volumes/Preboot/Cryptexes/OS/, /private/preboot/Cryptexes/OS/ (present in our image). Next try `ignition_level=0` (`shim/out/shim-boot-0029j.img`).
+- **APPLE launchd EXECUTED FROM UFS (2026-10-15).** Flashed iOS image: `img2simg` -> `ios16-root-20H392.simg` (12.1 GB) then `fastboot -S 512M flash userdata ...simg` (24 chunks, 307 s, `research/flash-userdata-ios16.log`; a raw-image flash was killed by earlyoom at 2.6 GB RSS - always flash the sparse image). ABL fastboot hung on getvar after the flash; power+vol-down fixed it. Boot 0029u 20:49:04 UTC (`research/boot0029u-ios16.log`), photo IMG_20261015_225134: `hfs: mounted iOSRoot` -> load_init_program /sbin/launchd -> panic `unexpected SIGKILL of launchd (CS_KILLED) with reason -- namespace 9 code 0xe` = OS_REASON_EXEC / EXEC_EXIT_REASON_WRONG_PLATFORM: our kernel is XNU_TARGET_OS_OSX, iOS-platform binaries are "alien" and refused unless spawn attr platform set or DEVELOPMENT TUNABLE `unentitled_ios_sim_launch`. Next try: same kernel, cmdline + `unentitled_ios_sim_launch=1` (`shim/out/shim-boot-0029i.img`). LONGER TERM: macOS-config kernel marks iOS maps alien (vm_map_mark_alien) and differs from iOS in many policies; an iPhoneOS-config kernel build may eventually be needed.
+- **iOS 16 ROOT IMAGE BUILT:** `/run/media/dipa/android/ios-sweet-ipsw/ios16-root-20H392.img` (16 GiB case-sensitive HFS+, label iOSRoot, 12 GB used, fsck OK after `fsck.hfsplus -y` rewrote 32 non-ASCII localized WorkflowKit Shortcut names Linux decomposes differently). Built by `tools/mkiosroot.sh OS.dmg SYSTEMOS.dmg APPOS.dmg OUT.img [SIZE]` (needs sudo; apfs-fuse as root; OS dmg is UDIF -> link must end .dmg). Contents: iPhone X 20H392 OS root + SystemOS cryptex at /private/preboot/Cryptexes/OS (so /System/Cryptexes/OS -> cache, 44 files, dyld_v1 arm64) + AppOS at .../App. /sbin/launchd and /usr/lib/dyld root:wheel 0755. NEXT: (confirm) `fastboot flash userdata ios16-root-20H392.img` (auto-sparse), boot 0029u (rd=ufsroot0) -> Apple launchd attempt.
+- **MILESTONE ON HARDWARE: BOOT FROM INTERNAL FLASH.** 0029 CI `38797924912` PASSED, `xnu/out-0029` SHA256 `a68bc847...2a37`. Image `shim/out/shim-boot-0029u.img` (payload-0029u = 0029 kernel + `shim/out/sweet-0028.adt` + `rd=ufsroot0`, NO RAM disk). Boots 20:01:34 and 20:12:37 UTC (`research/boot0029u*.log`), photo IMG_20261015_221403: `SWEET UFS: "userdata" on LUN 0: first block 0x2b8c00, 109643 MiB, read-only` -> `BSD root: ufsroot0, major 1, minor 0` -> `hfs: mounted SweetRoot on device b(1, 0)` -> `SWEET: root volume is not authenticated (error 25); continuing unsealed` -> `load_init_program ... /sbin/launchd` -> `*** SWEET userspace: init running as PID 1 ***` -> heartbeat (ran for minutes unattended). userdata currently holds the 8 MB `research/root-hfs.img`. NEXT: build a multi-GB HFS+ image with the iOS 16 (iPhone X 20H392) userland (OS rootfs + SystemOS cryptex contents incl. dyld shared cache at /System/Library/Caches/com.apple.dyld; preserve modes/owners/symlinks; decompress LZBITMAP via apfs-fuse), flash it to userdata (sparse, needs user OK), then try Apple's dyld/launchd. Driver is read-only (root mounts RDONLY), fine for first launchd attempts.
+- **userdata FLASHED with the 8 MB HFS test volume** (user said "flash it", 2026-10-15 19:53:17 UTC, `research/flash-userdata-hfs-test.log`: `fastboot flash userdata research/root-hfs.img` OKAY; pre-checks: one sweet device, partition-size:userdata 0x1AC4BFB000, partition-type f2fs, image fsck OK, SHA256 3626ea69...). Android userdata is now destroyed (expected/approved). Boot 0028u at 19:53:20 (`research/boot0028u-hfs.log`), photo IMG_20261015_215541: `BSD root: ufsroot0` -> **`hfs: mounted SweetRoot on device b(1, 0)` from internal UFS** -> panic `rootvp not authenticated after mounting @bsd_init.c:931` (arm64 macOS-config requires FSIOC_KERNEL_ROOTAUTH sealed root for non-ramdisk roots). Patch **0029** (`dd1c284`): SWEET logs `SWEET: root volume is not authenticated (error N); continuing unsealed` instead of panicking (Apple configs keep the panic; pivot_root still requires auth). CI **`38797924912`** running. Next: download out-0029, phone image with sweet-0028.adt + rd=ufsroot0 (no RAM disk), boot -> expect init from UFS.
+- **UFS ROOT DRIVER VERIFIED ON HARDWARE (read-only).** 0028 CI `38796139570` PASSED, `xnu/out-0028` SHA256 `8b981640...9da6`; QEMU HFS RAM-disk regression `research/q0028-hfs` still runs init. Phone boot 2026-10-15 19:50:24 UTC (`research/boot0028u.log`, image `shim/out/shim-boot-0028u.img`, phone ADT `shim/out/sweet-0028.adt` with /sweet-ufs, NO RAM disk, `rd=ufsroot0`), photos IMG_20261015_215151/215220: `SWEET UFS: "userdata" on LUN 0: first block 0x2b8c00, 109643 MiB, read-only` -> `BSD root: ufsroot0, major 1, minor 0` -> `hfs_ValidateHFSPlusVolumeHeader: unknown Volume Signature : f188` (Android-encrypted data, as expected) -> `cannot mount root, errno = 19`, kernel retries mountroot (no panic). Nothing written to flash. NEXT (destructive, needs user confirmation right before): `fastboot flash userdata research/root-hfs.img` (8 MB HFS with test init) then boot rd=ufsroot0 -> expect init from internal flash.
+- **PATCH 0028 (`33aceac`): XNU read-only UFS root device**, CI **`38796139570`** running (next artifacts xnu/out-0028, research/bt29, run29.log). `bsd/dev/sweet_ufs.c`: reuses ABL's UFSHCI state (like the shim probe), takes over UTRL at a kmem_alloc_contig region (DMA layout: UTRL 0x0, UCD 0x1000, 1 MiB bounce 0x4000), verifies UTRLBA readback before any doorbell, IE=0 polled, one SCSI cmd at a time on LUN0 (TUR x3, READ(10) via bounce, PRDT 256 KiB chunks), flush_dcache64 by PA around each command (host not dma-coherent per DT), finds GPT partition by name (`ufsroot=` boot-arg, default `userdata`), exposes `/dev/ufsroot0`/`rufsroot0` (512-byte logical sectors, physical 4 KiB, DKIOC* ioctls), refuses writes (EROFS). IOKitBSDInit: `rd=ufsroot0` -> sweet_ufs_rootdev() (lazy init) else panic. ADT: `tools/mkadt.py` adds `/sweet-ufs` reg <0x1d84000 0x3000> for the PHONE only (not --qemu). Local compile OK, imports resolve. Sandbox research/bt28 (pre0028 originals). FIRST PHONE TEST PLAN (non-destructive): boot 0028 with phone ADT + `rd=ufsroot0` and NO RAM disk: expect `SWEET UFS: "userdata" on LUN 0: first block 0x2b8c00, 109643 MiB` + `BSD root: ufsroot0`, then root mount failure (userdata is still Android-encrypted) -> panic. That validates the driver before flashing an HFS image into userdata (needs explicit user confirmation at that time).
+- **SUPERSEDES the 64 GiB iosroot GPT plan: user said "u can delete android" (2026-10-15).** Use the existing `userdata` partition (LUN0 sda34, 4K LBA 0x2B8C00, 0x1AC4B MiB ~107 GiB) directly as the iOS root: NO GPT changes. Keep bootloaders, recovery (OrangeFox), modem/persist/fsg/modemst untouched. Write the HFS image later with `fastboot flash userdata` (sparse, auto-split under the 768 MiB limit). Android will no longer boot normally (expected; reinstallable). Order: XNU UFS driver first, read-only against the current GPT; flash only once it can locate userdata. Nothing erased yet.
+- **DECIDED (user, 2026-10-15): 64 GiB `iosroot` on LUN0 (sda), taken from userdata (wipes Android user data; Android/super kept).** Planned GPT (4K LBAs): userdata 0x2B8C00..0xD7D6FF (~43 GiB, keep type/unique GUIDs and attributes); iosroot 0xD7D700..0x1D7D6FF (0x1000000 blocks = 64 GiB, 1 MiB aligned); backup GPT area unchanged. Procedure: user backs up phone data -> boot OrangeFox recovery (adb) -> back up GPT (sgdisk --backup + raw dd of LBA 0-5 and last 6 blocks) to research/ -> sgdisk edit -> Format Data -> verify Android boots to setup. NOT EXECUTED YET.
+- **INTERNAL UFS WORKS FROM THE SHIM (read-only), user authorized internal-UFS approach incl. flashing (2026-10-15, "i allow everything").** Shim probe `shim/ufs.c` (commit `12ed3ed` + filter): ufshc@1d84000 is UFSHCI 2.1 (ver 0x210, cap 0x1587031F, 32 slots), ABL leaves HCE=1, HCS=0x10F (device present, lists ready, UIC ready); probe takes over UTRL at its own buffer (verifies UTRLBA readback before any doorbell), TEST UNIT READY/READ CAPACITY/READ(10) all succeed. LUN0 = 0x1D7D800 x 4 KiB (~126.6 GB), valid GPT (64 entries at LBA 2). Photos IMG_20261015_212916/213325/213429. Big LUN0 partitions (start in 4K LBAs / MiB): super 0xCA00/0x2200 (8.5 GiB), logdump 0x22CA00/64, minidump 0x230A00/128, rawdump 0x238A00/128, recovery 0x240C00/128, cache 0x248C00/384 ext4, exaid 0x260C00/384, cust 0x278C00/1024 ext4, **userdata 0x2B8C00/0x1AC4B MiB (~107 GiB), fs unreadable = encrypted (metadata encryption)**. cache..cust contiguous = only 1.75 GiB (too small for iOS ~10+ GiB). Plan needing user consent: shrink userdata in GPT (wipes Android data) and add an `iosroot` partition at the end of LUN0. LUNs 1-5 not listed yet (sdb..sdf backed up in backup/lun).
+- **fastboot limit measured (2026-10-15, read-only getvar):** `max-download-size: 805306368` (768 MiB); `max-fetch-size` unsupported; `is-userspace: no` (ABL fastboot). A `fastboot boot` image (shim+kernel+RAM disk) must be < 768 MiB, so the 2.5 GiB iOS shared cache cannot ride in the boot RAM disk even if XNU gets all RAM. Real userland needs storage access (UFS driver, or USB host) or a much smaller cache. Unlocking full RAM is still needed later (GUI).
+- **iOS 16 USERLAND SOURCE (Claude, 2026-10-15).** Chose **iPhone X (iPhone10,3/10,6, D22/D221AP)** iOS **16.7.16 (20H392)** over iPhone 8: same A11 (no PAC -> plain arm64, runs on Kryo 470/ARMv8.2), last iOS for A11; X userland is home-button-less and tall-screen (1125x2436 vs sweet 1080x2400), better fit for later GUI. Note the X has its OWN SystemOS cryptex (different digest from iPhone 8's). IPSW URL in `research/ipsw-x/URL.txt` (+ BuildManifest). Images on the user's external SSD (NOT in git, do not format that disk: it holds the user's photos): `/run/media/dipa/android/ios-sweet-ipsw/iPhone10,3_16.7.16_20H392/` — `087-86593-047.dmg` = Cryptex1,SystemOS (2,743,074,816 B), `087-86698-044.dmg` = OS rootfs (4,730,814,044 B), both zip CRC-32 verified, plus Firmware/*.root_hash/.trustcache/.mtree. AppOS cryptex is 087-86715-047.dmg (10 MB, same as iPhone 8).
+  - Images are raw APFS; files use LZBITMAP (decmpfs type 14). 7z cannot decode. Tools: `ipsw` 3.1.738 (AUR ipsw-bin, user-approved) needs apfs-fuse on Linux; **apfs-fuse** built in user space (system cmake broken: cmake 4.4.4 wants libjsoncpp.so.27, jsoncpp 1.9.6 installed = partial upgrade, NOT fixed) with pip cmake + `-DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_CXX_FLAGS="-include cstdint"`, installed to `~/.local/bin/apfs-fuse` (+apfs-dump-quick). Mount via a comma-free symlink (apfs-fuse splits options on ',' in `iPhone10,3`; exFAT has no symlinks -> put link elsewhere): `apfs-fuse LINK/087-86698-044.dmg MNT` -> `MNT/root/...`; unmount `fusermount3 -u MNT`.
+  - Verified from headers: `dyld_shared_cache_arm64` magic `dyld_v1   arm64`; `/sbin/launchd`, `/usr/lib/dyld` = cputype 0x100000c subtype 0 (plain arm64). libSystem exists only inside the cache.
+  - **BLOCKER for real userland via RAM disk:** shared cache = 3.10 GiB in 44 files (~2.5 GiB without the 592 MB `.symbols`), but the kernel manages only 1.20 GiB (0xb0000000..0xfd000000). Options: (A) give XNU the phone's full ~6 GB (banks 0x80000000+2G and 0x100000000+0xfcc00000, carve-out holes need pmap support) AND check fastboot max-download-size for a multi-GB boot image; (B) storage driver (Qualcomm UFS) to read a root from flash (no flashing allowed: would need a file/partition strategy); (C) run against individual dylibs extracted from the cache (uncertain).
+- **MILESTONE ON HARDWARE: HFS+ ROOT FILESYSTEM -> PID 1.** Boot 2026-10-15 18:22:12 UTC (`research/boot0027b.log`, image `shim/out/shim-boot-0027b.img`), photo `IMG_20261015_202334.jpg`: `BSD root: md0` -> `hfs: mounted SweetRoot on device b(1, 0)` -> `load_init_program: attempting to load /sbin/launchd` -> `*** SWEET userspace: init running as PID 1 ***` -> repeated `SWEET init: still alive`, no panic. Kernel 0027 (built-in Apple OSS HFS + BearSSL MD5), init with SP alignment fix. NEXT: real iOS 16 userland on the HFS image (dyld, libSystem/dyld shared cache, launchd). Known gaps: entitlements (none granted), SHA-1/SHA-384/512 providers, no storage driver (RAM disk only), root mounted read-only.
+- **PHONE HFS ROOT (0027) + SIGBUS ROOT-CAUSED.** Phone boot 2026-10-15 17:49:06 UTC (`research/boot0027.log`, photo `IMG_20261015_200031.jpg`): `hfs: mounted SweetRoot on device b(1, 0)` (HFS works on hardware), init printed its first line, then `pid 1 exited -- exit reason namespace 2 subcode 0xa` = SIGNAL/SIGBUS -> `initproc failed to start` panic. Diagnostic boot 18:08:13 UTC (`research/boot0027d.log`, image `shim/out/shim-boot-0027d.img`, diag init `research/diag-init` from scratch diag-init.S with [a][b][c] markers, `cs_debug=1`; photo `IMG_20261015_201547.jpg`): output `PID [a][b]` then SIGBUS -> fault at first `strb w21,[sp]`; no code-signing messages. Cause: kernel enters a static binary with sp at argc, not necessarily 16-aligned (depends on arg/apple string lengths, differs mockfs vs HFS); EL0 SP alignment check -> EXC_ARM_SP_ALIGN -> SIGBUS (sleh handle_sp_align). QEMU does not enforce SP alignment. NOT a kernel bug: real binaries start in dyld which aligns. Fix `1a8fc15`: sweet-init aligns sp at entry. Rebuilt `research/root-hfs.img`, QEMU `research/q0027-hfs2` OK. Phone image `shim/out/shim-boot-0027b.img` SHA256 `098ba46c...c5c` (payload-0027b, ramdisk match check-0027b) ready, awaiting FASTBOOT. Lesson: Assembly `;` is a comment in Apple arm64 asm (use .macro, not ;-joined #define).
+- **HFS ROOT WORKS (QEMU).** 0027 CI `38779441895` PASSED, `xnu/out-0027` SHA256 `a8643886...5f6a`. QEMU `research/q0027-hfs` (RAM disk = `research/root-hfs.img`, rd=md0): `BSD root: md0` -> `hfs: mounted SweetRoot on device b(1, 0)` -> `load_init_program: attempting to load /sbin/launchd` -> `*** SWEET userspace: init running as PID 1 ***` + heartbeat, no panic. Phone image `shim/out/shim-boot-0027.img` (payload-0027 = 0027 kernel + sweet-0021.adt + root-hfs.img + rd=md0, ramdisk byte-match check-0027) ready; awaiting FASTBOOT for phone test.
+- **HFS ROOT WORK (Claude), patches 0026-0027.**
+  - 0026 (`f0e990c` + link fix `64c96f4`): Apple OSS **hfs-627.100.6** (commit `31d5ec238dfab485e78a9a30b8b92d13e8914f03`, paired with xnu-8796.141.3 in macos-135 release.json) staged by `xnu/patches/0026-stage-hfs.sh` into `bsd/sweet_hfs` (core + hfs_encodings; AppleKeyStore include/key prototypes guarded by CONFIG_PROTECT; SDK TargetConditionals copied). New config option `sweet_hfs` (MASTER + MASTER.arm64.sweet); 40 `optional sweet_hfs` files; Makefile.template foreach adds `_CFLAGS_ADD = -include sweet_hfs_compat.h -I...` (MUST come after kernel -D flags; compat undefs BSD/XNU_KERNEL_PRIVATE and the CONFIG_* HFS tests so kext-config.h decides: macOS profile, no content protection). `sweet_hfs_iokit.c` replaces hfs_iokit.cpp/hfs_encodings_kext.cpp: `sweet_hfs_register()` called in bsd_init after vfsinit (encodings init, vfs_fsadd VFS_TBLCANMOUNTROOT, zones, sysctls); is_ejectable 0, iterate_media none, serial KERN_NOT_SUPPORTED, OSKextGetCurrentLoadTag -> kOSKextInvalidLoadTag (renamed via compat macro). hfs_encodings' own `hfs_allocated` renamed per object (separate kexts on Apple; first CI `38777325964` failed on that duplicate at link). mockfs now validates Mach-O magic (its TODO) so non-Mach-O roots fall through to HFS (new fs entries come AFTER mockfs in vfsconf). CI `38778133720` PASSED, `xnu/out-0026` SHA256 `0b49170c...701a`, prints `SWEET HFS: hfs-627.100.6 registered`.
+  - HFS+ image: `research/root-hfs.img` (8 MB, mkfs.hfsplus from AUR hfsprogs installed with user approval; loop-mounted with sudo; /sbin/launchd = research/sweet-init, /dev; fsck.hfsplus OK). QEMU `research/q0026-hfs`: `BSD root: md0` then data abort in MD5Init from hfs_getvoluuid (mount computes volume UUID).
+  - 0027 (`14bf2b7`): 0020 stager also copies BearSSL hash/md5.c + codec/dec32le.c/enc32le.c; `corecrypto_md5.c` SWEET branch converts MD5_CTX <-> br_md5_context around br_md5_* calls; wrappers sweet_md5.c/sweet_dec32le.c/sweet_enc32le.c. Host test 40/40 match md5sum. CI **`38779441895`** running.
+  - Local tooling: `tools/xnu-cc.py` has `XNU_CC_POST` (flags after logged ones). Sandbox `research/bt28/xnu` = 0025 CI tree + 0026/0027 edits; originals `research/pre0026`, `research/pre0027`. HFS local objects `research/hfs-objs`. Checker entries updated to bt28.
+  - SHA-1 / SHA-384/512 still have no provider.
+- **MILESTONE ON HARDWARE: USERSPACE PID 1 RUNS ON THE PHONE.** Boot 2026-10-15 17:16:00 UTC (`research/boot0025.log`: send OKAY0.410s, boot OKAY0.135s), image `shim/out/shim-boot-0025.img` SHA256 `9dbfa0b1...89db0`. Photo `IMG_20261015_191733.jpg`: `BSD root: md0` -> `load_init_program: attempting to load /sbin/launchd` -> `*** SWEET userspace: init running as PID 1 ***` -> repeated `SWEET init: still alive` (5 s heartbeat), no panic. Kernel 0025 + mockfs RAM disk + built-in no-entitlements AMFI. No flashing performed.
+- **NEXT (toward real iOS userland):** real root filesystem with real binaries. Options: (a) build Apple OSS `hfs` (macOS 13.5 tag `hfs-627.100.6`) into SWEET like libpthread, then an HFS RAM disk image; (b) iOS 16 dyld + libSystem/dyld shared cache from the IPSW (needs APFS or repacking onto HFS). Expected hurdles: entitlements (sweet_amfi grants none), SHA-1/MD5/SHA-384/512 providers (BearSSL), missing kexts/daemons. Current init is a static test program, not launchd.
+- **MILESTONE: USERSPACE RUNS (QEMU).** 0025 CI `38774788048` PASSED, `xnu/out-0025` SHA256 `5496069b...4877`. QEMU `research/q0025-rd` (150 s, no panic): `BSD root: md0` -> `load_init_program: attempting to load /sbin/launchd` -> `*** SWEET userspace: init running as PID 1 ***` -> `SWEET init: still alive` every 5 s. Exec, ad-hoc SHA-256 code signature, syscalls, devfs /dev/console, select timeouts all work. Phone image prepared: `shim/out/shim-boot-0025.img` 16,515,072 bytes SHA256 `9dbfa0b15140c0bd733a16c4f727f6a7df44a8741f98d8e266d5f2fa4f689db0` (payload-0025 = 0025 kernel + sweet-0021.adt + research/sweet-init + rd=md0; ramdisk byte-match check-0025). Waiting for user to put phone in FASTBOOT.
+- **0024 CI `38773277811` PASSED**, `xnu/out-0024` SHA256 `a0ba964b...4348`. QEMU `research/q0024-rd` and **PHONE (boot 2026-10-15 17:05:55 UTC, `research/boot0024.log`, image `shim/out/shim-boot-0024.img` SHA256 `cf3dac86...6964`, 16,510,976 bytes, payload `shim/out/payload-0024.bin` = 0024 kernel + `shim/out/sweet-0021.adt` + RAM disk `research/sweet-init` + rd=md0; ramdisk byte-match `check-0024`)** agree: `Added memory device md0`, `BSD root: md0`, `load_init_program: attempting to load /sbin/launchd`, then data abort in accelerate_entitlement_queries (PC 0x...77d2458, FAR 0x1a0) = NULL AMFI interface. Photo `IMG_20261015_190715.jpg`. RAM disk root is physically verified.
+- **0025 (`2518c79`)**: new `bsd/kern/sweet_amfi.c` registers a built-in AMFI interface at EARLY_BOOT/MIDDLE: no entitlements (adjustContextWithoutMonitor succeeds without creating a context, queries KERN_DENIED, copies NULL/KERN_NOT_FOUND, get_xml/transmuted false); WithMonitor KERN_NOT_SUPPORTED; OSEntitlements_query and query_context_to_object panic explicitly (CoreEntitlements closed; no kernel caller); TrustCache version 0 (0015 keys on trust_cache_rt==NULL, img4 absent -> still unavailable); CoreEntitlements table zero (PMAP_CS only). Compiles locally; checker updated (bt27 entries). CI **`38774788048`** running. Next artifacts `xnu/out-0025`, `research/bt29`, `research/run29.log`. Real iOS binaries will need real entitlements later (no OSS CoreEntitlements exists).
+- **0021-0024 RAM-disk-root iteration (Claude), QEMU only so far, no new phone boot since 0020.** Each kernel tested with `tools/mkpayload.py KERNEL research/q0021.adt OUT --ramdisk research/sweet-init --cmdline "debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=md0"` then `tools/qemu-sweet.py OUT DIR --secs 150 --kernel KERNEL --fail-on-panic` (PATH needs ~/swift/usr/bin for llvm-nm). Fresh ADTs: `research/q0021.adt` (QEMU), `shim/out/sweet-0021.adt` (phone).
+  - 0021 CI `38769532000` PASSED, `xnu/out-0021` SHA256 `2b7500a1...962e`, `research/bt25`/`run25.log`. QEMU `research/q0021-rd`: md0 root, then assert `iomediaClass` in IOService::publishHiddenMedia.
+  - 0022 (`20ece9c`, publishHiddenMedia without IOMedia class) CI `38770666158` PASSED, `xnu/out-0022` SHA256 `a4d0e787...30c5`, `research/bt26`/`run26.log`. QEMU `research/q0022-rd`: data abort in SHA256_Init (NULL g_crypto_funcs) from vm_kernel_addrhash_internal.
+  - 0023 (`c8089d1`, libkern SHA256_Init/Update/Final use built-in ccsha256_ltc_di + ccdigest_init/update on SWEET; also serves code-signing SHA-256; SHA-1/MD5/SHA-384/512 still have NO provider - BearSSL from 0020 could supply them later) CI `38771876423` PASSED, `xnu/out-0023` SHA256 `d763fed7...1003`, `research/bt27`/`run27.log`. QEMU `research/q0023-rd`: **mockfs mounted md0, `load_init_program: attempting to load /sbin/launchd`**, then panic `mockfs_fsnode_vnode failed to create fictitious pages ... rvalue = 5` (mockfs.c:351).
+  - 0024 (`3293c80`): mockfs used memdev mi_base (4K page number of a VIRTUAL kernel address for IOKit RAMDisk, truncated to 32 bits) << PAGE_SHIFT as a physical address. Now zero-copy pager mapping only when mi_phys (with 4K units); virtual md uses pagein/blockmap/strategy -> memdev bcopy. memdev's own mdPhys path assumes 4K ppnums (unsafe on 16K arm64), so do NOT switch the RAMDisk to physical. CI **`38773277811`** running. Next artifacts `xnu/out-0024`, `research/bt28`, `research/run28.log`.
+  - Sandboxes: bt25/bt26/bt27 contain the next patch's edited files; pristine copies in `research/pre0022`..`pre0024`.
+- **PATCH 0021 (Claude): RAM disk root via mockfs -> first userspace program.** Commits `9c37771` (initial; CI `38768500280` FAILED: mockfs_fsnode.c kfree_type(mockfs_fsnode_t) typed-alloc static assert; local xnu-cc stubs `__builtin_xnu_types_compatible` so it can't catch this) and `193772f` (fix), CI **`38769532000`** running: https://github.com/dipa-studio/ios-sweet/actions/runs/38769532000. Next artifacts: `xnu/out-0021`, `research/bt25`, `research/run25.log`.
+  - Kernel: `config/MASTER.arm64.sweet` FILESYS_BASE += `mockfs` (XNU's built-in FS: root device is itself a Mach-O, served as /sbin/launchd, plus /dev for devfs). Upstream mockfs bit-rot fixed: kalloc_type/kfree_type used the POINTER typedef mockfs_fsnode_t (nodes were 8 bytes) -> `struct mockfs_fsnode`. `IOService::setRootMedia` asserted IOBlockStorageDriver class exists (IOStorageFamily absent): SWEET-only, a missing class means root=NULL (same as IOSetImageBoot); Apple path keeps assert. All 21 patches apply (`research/check-patch-order.py`); 5 TUs compile locally with -DMOCKFS (`research/mockfs-objs`), imports resolve vs 0020 kernel. Sandbox `research/bt24/xnu` now holds 0021 versions of those 3 files; pristine 0020 copies in `research/pre0021`.
+  - Tools: `tools/mkpayload.py --ramdisk IMAGE` appends IMAGE as an extra payload segment right after the kernel, moves kernel_end past it (shim unchanged: ADT+boot_args follow it, image stays below topOfKernelData), and adds ADT `/chosen/memory-map` `RAMDisk`=<phys,size>. Boot with `rd=md0`. Without --ramdisk output is byte-identical to existing 0020 QEMU and phone payloads (verified). `tools/sweet-init.S` + `tools/mkinit.py`: PIC static init (open /dev/console, print PID, heartbeat every 5 s via select, never exits) wrapped into a static arm64 Mach-O (__PAGEZERO, __TEXT@0x100000000, LC_UNIXTHREAD, ad-hoc SHA-256 CodeDirectory v0x20400, 4K pages). Build: `~/swift/usr/bin/clang -target arm64-apple-ios16.0 -c tools/sweet-init.S -o X.o && tools/mkinit.py X.o research/sweet-init` (ld64.lld cannot link static iOS). Signature not verified by a real codesign; the kernel will tell.
+  - QEMU with 0020 kernel + RAM disk (`research/q0020-rd.bin`, rd=md0, 150 s `research/q0020-rd150`): `Added memory device md0`, **`BSD root: md0, major 1, minor 0`** (plumbing works), then the setRootMedia assert (now fixed in 0021). NOTE: QEMU needs >60 s to reach IOFindBSDRoot (60 s run showed nothing after stf0; likely RTC/inittodr wait), so use --secs 150.
+  - NEXT: download 0021, QEMU 150 s with ramdisk; expect mockfs mount then init exec -> `*** SWEET userspace: init running as PID 1 ***`. Then phone boot with same payload (phone ADT shim/out/sweet-0020.adt pattern + --ramdisk + rd=md0).
+- **0020 PHONE RESULT (user transcription of screen, 2026-10-15): KERNEL INIT COMPLETE, WAITING FOR ROOT.** After Skywalk self-tests PASSED, kminit, ifnet_attach lo0/gif0/stf0, screen prints `BSD`, then `Waiting on <dict><key>IOProviderClass</key><string>IOMedia</string><key>Content</key><string>Apple_HFS</string></dict>` and `Failed to write boot-picker-bringup-reason to NVRAM.` No panic. This is IOFindBSDRoot waiting for a root device (none exists); NVRAM warning is expected (no NVRAM driver). QEMU `cpu_idle` snapshot is presumably the same wait (not GDB-confirmed; milestone GDB run was cancelled by user since phone answered it). Draft `research/check-milestones20.gdb` (hbreaks inittodr/vfs_mountroot/IOFindBSDRoot/bsd_utaskbootstrap) left uncommitted/ignored.
+- **NEXT MILESTONE: root filesystem -> launchd.** Plan: (1) RAM disk: shim places an image in RAM, ADT /chosen/memory-map `RAMDisk` entry, boot-arg `rd=md0` (XNU md driver). (2) HFS is a separate kext on Apple; build Apple OSS `hfs` (tag paired with macOS 13.5 in distribution-macOS macos-135 release.json) into SWEET like libpthread 0019. APFS is closed. (3) Minimal HFS image with iOS 16 launchd (later: dyld/shared cache; AMFI/code-signing absent will be a later hurdle). User's end goal is full iOS GUI.
+- **0020 (AES) VERIFIED + PHONE BOOTED (Claude took over after Codex usage limit).** Actions `38765422261` (`ab9e23f`) PASSED; kernel `xnu/out-0020/kernel.development.sweet` checksum OK; buildtree `research/bt24`, log `research/run24.log`. Actual-kernel AES checks PASS (`research/check-aes20.gdb` / `.log`, 12 extra CBC cases match OpenSSL). 45s QEMU `research/q0020`: no panic, zero unknown glyphs, past old TCP/AES panic -> Skywalk self-tests PASSED -> bsd_autoconf kminit -> ifnet_attach lo0/gif0/stf0; final snapshot PC in `cpu_idle` (idle or waiting; NOT yet diagnosed, could be root-device wait). Image `shim/out/shim-boot-0020.img` 16,461,824 bytes SHA256 `775200cb02d95fc750981516b79d91dcdc96184bbe67a38f9d57c59b4a391828`, ramdisk byte-matches `payload-0020.bin` (`check-0020`). **Phone temporarily booted 2026-10-15 16:10:00 UTC**: one FASTBOOT product sweet, send OKAY0.407s, boot OKAY0.134s, total0.549s, exit0 (`research/boot0020.log`). Awaiting user photo; do not reboot the phone before it. NEXT: read photo; diagnose what QEMU waits on after stf0 (GDB backtrace of threads / longer run). Codex's STOP request below is complete.
+- User requests STOP after completing the current0020 AES iteration (Actions/QEMU/phone), then leave a precise committed handoff for another AI. User says FASTBOOT ready again after0019 photo. Do not start a new blocker fix after this iteration.
+- Goal: iOS16-generation XNU on Redmi Note10Pro sweet/SM7150. Always commit, use gh/Actions for kernel builds, keep this handoff current. Temporary fastboot boot only; preserve Android/backups. No userland/root filesystem boot yet.
+- **Patch0020 update:** initial `e71098d` / Actions `38765012466` superseded by scalar-only compile flags. Added -mgeneral-regs-only to all six provider/BearSSL TUs and corecrypto_aes.c; object disassembly now confirms no SIMD. Updated implementation `ab9e23f`, Actions `38765422261` queued/running: https://github.com/dipa-studio/ios-sweet/actions/runs/38765422261. Do not launch another run. portable BearSSL AES CBC and legacy one-block ECB wired directly into SWEET corecrypto_aes.c. Genuine bitslice implementation, no CPU AES/SIMD requirement, heap or fake global crypto table. Source fetched by `0020-stage-bearssl.sh` from official BearSSL git at immutable `7bea48e5e850ab4cafbe68d3765cdaba13a86d6f`; MIT license retained, downloaded source stays out of git. Kernel limits include adapter only. All128/192/256-bit keys, CBC encrypt/decrypt, copied contexts, in-place/out-of-place; zero block count and size overflow handled, invalid keys clear context. Seven TUs compile to arm64 objects (`research/aes-objs`), imports resolve, all20 patches apply and sources match (`research/patch0020-check.log`). Sandbox `research/bt23/xnu`, originals `research/pre0020`. NEXT: Actions then actual-kernel NIST/random CBC/ECB checks and >=45s QEMU before another phone boot. Next artifacts out-0020 / bt24 / run24.log. 0020 updated CI pending. Local sources/checks match the scalar-only patch.
+- **Latest built kernel0019**, implementation `256d3f0`, patches0001-0019. Actions `38763072907` PASSED (4m5s): https://github.com/dipa-studio/ios-sweet/actions/runs/38763072907. Kernel `xnu/out-0019/kernel.development.sweet`, SHA256 `a27df7568f03fb541cf0e8024c0a594fa178a85054fcf9eba29158cbd4c5ecc0`; checksum verified. Log/source `research/run23.log` / `research/bt23` (no nested .git). Seven pthread source/build/header files and staged adaptations byte-match local compile inputs.
+- **0019 hardware photo received** `IMG_20261015_175306.jpg`: pthread registration visible, passes mbinit and DLIL checksum/scheduling, same AES fault as QEMU: PC`0xfffffe00079174e0` (`aes_encrypt_key128`), LR`0xfffffe000767c3a4` (`tcp_init`), FAR0x78, x8=0. Disassembly proves NULL g_crypto_funcs->ccaes_cbc_encrypt. Photo processed; no more0019 observation pending. General crypto table remains absent, other hash/mode operations may still fault after0020. DO NOT bypass TCP or install fake crypto. XNU already contains SHA256/HMAC implementations; AES source there is a dispatch wrapper. Full future provider interface libkern/libkern/crypto/register_crypto.h. Apple/corecrypto default README describes evaluation-only licensing, so no external corecrypto was fetched or staged; BearSSL selected for this portable AES integration.
+- **0019 pthread FIXED in QEMU and observed beyond its init on phone**: 45s QEMU `research/q0019`, zero unknown glyphs, then AES panic. Actual-kernel API checks PASS `research/check-pthread19.gdb` / `.log`, guest `research/q0019-api`: function/callback table identity, actual provider pthread_init returns, locks/global hash/threadcall/typed zones initialized, thread_selfid via syscall shim + buffer bounds, process hash init/delete via shims restores NULL. Monitor quit prints expected remote-disconnect after PASS. All fixture guests stopped.
+- **0019 provider**: genuine Apple libpthread-514.100.2 commit `a6c70ca0e544347a0377babf748f831577ec24f9`, exact paired release with xnu8796.141.3 in distribution-macOS/macos-135/release.json (`research/macos-135-release.json`). 0019 shell stage runs before patches (workflow copies *.sh); three SWEET wrapper TUs use kext BSD header view, vm_fault_external, renamed provider-side pthread_kern/current_uthread; register real function table at EARLY_BOOT SECOND, real pthread_init later. Stager applies bounded address casts, zero user addresses, proper panic format. SWEET opaque ksyn storage enlarged48->56 for trailing kwe_uth, checked with provider static assertion. Local pre-CI TargetConditionals fixture was syntax-only; artifact bt23 carries actual SDK header and CI is authoritative.
+- **Phone0019 temporarily booted** 2026-10-15 15:51:36 UTC: exactly one FASTBOOT/product sweet verified; send OKAY0.406s, boot OKAY0.134s, total0.546s, exit0 (`research/boot0019.log`). Image `shim/out/shim-boot-0019.img`, 16,457,728 bytes, SHA256 `19429a57e486b856880df9e27327ed488e0139345311fdb0350974e72103a9a1`. Phone ADT/payload `shim/out/sweet-0019.adt` / `payload-0019.bin` timer19, unpacked ramdisk byte-match (`check-0019`). EntryPA0xb146b488, kernelendPA0xb2000000, boot_argsPA0xb2004000/top0xb2008000. Last user FASTBOOT+USB reply preceded this boot; do not assume phone is still in FASTBOOT.
+- **CPU0018 physically verified** by `IMG_20261015_173951 (2).jpg`: boot CPU0 registered, real SGI1 verified, initialization complete -> BSD/MAC/mbinit -> old pthread-table panic. SweetCPU uses legacy IOCPU, ml_processor_register/processor_start/initCPU, real SGI1 clears SIGPdisabled before max CPUs completion; no forced flags/skipped waits. CPU APIs and two-CPU rejection passed (`research/check-cpu18.gdb`, `q0018-api`, `q0018-smp`). Single core; SMP/suspend unsupported. CURRENT SWEET has NO USE_APPLEARMSMP.
+- QEMU next run: generate fresh `tools/mkadt.py research/q0020.adt --qemu` (timer27), mkpayload with `debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress`, then `tools/qemu-sweet.py PAYLOAD OUT --secs 45 --kernel KERNEL --fail-on-panic`. 12s can miss later panics because IORTC waits30s. Runner snapshot only: panic exit2, blank/incomplete exit3; absence of panic does not mean complete boot. Qualcomm XPU/ABL/panel and phone SMC PSCI require hardware checks.
+- Local checker `tools/xnu-cc.py research/run23.log research/bt23 FILTER --per-file`, XNU_CC_OBJDIR for objects. For new BearSSL TUs add XNU_CC_EXTRA with -I bt23/xnu/libkern/crypto/sweet_bearssl/{inc,src}. Patch checker `research/check-patch-order.py` uses temporary upstream index; source fixtures/artifacts ignored under research. GDB mask registers to unsigned64, use function-entry manual-call return traps, discard manipulated guests. No QEMU guest intentionally left running.
+
+## Session log and earlier handoffs (superseded by the active summary above)
+
+### Prior 0019 transition notes (superseded)
+
+- Goal: iOS 16 generation XNU on sweet. Always commit completed work, use gh/Actions for kernel builds, keep this handoff current. Temporary fastboot boot only; preserve Android/backups.
+- **0019 build PASSED** Actions `38763072907` (4m5s), implementation `256d3f0`. Kernel `xnu/out-0019/kernel.development.sweet`, SHA256 `a27df7568f03fb541cf0e8024c0a594fa178a85054fcf9eba29158cbd4c5ecc0`; checksum verified. Log/source `research/run23.log` / `research/bt23`; all seven patched files and staged provider adaptations match local compile inputs. Prefer bt23 as the next baseline.
+- **0019 pthread FIXED in QEMU**: 45s run `research/q0019` registers provider, passes mbinit, DLIL SUM16 checks and DLIL thread scheduling. Actual-kernel GDB checks `research/check-pthread19.gdb` / `.log` PASS: function/callback table identity, real _pthread_init returns, locks/global hash/cleanup threadcall/typed zones non-NULL, thread_selfid via actual syscall shim with output bounds, process hash init/delete through actual shims restores NULL. Guest stopped after tests; no fixture left running. GDB monitor quit prints expected remote disconnect after PASS.
+- **Current next blocker:** QEMU0019 panic data abort FAR0x78 at `aes_encrypt_key128` PC`0xfffffe00079174e0`, called by `tcp_init` LR`0xfffffe000767c3a4`. Disassembly confirms `g_crypto_funcs == NULL`, loading ccaes_cbc_encrypt at+0x78. General crypto registration is still absent; DO NOT bypass TCP or supply fake crypto. Next integrate a genuine compatible crypto implementation/provider (AES first needed here, other digest/mode APIs also used). XNU contains SHA256/HMAC but no AES implementation; its corecrypto_aes.c is a dispatch wrapper. Full crypto table is in libkern/libkern/crypto/register_crypto.h.
+- **0019 phone image prepared and verified**, user reports FASTBOOT+USB again; exactly one device/product sweet verified. `shim/out/shim-boot-0019.img`, 16,457,728 bytes, SHA256 `19429a57e486b856880df9e27327ed488e0139345311fdb0350974e72103a9a1`; unpacked ramdisk matches phone payload (`shim/out/check-0019`, `payload-0019.bin`, `sweet-0019.adt`, timer19). EntryPA0xb146b488; kernelendPA0xb2000000; boot_argsPA0xb2004000/top0xb2008000. Usual debug cmdline cpus=1/-noprogress. **Temporarily booted 2026-10-15 15:51:36 UTC**: send OKAY0.406s, boot OKAY0.134s, total0.546s, exit0 (`research/boot0019.log`). User asked for photo after45s. Await the photo; DO NOT reboot again before observation. Bootloader acceptance only; no0019 physical progress observed yet.
+- **Hardware photo confirms 0018 progress** (`IMG_20261015_173951 (2).jpg`): real phone prints `SWEET CPU: boot CPU 0 registered, SGI1 verified, initialization complete`, enters BSD/MAC, reaches `mbinit: done`, then the same missing-pthread-function-table panic as QEMU at pthread_shims.c:318. CPU completion/interrupt delivery is now physically observed. The photo was received; no further phone boot performed yet.
+- **Patch0019 committed/pushed `256d3f0`; Actions `38763072907` queued/running:** https://github.com/dipa-studio/ios-sweet/actions/runs/38763072907. Do not launch a duplicate. genuine Apple OSS libpthread-514.100.2 provider (immutable commit `a6c70ca0e544347a0377babf748f831577ec24f9`), paired with xnu-8796.141.3 by Apple's `distribution-macOS/macos-135/release.json` (`research/macos-135-release.json`). `0019-stage-libpthread.sh` fetches/stages it before patches; workflow now copies shell scripts too. SWEET-only wrappers compile all three real kernel sources, rename provider-side symbols, use kext header view and vm_fault_external, register the real function table at EARLY_BOOT SECOND. Existing pthread_init then runs the actual provider initialization. No pthread wait/syscall is bypassed. Source staging includes bounded explicit address casts/zero user addresses and panic-format fixes. SWEET kernel opaque ksyn storage enlarged from48 to56 bytes to contain this provider's trailing kwe_uth, with a provider size assertion. Local compile of three provider TUs plus pthread_shims/kern_fork passed; imports resolve and provider exports do not collide with existing kernel symbols. All19 patches apply and changed sources match (`research/patch0019-check.log`). Source sandbox `research/bt22/xnu`, originals `research/pre0019`, objects `research/pthread-objs`. Local TargetConditionals fixture only has target macros for syntax; CI stages the real macOS SDK header and is authoritative. Next Actions artifacts: out-0019 / bt23 / run23.log; run QEMU >=45 seconds. 0019 CI is pending; no 0019 QEMU run yet.
+- **Latest kernel implementation `e7d9550`, patches0001-0018; CI `38760004398` PASSED (3m56s)**: https://github.com/dipa-studio/ios-sweet/actions/runs/38760004398. No build is pending. Kernel `xnu/out-0018/kernel.development.sweet`, SHA256 `b3c8d59acc88f93a2c836eb2527a05ed4fbaac7c580a2ea8c3b795137f4aadf1`; checksum verified. Source/log `research/bt22` / `research/run22.log` (baseline for patch0019; no nested .git). New driver/config sources match CI exactly.
+- **CPU wait FIXED in QEMU**: SweetCPU uses legacy IOCPU, validates single boot CPU, ml_processor_register -> processor_start -> initCPU real SGI1 -> scheduler/IOKit completion -> ml_set_max_cpus. It does NOT force a flag or skip a wait. CPU APIs passed: Running CPU0, processor_array[0] association, SGI signalling enabled, name, unsupported secondary-start error (`research/check-cpu18.gdb` / `.log`, `research/q0018-api`). Single-core only; SMP and suspend unsupported. Two-CPU topology fails explicitly (`research/q0018-smp`).
+- **Next blocker reproduced in 45s QEMU** (`research/q0018-long`, zero unknown glyphs): BSD initialization reaches MAC framework, network mcache and `mbinit: done`, then **`pthread kernel extension not loaded (function table is NULL). @pthread_shims.c:318`**. Do not bypass pthread_init: find/integrate the matching open-source libpthread kernel implementation and register its real function table. A 12s run `research/q0018` looked panic-free before the 30s IORTC wait elapsed; use >=45s or GDB checkpoints for the next iteration. No userland/root filesystem boot yet.
+- **Phone 0018 TEMPORARILY BOOTED** 2026-10-15 **15:31:15 UTC**: exactly one FASTBOOT device verified product sweet; send OKAY0.400s, boot OKAY0.134s, total0.539s, exit0. Local log `research/boot0018.log`. This confirms bootloader acceptance only. User was asked for a photo; await it, DO NOT reboot the phone again before their observation. No flashing performed.
+- Current hardware image `shim/out/shim-boot-0018.img`, **16,437,248 bytes**, SHA256 **`b7a23595d143a76c72c9fe2cfcc5d77a8f16987b5af1a2703bbffdfa6922908c`**. Phone ADT/payload `shim/out/sweet-0018.adt` / `shim/out/payload-0018.bin` (timer19), unpacked ramdisk exactly matches payload (`shim/out/check-0018`). EntryPA0xb146b488; kernelendPA0xb1ffc000; boot_argsPA0xb2000000/top0xb2004000. Command line `debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress`.
+- QEMU payload/ADT `research/q0018.bin` / `research/q0018.adt` (timer27). Run `python3 tools/qemu-sweet.py research/q0018.bin research/NEW-OUT --secs 45 --kernel xnu/out-0018/kernel.development.sweet --fail-on-panic`; fresh ADT seed for a new payload. Output fb.png/fb.txt/regs.txt/qemu.log/result.json. Visible panic exit2; blank/incomplete decode exit3; no_panic_observed is snapshot-only, not successful boot. -noprogress prevents the graphical indicator corrupting console text. Qualcomm XPU/bootloader/panel and SMC PSCI still need physical validation.
+- Patches0014-0017 fixed PRNG registration/direct SHA256, explicit unavailable trust-cache service with rejected loads/no matches, built-in SweetPlatformExpert, and timer PPI from ADT (phone19/default19, QEMU27). All their checks/artifacts are preserved in the history below. CURRENT SWEET has NO USE_APPLEARMSMP; do not assume gCPUIC/gAIC/gPMGR AppleARMSMP globals exist.
+- Local single-file checker: tools/xnu-cc.py research/run22.log research/bt22 FILTER --per-file, output via XNU_CC_OBJDIR. Patch checker `research/check-patch-order.py` applies all18 via temporary index, matches sandbox sources. Sandbox for0018 `research/bt21/xnu`, originals `research/pre0018`, objects `research/cpu-objs`. First compiler issues were missing machine/atomic.h and nonexistent getNameSymbol; fixed and both TUs compiled successfully before CI. Fixtures/artifacts under research are local-only/ignored.
+- GDB: mask int(register)&((1<<64)-1) for unsigned kernel pointers; use function-entry manual-call return traps, discard manipulated guests. No QEMU fixture is intentionally left running.
+
+### Earlier active handoff snapshot (superseded)
+
+
+- **0018 milestone:** Actions `38760004398` PASSED (3m56s), checksums passed, new CPU/build files byte-match CI tree. Kernel `xnu/out-0018/kernel.development.sweet`, SHA256 `b3c8d59acc88f93a2c836eb2527a05ed4fbaac7c580a2ea8c3b795137f4aadf1`; log/tree `research/run22.log` / `research/bt22`. QEMU `research/q0018` 12s: boot CPU registered, SGI1 verified, CPU initialization complete, **BSD initialization entered** (copyright, MAC framework, buffer headers), no panic/zero unknown glyphs. Direct CPU API checks PASS (`research/check-cpu18.gdb`, `.log`, `research/q0018-api`): CPU0 Running, processor matches processor_array[0], real SGI enabled, CPU name correct, secondary-start returns KERN_NOT_SUPPORTED. Two-CPU ADT correctly panics before registration (`research/q0018-smp`). Longer 45s run `research/q0018-long` still running; next BSD wait/fault not yet identified.
+- **Prepared 0018 phone image:** `shim/out/shim-boot-0018.img`, 16,437,248 bytes, SHA256 `b7a23595d143a76c72c9fe2cfcc5d77a8f16987b5af1a2703bbffdfa6922908c`. Phone ADT/payload `shim/out/sweet-0018.adt` / `shim/out/payload-0018.bin`, usual debug args with cpus=1 and -noprogress. Unpacked ramdisk byte-compared (`shim/out/check-0018`). Entry PA remains 0xb146b488; kernel end PA 0xb1ffc000, boot_args 0xb2000000/top0xb2004000. User reports FASTBOOT+USB ready; read-only check found exactly one product sweet. NEXT: temporary fastboot boot of this verified image, record send/boot results, then await hardware photo without rebooting again.
+- Patch 0018 committed/pushed **`e7d9550`**; Actions **`38760004398`** queued/running: https://github.com/dipa-studio/ios-sweet/actions/runs/38760004398. Do not launch a duplicate run.
+- Active continuation: patch **0018** implemented in `iokit/Kernel/arm/SweetCPU.cpp` + arm64 source list + exact qcom,kryo470 personality. Keeps legacy IOCPU, accepts ONLY the single boot CPU, fills ml_processor_info from parsed topology with CPU object as cpu_id, calls ml_processor_register and processor_start. initCPU sends SGI1 via ICC_SGI1R_EL1 and waits (1-second deadline) for real cpu_signal_handler to clear SIGPdisabled. Only after successful startup calls ml_cpu_init_completed/cpusRunning and publishes completion/max CPUs. Secondary startup/suspend are explicitly unsupported. Local C++ compile passed for both TUs (`research/cpu-objs`), all imports resolve, object contains dsb ishst / ICC_SGI1R / isb; all18 patches apply in order and match sources. Sandbox `research/bt21/xnu`, originals `research/pre0018`; next CI artifacts should use `xnu/out-0018`, `research/bt22`, `research/run22.log`. User has the phone available; first run QEMU, then prepare/temporarily boot useful hardware progress.
+- Goal: iOS 16 generation XNU on Redmi Note 10 Pro / sweet. User wants persistent progress, commits, kernel builds via `gh` Actions, and this handoff kept current across agent switches. Temporary `fastboot boot` only; preserve Android and backups.
+- Latest kernel implementation: **`aa3f991`**, patches **0001-0017**. All four new Actions builds PASSED: 0014 `38748543058` (4m0s), 0015 `38749549779` (4m3s), 0016 `38750733996` (4m3s), 0017 **`38751507437` (4m7s)**. Latest: https://github.com/dipa-studio/ios-sweet/actions/runs/38751507437. No build is pending.
+- **Current blocker: CPU initialization has no SWEET CPU driver.** QEMU registers SweetPlatformExpert, then kernel_bootstrap_thread waits in **kperf_init_early -> ml_wait_max_cpus**. Confirmed via actual-kernel GDB call stack (`research/locate-cpu-wait2.log` / `.symbols`) and normal-run `max_cpus_initialized == 2` (MAX_CPUS_WAIT). Do not force the flag or remove the wait. Next implement real CPU registration and completion using XNU's CPU/processor interfaces. CURRENT SWEET uses legacy IOCPU (`USE_APPLEARMSMP` is absent); enabling AppleARMSMP is a separate architectural change requiring GIC/PMGR services. No userland/root filesystem boot yet.
+- Fixed this session: PC=0 unregistered PRNG callback (0014, built-in HMAC-SHA256 provider + direct entropy/write_random hashing); absent Image4/AMFI trust-cache service (0015, unavailable runtime, loads rejected and queries no-match); missing platform driver (0016, SweetPlatformExpert exact personality); incorrect QEMU timer IRQ (0017, validated ADT PPI property, phone default19/QEMU27).
+- **Latest kernel** `xnu/out-0017/kernel.development.sweet`, SHA256 `055a80190ab998b4df9203f1102072dcc78faad1779a537a514e522b682b582f`. Buildtree/log **`research/bt21` / `research/run21.log`**; all nine changed C/C++/header/config files byte-match local checked sources. Checksums passed. Entry PA `0xb146b488`, kernel end PA `0xb1ff4000`. Preferred baseline for patch 0018: `research/bt21/xnu` (no nested .git).
+- **QEMU verified**: `research/q0017-noprogress` ran **30 seconds**, no visible panic, **zero unknown glyphs**, IRQ exceptions returned normally (4 IRQs, tickless idle). It still waits for CPU completion, so this is NOT a completed boot. Earlier 15s run `research/q0017` captured 122 IRQs, timer value27, GICR_ISENABLER0 `0x08000002`, and CPU WAIT; graphical progress overlay corrupted 13 glyphs. Add **`-noprogress`** to keep the console readable. New runner classifies incomplete/blank decoding explicitly (exit3 with --fail-on-panic), visible panic exits2. Snapshot-only; use regs/GDB to diagnose stalls.
+- Current QEMU payload/ADT: **`research/q0017-noprogress.bin` / `research/q0017.adt`**. Run: `python3 tools/qemu-sweet.py research/q0017-noprogress.bin research/NEW-OUT --secs 30 --kernel xnu/out-0017/kernel.development.sweet --fail-on-panic`. Generate fresh seed with mkadt for a new payload. QEMU virt models generic ARM execution, not Qualcomm XPU/bootloader/panel or the phone's SMC PSCI conduit.
+- **Prepared phone image**: **`shim/out/shim-boot-0017.img`**, 16,416,768 bytes, SHA256 `51ff7fe30b4a6668c3452ffe1da922c5ac30cb8de60625c2a652587ecbd0ec92`. Phone ADT/payload `shim/out/sweet-0017.adt` / `shim/out/payload-0017.bin` (timer19). Unpacked ramdisk exactly matches payload (`shim/out/check-0017`). Command line **`debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress`**. NOT sent to phone this session: known CPU-driver wait should be addressed in QEMU first. Last actual phone boot remains 0013; user's latest photo `IMG_20261015_160033.jpg` confirmed the old PRNG PC=0 panic.
+- Direct QEMU/GDB API checks: PRNG 600-byte chunking, buffer bounds, changing output, zero-length reads/writes, user reseed, contended refresh, generator1 init/output PASS again on latest0017 (`research/check-prng17.gdb` / `.log`, guest `research/q0017-api`). Trust-cache unavailable-service/argument/output cases PASS on0015 (`research/check-trustcache.gdb` / `.log`). Platform registration + target/product normal/truncated/zero/null/bounds PASS on0016 (`research/check-platform.gdb`, `research/check-platform3.log`). Different platform ID correctly retains IOPanicPlatform fallback (`research/q0016-negative`). Timer PPI32 and size2 correctly panic (`research/q0017-badppi`, `research/q0017-badsize`); omitted property selects19 (`research/q0017-default`). These are API/bring-up checks, not crypto certification or SMP scheduling validation.
+- Local checker **`research/check-patch-order.py`** verifies all17 patches and changed source equality using a temporary upstream git index. Fixtures/logs/artifacts under research are local-only and ignored. For GDB unsigned kernel pointers, mask `int(register_value) & ((1<<64)-1)`; x30/x29 may be rendered signed. Stop at a function entry for manual-call return traps, and discard each manipulated guest after API tests. All fixture QEMU guests have been stopped.
+
+
+- User wants persistent progress toward iOS 16, commits for completed changes, builds through `gh` / GitHub Actions.
+- Keep this file current at every milestone so another agent can resume immediately, including when usage limits interrupt a session.
+- Patch 0017 committed/pushed `aa3f991`, Actions `38751507437` running: https://github.com/dipa-studio/ios-sweet/actions/runs/38751507437. Next artifacts: xnu/out-0017, research/bt21, research/run21.log. Do not duplicate.
+- Patch 0016 kernel downloaded/checksum verified: SHA256 `d06336c54baa06e0df6561a8bd7df98a9b9f7502c9381c62d1a44c045cd1ce46`, `xnu/out-0016/kernel.development.sweet`; buildtree/log `research/bt20` / `research/run20.log`. QEMU `research/q0016` (10s) prints platform expert registered, zero unknown glyphs, no panic observed BUT stalls (timer mapping still wrong until 0017). Direct actual-kernel GDB tests passed for registered instance and target/product names, including maxLength=1/0 and NULL, sentinels intact (`research/check-platform.gdb`, `research/check-platform3.log`, `research/q0016-api3`). First two fixture attempts used premature/wrong return breakpoints; discarded, corrected fixture uses start-return observation then a function-entry return trap. No phone boot yet.
+- Patch 0016 CI `38750733996` PASSED (4m3s); artifacts not yet downloaded/booted. Patch 0017 prepared to fix QEMU timer fidelity BEFORE interpreting future no-panic/stall runs: actual `qemu-system-aarch64 -M virt,gic-version=3,dumpdtb=research/qemu-virt.dtb ...` timer property has virtual PPI 11 => INTID 27, while phone uses INTID 19. Kernel formerly hardcoded 19. New optional /arm-io/gic virtual-timer-intid property selects the PPI (validate exact u32 and 16..31); missing property retains phone default 19. One RO-late global drives GIC enable and sleh_irq dispatch. tools/mkadt.py emits phone19/QEMU27. Both C TUs compile (`research/timer-objs`), ADT serialize/parse checks confirm values/addresses, all 17 patches apply and match. Sandbox `research/bt19/xnu`, originals `research/pre0017`; initial local sleh compile failed due read-only exported header not updated, fixed export and BOTH recompiled successfully. CI exports normally.
+- Architecture correction for next agent: CURRENT SWEET board_config does NOT define USE_APPLEARMSMP; it compiles the legacy IOCPU path, not cpu_boot_thread/IOPMGR AppleARMSMP. Existing roadmap mentions AppleARMSMP as a future approach. Do not look for gCPUIC/gAIC/gPMGR globals in the current kernel: they are absent. Determine the actual CPU-init wait after platform registration before choosing the next driver architecture.
+- Patch 0016 committed/pushed as `0dcdf5c`; Actions `38750733996` running: https://github.com/dipa-studio/ios-sweet/actions/runs/38750733996. Next artifacts: `xnu/out-0016`, `research/bt20`, `research/run20.log`.
+- Patch 0016 implemented: new `iokit/Kernel/arm/SweetPlatformExpert.cpp`, arm64 source list, built-in personality in KernelConfigTables.cpp guarded by ARM64_BOARD_CONFIG_SWEET. Matches only xiaomi,sweet at score 10000, keeps IOPanicPlatform fallback for other hardware. Uses IODTPlatformExpert base initialization/power domain and createNubs CPU logical-ID annotation; overrides top-level publishing because base requires nonexistent Apple NVRAM /options. Publishes real CPU/top-level nodes, provides bounded target/product names, and registers the platform service. GIC/PMGR and arm-io child-bus drivers remain separate work. Both C++ TUs compile (`research/platform-objs`), all imports resolve against 0015/own objects, all 16 patches apply and sources match. Sandbox `research/bt19/xnu`; originals `research/pre0016`. NEXT: full Actions/QEMU; inspect CPU boot waits after the platform registers, do not equate absence of panic with successful boot.
+- Patch 0015 CI `38749549779` PASSED (4m3s), checksum verified. Kernel `xnu/out-0015/kernel.development.sweet`, SHA256 `ca1b424a596c7058550ad1659080a333e7643270f019656401d80bf2b876645f`; buildtree/log `research/bt19` / `research/run19.log`. QEMU `research/q0015` (10s, zero unknown glyphs) passes trust-cache handling and machine lockdown, then panics `Unable to find driver for this platform: "xiaomi,sweet" @IOPlatformExpert.cpp:2319` (IOPanicPlatform fallback). Next concrete work: add a built-in SWEET IODTPlatformExpert personality/class; keep the fallback for mismatched platforms. No phone boot yet.
+- Direct trust-cache API checks PASSED in the actual 0015 kernel under QEMU/GDB (`research/check-trustcache.gdb`, `research/check-trustcache.log`, `research/q0015-api`): runtime pointers NULL, hash/UUID queries return NOT_FOUND, typed/untyped/legacy loads return NOT_SUPPORTED, capabilities outputs zero and bounds preserved, invalid-argument cases still reject. Second PRNG check also verifies contended refresh returns immediately (`research/check-prng2.log`, `research/q0014-api2`).
+- Patch 0015 committed/pushed `8f851d4`, Actions run `38749549779` running: https://github.com/dipa-studio/ios-sweet/actions/runs/38749549779. Do not duplicate.
+- Direct PRNG API checks passed in the REAL 0014 kernel under QEMU/GDB, stopped before trust-cache init (`research/check-prng.gdb`, log `research/check-prng.log`, guest `research/q0014-api`). Invoked read_random for 600 bytes (chunking and buffer sentinel intact), repeated output differed, zero-length read/write succeeded, write_random(64-byte input) succeeded, secondary generator 1 initialized and generated distinct output. QEMU log has no exceptions during these checks; guest was discarded after the tests. This tests API behavior, not a cryptographic certification or SMP scheduling.
+- Patch 0015 implemented in `bsd/kern/kern_trustcache.c`: SWEET with missing Image4/AMFI marks both runtime pointers NULL and logs service unavailability. Existing static loader handles NULL. Public load APIs return KERN_NOT_SUPPORTED; hash/UUID queries return KERN_NOT_FOUND; capabilities outputs are zero with KERN_NOT_SUPPORTED. Invalid-input checks remain, and Apple paths/available-provider initialization retain existing behavior. No trust is granted. Local arm64 compile passed (`research/trustcache-objs`), all 15 patches apply and sources match. Sandbox `research/bt18/xnu`, baseline `research/pre0015`. Next: Actions/QEMU and direct unavailable-service API checks using GDB.
+- Patch 0014 CI `38748543058` PASSED (4m0s), artifact checksum passed. Kernel `xnu/out-0014/kernel.development.sweet`, SHA256 `741de20c851755d333759d7e668346f3edb4f325efac4cc7c142d80d1f5ff75c`; buildtree/log `research/bt18` / `research/run18.log`. QEMU run `research/q0014` (10s, zero unknown glyphs) prints `SWEET PRNG: HMAC-SHA256 registered`, passes commpage initialization, loads vnguard policy, THEN panics `image4 interface not available @kern_trustcache.c:253`. PC=0 fault FIXED IN QEMU. No new phone boot performed.
+- Next work: SWEET currently has neither AppleImage4 nor AMFI. `trust_cache_runtime_init` unconditionally requires both; unlike BCM2837, SWEET enters this startup path. Investigate an explicitly unavailable trust-cache runtime with rejected loads/no query matches while providers are absent; preserve all Apple-platform checks. Merely skipping the startup call would leave later AMFI/IMG4 dereferences unsafe. Existing load_static_trust_cache already handles trust_cache_rt == NULL.
+- QEMU runner now supports `--kernel MATCHING_KERNEL --fail-on-panic`: runtime font extraction from the payload produces exact `fb.txt`, plus `result.json`; a visible panic returns 2. Baseline 0013 re-run `research/q0013-text` detects the same NULL callback panic with zero unknown glyphs. Synthetic glyph roundtrip (including literal `?`) and invalid-VA rejection passed. Screen rows remain circular, not a full log; `no_panic_observed` does not prove successful boot. README has the invocation.
+- Patch 0014 committed/pushed as `be61f99`; Actions run `38748543058` is running: https://github.com/dipa-studio/ios-sweet/actions/runs/38748543058. Do not start a duplicate build.
+- 2026-10-15 active: hardware photo `IMG_20261015_160033.jpg` confirms the same PC=0 instruction-fetch abort as QEMU (LR `0xfffffe0007443fe4` = read_random). Independently reproduced with kernel 0013 in `research/q0013` (8-second run); prior allocator fix works. Latest tooling commit reviewed: `8d66d2d`.
+- Patch 0014 implemented: registers a built-in HMAC-SHA256 DRBG provider at EARLY_BOOT/FIRST, before commpage creation. A shared mutex serializes output/reseed across CPUs (correctness first; no per-CPU scaling yet), initgen validates CPU identities, refresh uses try-lock and the existing entropy filter/health tests. SWEET entropy accumulation and write_random now use the built-in SHA256 directly; no incomplete g_crypto_funcs table is registered. The existing bootloader-seed requirement remains enforced.
+- Local validation: both PRNG translation units compile to arm64 objects in `research/prng-objs`; no SHA256 wrapper imports remain. All 14 patches apply in CI order and resulting PRNG sources match local inputs. Sandbox `research/bt17/xnu`, originals `research/pre0014`, checker `research/check-patch-order.py`. NEXT: Actions kernel build, download to `xnu/out-0014`, run the QEMU payload before requesting another phone boot. Baseline QEMU ADT/payload are `research/q0013.adt` / `research/q0013.bin`.
+- 2026-10-15 08:15 QEMU EMULATION WORKS (`tools/qemu-sweet.py`, see "QEMU emulation" below). Patch 0013 VERIFIED in QEMU: boot passes kmem_crypto_init and ulock_initialize. NEXT BLOCKER (reproduced in QEMU, expected on hardware too): `pmap_create_commpages -> random() -> RandomULong -> read_random -> prng_funcs.refresh == NULL` (instruction fetch abort at pc 0, lr read_random+0x34). Nobody calls `register_and_init_prng` (closed corecrypto kext does it on Apple). Fix = patch 0014: SWEET-registered cckprng_funcs provider (osfmk/prng/prng_random.c); note random_cpu_init also panics while !prng_ready. The 07:26 hardware boot of 0013 will most likely show this same panic.
+- Previous hardware boot: patch 0013 (`a3a46e2`) CI `38686345689` PASSED (3m44s), image `shim/out/shim-boot-0013.img` was temporarily booted on 2026-10-15 at 05:26 UTC: send OKAY (0.407s), boot OKAY (0.134s), total 0.546s. Superseded by the hardware/QEMU PC=0 observation and patch 0014 work above.
+- Latest kernel implementation commit: `8f851d4`. Latest successful kernel CI: `38749549779` (patch 0015), https://github.com/dipa-studio/ios-sweet/actions/runs/38749549779.
+- CURRENT image: `shim/out/shim-boot-0013.img`, 16,412,672 bytes, SHA256 `110d1c46aee4b60253db24b6535e9781c4cf0fd25ca2a70e9016cf81378cea25`. Kernel `xnu/out-0013/kernel.development.sweet`, SHA256 `f0b1d375995316c550ce7014ff234d8271e9b9ac2857795ceff41b76ba2cd740`, plain arm64. CI log confirms 0013 applied; checksums passed. Entry PA `0xb146b488`, kernel end PA `0xb1ff4000`.
+- Current log/buildtree: `research/run17.log`, `research/bt17` (extracted, no nested .git; preferred baseline for patch 0014). Payload/ADT: `shim/out/payload-0013.bin`, `shim/out/sweet-0013.adt` (includes /defaults). Unpacked ramdisk byte-compared with payload in `shim/out/check-0013`.
+- Patch-0012 original image: `shim/out/shim-boot-0012.img`, 16,412,672 bytes, SHA256 `cf4b8ec4a65a51888d71c17d09cd0831d6b761b90e2531fdb8e575c32f4fd24a`. Kernel `xnu/out-0012/kernel.development.sweet`, SHA256 `69b78f49f6459cc63a0af44e7cf73c1779ef72130ef72b12ae86c88183ffc742`; checksums passed and sweet_early_relocate symbol present. Entry PA remains `0xb146b488`, kernel end PA `0xb1ff4000`.
+- Patch-0012 log/tree: `research/run16.log`, `research/bt16` (extracted, no nested .git; preferred baseline for next patch). CI log confirms 0012 applied. Payload `shim/out/payload-0012.bin`, ADT `shim/out/sweet-0012.adt`; packed ramdisk byte-compared with payload in `shim/out/check-0012`.
+- Active payload command line: `debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam`.
+- Latest observed photo: `/home/dipa/Downloads/IMG_20261015_071346.jpg` (local only). Stages 9 (kernel framebuffer VA), 10 (TTBR0 off/TLB flush), 11 (physmap table pointers) and 12 (calling pmap_bootstrap) all visible. Persistent diagnostics are VERIFIED ON HARDWARE.
+- pmap.c:1987 is the assert after SecureDTLookupEntry(NULL, "/defaults", &entry). The pmap-max-asids property itself is optional; an empty /defaults uses XNU's MAX_ASIDS. Do not bypass the assertion or guess an ASID limit.
+- Previous payload-only fix image: `shim/out/shim-boot-0012-defaults.img`, SHA256 `3ff61a268853c6ea7cbf284833f1346a1d791980ca366b6e1a215a86e040512b` (16,412,672 bytes). Same kernel/CI as 0012; ADT 2516 bytes (`shim/out/sweet-0012-defaults.adt`), root /defaults present with no ASID override. Payload `shim/out/payload-0012-defaults.bin`; unpacked ramdisk exactly matches payload (`shim/out/check-0012-defaults`). This boot reached the allocator crypto NULL-pointer fault below.
+- Latest hardware photo: `/home/dipa/Downloads/IMG_20261015_071608.jpg` (local only). Normal serial framebuffer console works. VM bootstrap/zone initialization, logging, scheduler, IPC, KDP and ulock_initialize print before the kmem_crypto_init data abort. gPanicBase warnings are expected because PLATFORM_PANIC_LOG_DISABLED is configured, and are not the faulting call.
+- Faulting instruction: `ldr x0, [x8, #0x150]` in crypto_random_kmem_ctx_size; x8 = NULL g_crypto_funcs. Source: libkern/crypto/corecrypto_rand.c and osfmk/vm/vm_kern.c:2448. rand.h explicitly permits NON-cryptographic kmem RNGs, but requires no locking in generation and context size <=256. Do not substitute read_random here: the global PRNG provider is also unregistered and kmem generation must remain lock-free. early_random may seed contexts during single-CPU bootstrap; it uses the built-in HMAC-SHA256 DRBG with the host-generated ADT seed.
+- Patch 0013 keeps the replacement entirely private to vm_kern.c: SplitMix64 state is 8 bytes per CPU/sizeclass, initialized using early_random. Uniform selection uses rejection sampling to avoid modulo bias. Other platforms retain the original corecrypto calls; SWEET's generic crypto APIs/registration remain untouched. Reference: https://prng.di.unimi.it/splitmix64.c (Sebastiano Vigna, public domain).
+- Validation: vm_kern.c compiles to arm64 (`research/kmem-rng-objs`, using `research/run16.log` + `research/bt16`). Undefined symbols include early_random and NO crypto_random_* references. All 13 patches apply in CI order and match the checked source. Original saved as `research/vm_kern.pre0013.c`.
+- RNG host checks: extracted actual new helper in `research/kmem-rng-check.c`; 16,384 outputs match the author's downloaded reference (`research/splitmix64-reference.c`), 147,456 bounded outputs satisfy their limits (including 1 and UINT64_MAX), and a forced rejection advances correctly. Full kernel crypto services and the registered kernel PRNG provider remain future work; this patch only supplies the allocator RNG contract.
+- Patch-0011 artifacts: kernel `xnu/out-0011/kernel.development.sweet`, log `research/run15.log`, extracted buildtree `research/bt15` (no nested .git). CI log confirms patch 0011 applied; artifact checksums passed. Kernel is plain arm64, entry VA `0xfffffe000746b488` -> PA `0xb146b488`, kernel end PA still `0xb1ff4000`.
+- Patch-0011 image: 16,412,672 bytes, SHA256 `29ad5cbfc752473de4af2c471a24a8b34f92da4bff5afec65c614b90cd3ad53a`. Kernel SHA256 `8ac3a956894b09f7bd0d890de8c5de38c65513287feb1e1bcd12db8ca772ee5c`. Payload/ADT in `shim/out/payload-0011.bin`, `shim/out/sweet-0011.adt`. Header unpacked/checked in `shim/out/check-0011`.
+- First patch-0011 attempt timed out waiting for FASTBOOT; superseded by the successful send/boot recorded above. Do not repeat the boot before the user reports the current screen.
+- Patch-0011 photo: `/home/dipa/Downloads/IMG_20261015_070218.jpg` (local only). Visible stages 1-8 and old red shim text; entry PA B146B488, boot args PA B1FF8000 / top B1FFC000. No evidence yet locating execution after stage 8.
+- Patch-0012 sandbox: `research/bt15/xnu` (NO nested .git). Proposed permanent debug VA: VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE, in the reserved gap below gVirtBase and above low globals; map the same PA framebuffer as Normal-NC in the final TTBR1 before arm_vm_physmap_init changes phystokv(). Keep the early panic sink until normal kprintf startup.
+- Patch 0012 validation: all 4 changed C translation units compiled to arm64 objects in `research/post-ttbr0-objs`; internal header export added to osfmk/arm64/Makefile and recreated locally in EXPORT_HDRS for pe_serial.c. All 12 patches apply in CI order and match all 6 edited files. Baselines are saved under `research/pre0012/`.
+- Actual mapping-helper host model (`research/early-map-check.c`, barrier stubbed only for host compilation) confirms: VA `0xfffffe0002000000`, L1 index 2016, L2 index 1; descriptor `0x006000009c000605` = framebuffer PA, Normal-NC, outer-shareable, EL1 RW, PXN+UXN. All other L2 entries preserved. The gap is excluded by ARM_LARGE_MEMORY's pmap_virtual_region(0).
+- Next boot command line MUST add `-enable_kprintf_spam`: DEVELOPMENT disables kprintf_output by default even when DB_KPRT is set (`pexpert/arm/pe_kprintf.c`). Planned command line: `debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam`.
+
+### Patch 0012 screen legend (after original stages 1-8)
+- 9: kernel framebuffer VA live; 10: TTBR0 off / TLB flushed; 11: physmap pointers rebound.
+- 12: calling pmap_bootstrap; 13: pmap_bootstrap returned; 14: early I/O page tables ready; 15: arm_vm_init returned.
+- 16: calling serial_init; 17: fbcon config read / mapping; 18: fbcon mapping returned; 19: serial_init returned; 20: kprintf startup complete.
+- Normal serial initialization clears the screen, so earlier stages may disappear before 19. If serial exists, early console disables after 20; otherwise early panic output stays enabled.
+- Local source sandbox: `research/bt13/xnu` (git baseline `623b060`, patches 0001-0008 already in baseline; uncommitted export edits correspond to patch 0009). Preserve those edits when producing patch 0010.
+- Previous compile log/tree: `research/run13.log`, `research/bt13`; previous kernel: `xnu/out/kernel.development.sweet`. New successful log/tree: `research/run14.log`, `research/bt14`; new kernel: `xnu/out-0010/kernel.development.sweet`.
+- Current device access: patch-0012 image was temporarily started from FASTBOOT; no adb connection is expected. Never flash partitions for bring-up; use `fastboot boot` with the shim image.
+- Patch `0010` lives in `xnu/patches/0010-sweet-early-framebuffer-debug.patch`. Its exact compiled sources are under `research/bt13/xnu`; generated objects are in `research/early-objs`.
+- Local checks passed: all 5 changed/new translation units compiled to arm64 Mach-O objects; new console only imports `_doprnt` and `iso_font` (both exist in the previous kernel). All 10 patches applied to a temporary upstream git index in CI order, and all 7 resulting changed source files matched the local compile inputs.
+- Reproduce changed-file compilation: `XNU_CC_OBJDIR="$PWD/research/early-objs" python3 tools/xnu-cc.py research/run13.log research/bt13 arm_init.c arm_vm_init.c kern/debug.c arm64/start.s osfmk/arm64/sweet_early.c --per-file` (create the output directory first). The helper now accepts explicit new source paths absent from the old artifact's Makefiles and rejects empty selections.
+- Device command result: `adb reboot bootloader`, then `timeout 30s fastboot boot shim/out/shim-boot-0010.img`: send OKAY (16028 KB), boot OKAY, total 0.541s. This confirms bootloader acceptance only, not XNU progress.
+- The successful boot above was on 2026-10-14. On 2026-10-15, `timeout 45s fastboot boot ...` timed out waiting for a device; no image was sent. Boot image SHA256 rechecked and unchanged. No new build is needed to repeat the trial.
+- Earlier retry: `timeout 90s fastboot boot shim/out/shim-boot-0010.img` timed out (exit 124). This is superseded by the successful 2026-10-15 repeat boot recorded above; do not repeat it until the user reports the screen.
+- User observation confirms MMU-on C entry, platform expert, CPU topology/bootstrap, startup bootstrap and cpu_init all complete. Failure is within arm_vm_physmap_init (non-XNU_MONITOR branch), before stage 8 / TTBR0 teardown. Old red shim text remains behind the early console; this is expected because only written rows are cleared.
+- New edit/compile sandbox is `research/bt14/xnu` (extracted artifact, NO nested .git; `git diff` there would act on the parent project). Use a saved baseline file / generated unified diff, or explicitly initialize a local baseline before editing. `research/bt13/xnu` does have its own baseline git repo.
+- Exact user-reported panic: `arm_vm_init.c:1606 Assertion failed: (temp_ptov_table[ptov_index - 1].va + temp_ptov_table[ptov_index - 1].len) <= physmap_end`.
+- Root cause: MacOSX build sets `ARM_LARGE_MEMORY=1`; `XNU_MONITOR` is off. Block alignment in arm_vm_physmap_slide can add gaps, but the non-PPL large-memory physmap_end omitted the padding already present in the small-memory branch. Patch 0011 reserves PTOV_TABLE_SIZE*ARM_TT_TWIG_SIZE (8*32MB) in both the aperture bound and its L1 allocation; monitor/PPL builds retain zero padding. The assertion is preserved.
+- Validation: `arm_vm_init.c` compiled to an arm64 object using `research/run14.log` + `research/bt14` (object in `research/physmap-objs`). All 11 patches apply in CI order and produce exactly that source. Host harness `research/physmap-check.c` extracts the real XNU slide function with page-table-write stubs: all 65,536 page-aligned slides within 1GB checked against the current kernel memory layout; old bound fails 65,504 cases, padded bound fails zero; worst overrun 0x1ffc000 bytes. Baseline source saved as `research/arm_vm_init.pre0011.c`.
+- CI: https://github.com/dipa-studio/ios-sweet/actions/runs/38638702083 (success; artifacts and full log downloaded).
+- New image: `shim/out/shim-boot-0010.img` (16,412,672 bytes, SHA256 `ed2c270e0081bad5ff517be415f9bfe8805463aea7866732203fa97ac737e64e`). Previous image preserved as `shim/out/shim-boot-pre0010.img`.
+- New kernel SHA256: `3ee05270cc291c49589a101678f904b1b69cb2f2575e05398bce8a4e052f409a`. Artifact checksums passed; arm64 (not arm64e), early-console symbols present. Payload entry VA `0xfffffe000746a488` -> PA `0xb146a488`; kernel end PA `0xb1ff4000`. Command line remains `debug=0xc serial=3 cpus=1 keepsyms=1`.
+
+### Patch 0010 screen legend
+- Bottom-left white 64x32 tile: assembly entered `start_first_cpu`, before page tables/MMU.
+- Text `SWEET EARLY 1`: entered `arm_init` with MMU on; 2: platform expert done; 3: CPU topology done; 4: CPU bootstrap done; 5: startup bootstrap done; 6: CPU init done; 7: entering `arm_vm_init`; 8: leaving bootstrap TTBR0.
+- `SWEET EARLY PANIC:` prints a copy of panic arguments before normal panic handling needs per-CPU/thread state.
+- In patches 0010/0011 the console disabled before TTBR0 invalidation; patch 0012 replaces that with a persistent kernel VA alias and diagnostics through normal serial/kprintf startup (see its legend above).
+- Screen contents require a physical observation from the user: adb cannot capture a framebuffer after Android has been replaced by a bare-metal kernel.
+
+## QEMU emulation (2026-10-15)
+- `tools/mkadt.py OUT.adt --qemu` = same ADT with QEMU virt GICD 0x08000000 / GICR 0x080a0000 / CNTFRQ 62.5 MHz.
+- `tools/qemu-sweet.py PAYLOAD OUTDIR [--secs N] [--hmp "x /8gx ADDR"] [--gdb]`: host-side copy of shim/loader.c
+  (segments + ADT + boot_args at their PAs, 6-instruction stub sets x0 and jumps), `-M virt,gic-version=3 -cpu cortex-a76`
+  (same ID_AA64MMFR0 as Kryo 470), 4G RAM so 0x9c000000 fb and 0xb0000000 kernel are plain RAM.
+  Outputs `fb.png` (the screen), `regs.txt`, `qemu.log` (exceptions with ESR/FAR/ELR). `--gdb` halts with a stub on :1234
+  (system `gdb` + `set architecture aarch64`, `hbreak *VA` works with the MMU on).
+- Not emulated: Qualcomm XPUs, ABL, real panel, PSCI conduit (QEMU virt uses hvc). Hardware still decides those.
+- Example: `python3 tools/mkadt.py /tmp/q.adt --qemu && python3 tools/mkpayload.py xnu/out-0013/kernel.development.sweet /tmp/q.adt /tmp/pq.bin --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam' && python3 tools/qemu-sweet.py /tmp/pq.bin /tmp/q`
+
+## Layout
+- `backup/`  partition dumps + full sdb..sdf LUNs, `SHA256SUMS` (all verified on-device == local)
+- `dtb/`     live FDT (from OrangeFox), PixelOS boot.img dtb, dtbo, dts versions
+- `shim/`    bare-metal boot shim (`./build.sh` -> `out/shim-boot.img`)
+- `research/` mainline sm7150 dts, XNU pe_fiq.c etc, PocketDarwin patches
+- `tools/unpack_bootv2.py`
+
+## Device access
+- No root in PixelOS 17 (user build, adb root disabled). Root = `fastboot boot recovery/recovery.img` (OrangeFox R12.0_2, temp boot, not flashed).
+- `fastboot boot` works for stock boot.img, OrangeFox, and our shim.
+- Shim resets itself via PSCI SYSTEM_RESET; IMEM restart_reason 0x77665500 is seen
+  (bootreason=bootloader) but ABL still boots Android, so it does not stop in fastboot.
+
+## Hardware facts (live DT + shim measurements)
+- Framebuffer (ABL cont splash): 0x9c000000, 1080x2400, stride 4320, a8r8g8b8, panel is DSC *video* mode (no kick needed).
+- RAM: 0x80000000+2G, 0x100000000+0xfcc00000. Live reserved-memory = PixelOS base dtb + sweet dtbo fixups.
+- GICv3: GICD 0x17a00000, GICR 0x17a60000 (stride 0x20000, 8 PEs). GICD_TYPER 0x007B041D: SecurityExtn=1 (DS=0).
+  ABL leaves GICD_CTLR = 0x10 (ARE_NS on, groups off). Writing 0x13 reads back 0x12: EnableGrp1A (bit1) is the one that matters.
+- GIC Group 1 VERIFIED (shim 2c): vtimer INTID 19 = 30 IRQs/300ms, ptimer INTID 18 = 30, SGI 1 to self = 10/10.
+  ICC_SRE=1 already, ICC_CTLR 0x8440, priority/enable writes stick. GICR_IGROUPR0 and GICD_IGROUPRn read 0 from NS
+  even though Group 1 delivery works (RAZ in NS view) - do not use them as a health check.
+  INTID 28 shows pending constantly (unknown PPI 12).
+- Timer 19.2 MHz. Qualcomm PPI numbering: secure-phys/phys/virt/hyp = PPI 1/2/3/0 -> vtimer INTID 19, ptimer 18 (NOT 27/30).
+- PSCI 1.1 via SMC, SMCCC 1.1. CPU_ON ok; SYSTEM_SUSPEND and SYSTEM_RESET2 unsupported.
+- SMP: CPU_ON works for all 7 secondaries (MPIDR 0x81000n00).
+- Entry EL1, MMU off, x0 = DTB (magic ok). ID_AA64MMFR0 = ...101122: 16K granule YES, 4K YES.
+- No serial console: debug UART SE is in SPI mode on sweet. Screen is the only debug channel.
+
+## XNU implications
+- XNU GICv3 path (pexpert/arm/pe_fiq.c, VMAPPLE) puts the timer (PPI 27) in Group 0 = FIQ. With SecurityExtn=1,
+  Group 0 is secure -> impossible from NS EL1. Need: Group 1 IRQ, ICC_IGRPEN1, INTID 19, and the timer handled in the IRQ path.
+- XNU VMAPPLE PSCI uses `hvc`; sweet needs `smc`.
+- PocketDarwin NonAppleGenericCpu.patch only swaps -mcpu=apple-h7 for -march=armv8-a.
+
+## Milestone 3 (2026-10-14): 16K MMU verified
+- ABL loads the Image at 0x80080000 (base 0x80000000 + 0x80000) regardless of text_offset=0.
+- 16K granule, T0SZ=28 (L2 start, 32MB blocks), MAIR 0x44ff00, TCR 0x1409CB51C, PARange=2 (40-bit PA).
+- Only own image pages WB (Qualcomm XPUs: never map carve-outs cacheable); fb Normal-NC; rest Device.
+- AT S1E1R checks all as expected; unmapped -> translation fault L2.
+- Fill fb: 110 ms (MMU off) -> 3.5 ms (NC). Memory loop 70 ms -> 0.7 ms. vtimer + SGI IRQs still fine with MMU on.
+
+## XNU loader design notes (xnu-8796)
+- Entry: `_start` -> `start_first_cpu`, x0 = boot_args (PA), MMU off, EL1. boot_args: Revision/Version 2,
+  virtBase/physBase/memSize/topOfKernelData, Boot_Video (fb 0x9c000000, rowBytes 4320, 1080x2400, depth 32),
+  deviceTreeP/Length (ADT), CommandLine[608], bootFlags, memSizeActual.
+- start.s maps [kernel mach header .. physBase+memSize) with cacheable BLOCKS. On Qualcomm every XPU carve-out
+  must therefore lie below the kernel: use physBase = 0xb0000000 (above ramdump_fb 0xaf000000+16M,
+  cdsp_sec, qseecom), end before rmtfs 0xfde01000 -> memSize ~0x4d000000 for bring-up.
+- Base ADT: iPhone 8 d20ap DeviceTree from iOS 16.7.16 IPSW (tools/remotezip.py + tools/adt.py; LZFSE payload).
+  Template values are empty: the loader must fill chosen/*, memory-map, cpu*/reg etc. like iBoot.
+- XNU build: GitHub Actions (dipa-studio/ios-sweet, xnu.yml) via blacktop/darwin-xnu-build, MACOS_VERSION=13.5.
+  New-clang fixes in xnu/patches; Xcode 16 iig is incompatible (IORPC.kernelContent) -> macos-14 runner, oldest Xcode.
+
+## Kernel architecture plan (SWEET machine config)
+- First stock build (VMAPPLE) is arm64e (PAC). Kryo 470 = ARMv8.2, no PAC -> SWEET must build plain arm64
+  (HAS_APPLE_PAC is only defined for __arm64e__, so arm64 drops PAC automatically).
+- Template: VMAPPLE (16K pages, GICv3 code in pe_fiq.c) minus APPLEVIRTUALPLATFORM hypercalls/paravirt PAC,
+  plus BCM2837 (generic ARM: no APPLE_ARM64_ARCH_FAMILY Apple sysregs). Do not link the KDK lib<cfg>.os.*.a.
+- Timer: XNU expects it on FIQ (sleh_fiq -> rtclock_intr). SWEET: GIC Group 1, so sleh_irq must ack ICC_IAR1,
+  route INTID 19 to the same timer path, SGIs to cpu_signal_handler, EOI via ICC_EOIR1.
+- SMP/interrupts: open-source AppleARMSMP (USE_APPLEARMSMP) needs an IOInterruptController (AIC role) and an
+  IOPMGR (CPU power -> PSCI CPU_ON via SMC). Plan: built-in IOKit classes (SweetGIC, SweetPMGR, platform
+  expert) compiled into the kernel and matched via iokit/KernelConfigTables.cpp -> no closed kexts needed.
+- Debug: xnu patch 0003 sweet-fbcon = kprintf drawn on the framebuffer (ADT node "sweet-fbcon").
+- ADT /arm-io ranges must not map to parent 0 (pe_arm_get_soc_base_phys()==0 disables serial): use parent 0x1000000.
+
+## Status 2026-10-14 late: first XNU boot attempt
+- SWEET kernel builds (CI run 38635343732, patches 0001-0009). Verified offline: arm64, no PAC, no >v8.2 code,
+  70300 classic relocs all in range (slide 0 = no loader work), entry = __start.
+- Boot: shim loader worked (initrd 0x846F0000-0x855FE3E0, BOOTARG 0xB1FF8000, JUMP 0xB146A488) but screen stayed
+  red -> xnu died/hung before serial_init (fbcon). kprintf is a no-op before STARTUP_SUB_KPRINTF.
+- Historical next-step plan (patch 0010, now implemented and built; see active handoff above): early fb debug channel
+  1. start.s start_first_cpu (after mov x20,x0 / mov x21,#0): PA marker band (MMU off, direct store to 0x9c000000).
+  2. start.s after both create_bootstrap_mapping calls: add ONE block entry to the existing V=P L2 table
+     (x25 + 2*PGBYTES; do NOT call create_bootstrap_mapping again: fb and RAM share L1 entry 0, it would replace
+     the L2 table). Entry = TYPE_BLOCK|VALID|SH(OUTER)|ATTRINDX(CACHE_ATTRINDX_WRITECOMB=1)|AF|PNX|NX|0x9c000000,
+     index = (va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT.
+  3. new osfmk/arm64/sweet_early.c (+files.arm64 entry): sweet_early_mark(n) colored bands at screen bottom and
+     sweet_early_putc using iso_font via VA=PA while the bootstrap TTBR0 is live; disable before
+     arm_vm_init's set_mmu_ttb(invalid_ttep) (arm_vm_init.c:2148).
+  4. markers in arm_init after PE_init_platform, ml_parse_cpu_topology, cpu_bootstrap, kernel_startup_bootstrap,
+     cpu_init, before arm_vm_init.
+  5. panic hook at top of panic_trap_to_debugger: va_copy + _doprnt(fmt, &copy, sweet_early_putc, 16).
+  Verify with tools/xnu-cc.py (compile+symbols) and patch-order simulation before the single CI run.
+
+### >>> UPDATE 2026-10-19 (GPU probe boot image packaged) <<<
+
+- Cross tools are installed and the shim has been built around the Actions kernel
+  from XNU patch 0081. Payload `shim/out/payload-0081-gpucc.bin` embeds
+  `sweetgpu=1`; image `shim/out/shim-boot-0081-gpucc.img` is Android boot header
+  v2 and contains the captured base DTB. SHA-256:
+  `2115e09372cdaeaeaec8cfd6a97b54bc15e0ae37a0f313a0217ad0724139d010`.
+- User reports this image booted and touch/button input responds. This confirms
+  kernel/input progress only; iOS userland and a valid HFS+ root on this phone
+  have NOT been verified. The older v15 notes describe the original project's
+  device and must not be treated as this user's device state. The user has not
+  downloaded the iOS firmware. Only the small D22AP device tree was fetched.
+- Root-image preparation: Apple iPhone X 16.7.16 (20H392) BuildManifest is in
+  ignored `research/ipsw-x/BuildManifest.plist`. Required members are OS
+  `087-86698-044.dmg`, SystemOS `087-86593-047.dmg`, and AppOS
+  `087-86715-047.dmg` (5,830,922,492 compressed bytes in total). Initial 64 MiB
+  HTTP range transfers stalled; retrying with smaller ranges. `apfs-fuse` is
+  missing, and sudo cannot elevate in this sandbox (`no new privileges`), so
+  mounting/build steps will need the user's host terminal. No userdata flash
+  has been authorized or performed on this user's phone in this session.
+- Root-image host handoff: user installed `apfs-fuse`. Ignored helper
+  `research/ipsw-x/download-root-components.py` uses six parallel 8 MiB ranges,
+  checks Content-Range and ZIP CRC-32, and preserves completed ranges to resume.
+  AppOS is complete/CRC verified; SystemOS reached at least 448/1046 MiB
+  compressed. Download process stopped for the host-terminal handoff; cached
+  ranges remain in `research/ipsw-x/firmware/.chunks/`.
+- Run `bash research/ipsw-x/build-root.sh` in the host terminal. This resumes
+  downloads, builds a 16 GiB HFS+ root using `tools/mkiosroot.sh`, applies
+  `tools/sweet-root-tweaks.py`, checks expected launchd/dyld/cache/build,
+  runs fsck, and creates `.simg` plus SHA-256 checksums under
+  `research/ipsw-x/`. Script passed `bash -n`; build has NOT run yet.
+  Log: `research/ipsw-x/build-root.log`. It performs no phone writes.
+- User ran the host script: all three DMGs completed and passed ZIP CRC-32.
+  The space guard stopped the build before image creation (23.7 GiB reported).
+  Later inspection shows 27.7 GiB free, consistent with Btrfs reclaiming the
+  deleted download chunks after the check. Added `sync -f "$work"` immediately
+  after downloads and before measuring space. Current space passes the 26 GiB
+  guard; rerun the same build command. No root image has been created yet.
+- Next host attempt failed during the OS rsync with thousands of source EIOs;
+  user interrupted it. Installed Fedora reader is
+  `apfs-fuse-0-30.20200928gitee71aa5.fc43`, predating upstream LZBITMAP support.
+  The incomplete `research/ipsw-x/ios16-root-20H392.img` is 16 GiB logical /
+  about 2.7 GiB allocated. Old APFS mounts remain at
+  `/tmp/tmp.4YfH05ONll/{os,sysos,appos}`; HFS output is no longer attached.
+- Fetched upstream APFS source with submodule into ignored
+  `research/apfs-fuse-current`, pinned at
+  `66b86bd525e8cb90f9012543be89b1f092b75cf3` (includes LZBITMAP decoder).
+  New `tools/build-apfs-reader.sh` builds it locally with current CMake/GCC
+  compatibility flags. User was asked to install cmake, gcc-c++, fuse3-devel,
+  zlib-ng-compat-devel, bzip2-devel; compilation is pending those dependencies.
+- `tools/mkiosroot.sh` now accepts APFS_FUSE and verifies a known compressed
+  plist before output creation. Local host wrapper selects the new binary;
+  `bash research/ipsw-x/build-root.sh --restart-partial` unmounts the old
+  session mounts and removes only the incomplete HFS+ image (after checking it
+  is detached and no completed outputs exist), then rebuilds. Run
+  `bash tools/build-apfs-reader.sh` first. Shell syntax checks pass; actual
+  decompression and full rebuild remain unverified. No phone writes occurred.
+- Current reader built successfully; its compressed-file check passed. The
+  13:29 host build copied OS, SystemOS, and AppOS and created the cryptex links.
+  Root now uses about 12 GiB within a 16 GiB image. It stopped at the final
+  read-only fsck, before running `sweet-root-tweaks.py` or generating `.simg`.
+- Investigated fsck locally on the detached image: `fsck.hfsplus -f -y` and
+  `-d -f -y` both finish with exit 0, volume OK. `-d -f -n` reports only
+  primary-header result 35 (Linux EDEADLK), VIStat 0x8000; catalog/extents/
+  bitmap statuses are zero. The upstream checker cache returns EDEADLK for
+  conflicting active buffers. Logs: `research/ipsw-x/fsck-*.log`.
+- Removed the failing `-n` pass from `mkiosroot.sh` and stopped swallowing
+  the repair pass's exit status. Host wrapper now supports `--resume-root`:
+  unmount leftover `/tmp/tmp.osCkEDttNv/{appos,sysos,os}`, confirm the image is
+  detached, run full write-enabled fsck, apply tweaks, verify contents, unmount,
+  check again, generate sparse image and checksums. Next host command:
+  `bash research/ipsw-x/build-root.sh --resume-root`. Keep the completed copy;
+  do not restart from scratch. Both modified scripts pass `bash -n`.
+- Host resume applied all root tweaks, then stopped at my incorrect assertion
+  that some individual dyld cache file must exceed 1 GiB. No copy was missing.
+  Read the SystemOS DMG directory with the current APFS library: 44 components,
+  3,330,359,296 bytes total, largest file 592,101,376 bytes; main cache is only
+  393,216 bytes. Expected layout is in `research/ipsw-x/dyld-source-layout.txt`.
+  The host wrapper now checks every component size against that layout and
+  checks the main cache's arm64 magic instead of using the size threshold.
+- Verified the unmounted HFS+ image directly with ignored diagnostic
+  `research/ipsw-x/hfs-read.py` (including hardlink resolution): all 44 cache
+  sizes match, main magic is `dyld_v1   arm64`, launchd/dyld are executable
+  Mach-O, system build is 20H392, Setup/Watchdog/Migration preferences are
+  applied, CommCenter jobs removed, keybag present, MediaToolbox recorder
+  flags off. `fsck.hfsplus -f -y` then passed. No host rerun needed.
+- Packaging completed locally: raw 17,179,869,184 bytes, SHA-256
+  `a94f5295fd88d0fa337fb25d05fab2ffd8b5edb1f10366630aa1186d6f4b5fb5`;
+  sparse 12,145,090,872 bytes, SHA-256
+  `42f6ac7c362651144bf138f3175604c2074aa76f633fe9a45dbecb377649e4f0`.
+  Checksums: `research/ipsw-x/root-image.sha256`. Sparse structure checked:
+  27,812 valid chunks, expands to the raw image's exact length. Existing
+  shim boot image SHA-256 remains `2115e09372cdaeaeaec8cfd6a97b54bc15e0ae37a0f313a0217ad0724139d010`.
+  `fastboot devices` currently returned no devices. Next action needs the
+  user's destructive-write confirmation and phone in bootloader fastboot.
+- New milestone: user reports iOS boots, with severe lag. Existing image uses
+  six A55 CPUs and software rendering; GPU patch 0081 is only a read-only
+  GPUCC probe. Prepared eight-core comparison image (17,149,952 bytes),
+  SHA-256 `cee57cd5b80fb77741b2d7571f13d5b1f4857a76de4d2d355e92da8db5970732`.
+  Verified eight CPU nodes in the original embedded ADT, identical shim code,
+  Android boot header v2, and exactly one changed byte in the embedded payload
+  (`cpus=6` -> `cpus=8`). `sweetfb_hz=30` and all other args are unchanged.
+  User was asked whether lag is choppy animation, delayed input, or settles
+  after a few minutes; response pending. Actual CPU count and crash loops
+  still need a device log. Eight-core image is packaged but NOT boot-tested.
+
+### GPU audit implementation (2026-10-19)
+
+- Reviewed live FDT and pinned Qualcomm/Lineage SM6150 sources. Exact CX/GX
+  GDSC and reset locations are recorded in docs/GPU_BRINGUP.md. Firmware
+  selection is a630_sqe.fw / a618_gmu.bin / a615_zap; no firmware copied yet.
+- Reproduced 0081's patch rejection against the relevant XNU 8796.141.3 files;
+  corrected 0081 and applied 0082 successfully, resulting source matches the
+  intended GPUCC audit. Collected primary sources/logs stay in research/gpu.
+  logs/ is now ignored to keep device-specific logs out of git.
+
+- ADB became accessible during this turn (OrangeFox). Mounted the existing
+  vendor logical block device dm-4 as EROFS **read-only**, copied matching
+  a618_gmu.bin (32,768 bytes), a630_sqe.fw (32,136 bytes), all a615_zap
+  components and vendor build.prop into ignored research/gpu/device-firmware,
+  then unmounted and removed the RAM-backed mountpoint. Manifest has hashes.
+  Vendor reports V14.0.8.0.TKFMIXM / RKQ1.210614.002, sweet / M2101K6G;
+  recovery product is sweetin. No userdata or boot partition writes occurred.
+  Firmware authenticity/redistribution permission not established; keep local.
+
+- OrangeFox KGSL reports `Adreno618v1`, recovery kernel
+  `4.14.348-openela-SML/b0507b61`, available GPU frequencies
+  800/650/565/430/355/267/180 MHz. This describes recovery's Linux driver,
+  not the state inherited by XNU after the next ABL boot.
+- CI 39228692751 completed successfully on source d37d1ca. Both the full
+  kernel compile and the required GPU marker check passed. Downloading the
+  xnu-kernel artifact to xnu/out-0082-gpu-audit; no new boot yet.
+
+- GPU audit kernel downloaded with ZIP ranges (the full artifact download was
+  slow). Local path xnu/out-0082-range/kernel.development.sweet, SHA-256
+  3eaf43cb6839bcf16cf3bf629e3e998c22f54c38b7e0f32a036b3096821c7e8a.
+  ZIP CRC and artifact SHA256SUMS match; GPUCC audit v2 marker is present.
+- Packaged shim/out/shim-boot-0082-gpu-audit.img (17,149,952 bytes), SHA-256
+  545174a46ed0d83716691cd2978d91ad2eac62cdd3b9a454de66065513c33205.
+  Embedded ramdisk matches intended payload; boot v2 header verified. ADT
+  and boot args match tested eight-core image, including sweetgpu=1 and
+  sweetfb_hz=30; no sweetusb. Original known-good images preserved.
+- Rebooted OrangeFox to fastboot. Sandboxed fastboot timed out because it
+  could not access the device; host escalation succeeded: Sending boot.img
+  OKAY (0.522 s), Booting OKAY (0.130 s). Temporary RAM boot only, no flash.
+  User said "it flashed"; clarified temporary boot and asked for home screen
+  result, then Power+VolDown back to FASTBOOT after 30 seconds. Next: host
+  fastboot boot recovery/recovery.img, then read persistent log into
+  logs/gpu-audit-v2.txt. Need actual SWEET GPU lines before any power writes.
+
+- User says the audit image is still booting and requested at least five
+  minutes before judging. Waiting for the result. No local recovery/recovery.img
+  exists on this host (historical notes refer to another machine). If needed,
+  user can enter installed OrangeFox with the hardware recovery key sequence;
+  once ADB returns, first pull the current recovery partition read-only for
+  future temporary boots. Do not substitute stock boot.img or flash recovery.
+
+- User confirmed audit image boots to iOS; missing acceleration is expected
+  because the image only reads GPUCC. Returned to OrangeFox, recovered full
+  persistent log into logs/gpu-audit-v2.txt (flush 12, 215,412 console bytes).
+  GPUCC audit completes, all GPU clocks off and CX/GX collapsed. See current
+  handoff and docs/GPU_BRINGUP.md for exact values and ARC implementation gap.
+- Read-only recovery partition backup now exists at recovery/recovery.img
+  (128 MiB), SHA-256
+  4efe904506a021f2853d756d19b97f113f991b64f5531bd4228b3293131f7e54.
+  Source was /dev/block/bootdevice/by-name/recovery -> /dev/block/sda30.
+  It is an Android boot image, not a partition write. Earlier "missing"
+  recovery-image note is superseded.
+- Also prepared an audit-disabled comparison image:
+  shim/out/shim-boot-0082-gpu-disabled.img, SHA-256
+  81bd8e1670f3d49c5b157aa6c65a632307baa00f5e9863404aaaf6ef9060483c.
+  Same kernel/ADT and boot args except sweetgpu=0. Payload differs in exactly
+  one byte; boot image also differs in its recomputed header SHA-1. Not booted.
+
+- End of audit cycle: phone remains in OrangeFox with ADB accessible; no
+  further reboot/flash performed after log/recovery backup. Changes pushed
+  to myfork/codex/adreno-power-audit (source d37d1ca, hardware report 64439b0).
+  Next code requires shared ARC level-vote handling before GPUCC power writes;
+  acceleration remains unimplemented. Full kernel artifact is also saved as
+  research/gpu/xnu-kernel-0082.zip (60,010,491 bytes); the independent ZIP-range
+  kernel copy was used for the successful boot. Original gh download session
+  39357 may still be fetching the same artifact into its separate ignored
+  output directory; do not confuse it with the verified xnu/out-0082-range.
+
+- **2026-10-19 ARC milestone build:** commit 9b446e6 (kernel/patches/docs)
+  pushed to myfork/codex/adreno-power-audit. GitHub Actions `xnu` run
+  **39239651278** succeeded, including both marker checks (`GPUCC audit v2`
+  and `ARC tables read-only complete`). Docs follow-up f189a5d adds the
+  guest IOGPU/AGXMetalA11 symbol evidence; it does not change the kernel.
+  The kernel artifact is downloading to `xnu/out-0083` (full artifact was
+  slow on 2026-10-19; use ZIP-range retrieval if needed). No device boot yet.
+  Next: package `sweetgpu=1` stage-2 image (read-only ARC tables) from this
+  kernel, ask the user for approval, boot it temporarily, and recover the
+  log before any `sweetgpu=2` vote. Exact gate criteria and expected markers
+  are in `docs/GPU_PROGRESS.md`. **User approved the stage-2-only temporary
+  boot on 2026-10-19; stage 3 (ARC votes) is not approved yet.**
+- Stage-2 image is built and verified: kernel
+  `xnu/out-0083/kernel.development.sweet` (17,222,944 bytes, SHA-256
+  `ed03acc1ca6d9388969cf42b15e152b8d26eb633b1405bfc2225dcb525f3c3b6`,
+  matches the CI artifact SHA256SUMS and the ZIP-range copy), ADT
+  `shim/out/sweet.adt` (unchanged eight-core ADT), cmdline identical to the
+  tested 0082 image except it keeps `sweetgpu=1`; payload
+  `shim/out/payload-0083-arc-probe.bin`; boot image
+  `shim/out/shim-boot-0083-arc-probe.img` (17,149,952 bytes, SHA-256
+  `1e549e65b4aa0e2d4113825b05bd8b496f8c1631edc38fff937e78c19107f9ef`).
+  Boot v2 unpack, embedded payload match and ARC marker all verified. Phone
+  is in fastboot; sandbox fastboot has no USB access, so the user must run
+  the temporary boot from the host.
+
+### 2026-10-19 continuation after external-agent build
+
+- Read-only pull from OrangeFox saved `logs/gpu-opencode-0083.txt`. The
+  source 9b446e6 image ran stage 1, printed all ARC tables, and kept touch and
+  iOS working. No ARC vote, GPU power-on or GPU rendering occurred.
+- Committed/pushed 0084 correction as `352601e`; CI `39244904492` is running
+  on that exact source. Only 0084 `sweetgpu=2` is suitable for the next
+  readback experiment; do not use 0083 mode 2, which writes fixed votes.
+- The prepared image still uses `sweetfb_hz=30`. The framebuffer timer also
+  rearms after presentation work, so actual presentation can be slower than
+  that cap. No current frame-time benchmark establishes the cost breakdown.
+  Do not promise iPhone 8 performance from GPU power or a framebuffer copy.
+- Qualcomm's 2025-11-21 rpmh_read discussion says resource reads return the
+  current setting, without separate active/sleep/wake values. This does not
+  yet establish this board's ARC response encoding/local vote semantics.
+  Reference: https://lists.openwall.net/linux-kernel/2025/11/21/534
+  Hardware raw response is the next prerequisite; readback was not claimed
+  to be an inherited vote in the new code.
+
+- 120 Hz scheduler change committed/pushed as `c056996`; combined CI run
+  `39245587501` builds patches through 0085 and requires both ARC-readback
+  and scheduler-v2 markers. It supersedes the readback-only run 39244904492.
+  No phone reboot or partition write performed in this continuation yet.
+
+- Live-FDT panel capability checked read-only: Xiaomi K6 38/0c/0a node has
+  supported-dfps-list [120, 60], timing@0 1080x2400 at 120. This does not
+  prove the active ABL scanout rate. Recovery DRM modes file was empty.
+- Image packaging will reuse the exact shim kernel/DTB unpacked from the
+  successful 0083 boot image, replacing only the XNU payload. Prepared local
+  research/gpu/package-0085.py for 120 Hz and 30 Hz comparison images.
+
+- **0085 artifact pulled and both images built (2026-10-19 ~18:15 local).**
+  `gh run download 39245587501 -R DC28088/ios-sweet -n xnu-kernel` into
+  `xnu/out-0085`; source `c056996`. Kernel `kernel.development.sweet`
+  (17,223,168 bytes, SHA-256
+  `c5111aaefb5d37c1c783f4c5f4d5e7913587db73be4aed77e562af216f26406f`)
+  matches the artifact SHA256SUMS and contains both required markers
+  (`SWEET GPU: ARC readback v1 starting`, `SWEET FB: scheduler v2
+  requested=`). `research/gpu/package-0085.py` then built the comparison
+  pair from the 0083 boot image's unpacked shim kernel/DTB and
+  `shim/out/sweet.adt`:
+  - `shim/out/shim-boot-0085-arc-readback-120hz.img` (17,149,952 bytes,
+    SHA-256 `65ce7fcfba318657577b0aaaac7579b445117c935d7c43cf6dcecade95366dda`),
+    cmdline keeps everything from 0083 plus `sweetfb_hz=120 sweetgpu=2`.
+  - `shim/out/shim-boot-0085-arc-readback-30hz.img` (17,149,952 bytes,
+    SHA-256 `e111d6469bf195912f5fa0fc464ca482ced37c1d88f30fbd1952d37f4b3e53ae`),
+    same cmdline with `sweetfb_hz=30`.
+  Both v2 unpacks verified: shim kernel and DTB byte-identical to
+  `shim/out/check-0083-readback-base`, embedded payload equal to a fresh
+  deterministic `mkpayload.py` run. Manifest with full cmdlines:
+  `research/gpu/0085-boot-manifest.json`. **The 120 Hz image was
+  temporarily booted (2026-10-19 20:12) and the persistent log was pulled
+  read-only to `logs/gpu-arc-probe-agent.txt`.** It passed the 60 s ARC
+  readback, reached SpringBoard, and kept touch/display working. The 30 Hz
+  comparison image was not booted. The raw replies and 120 Hz timing
+  limits are recorded at the top of this file and in
+  `docs/GPU_PROGRESS.md`. The raise-only `gfx.lvl` vote (0086) was then
+  approved and passed on 2026-10-19 (see the top section). Patch 0087 is
+  built (CI `39289968547` green) and both images are packaged (CX power =
+  `sweetgpu=4`, CX+GX power = `sweetgpu=5`) but not booted; both boots need
+  explicit approval, 4 before 5. No GPUCC/core/GMU write has been performed
+  on hardware yet.
