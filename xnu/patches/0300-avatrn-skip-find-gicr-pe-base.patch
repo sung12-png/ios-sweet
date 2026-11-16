@@ -1,21 +1,16 @@
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
-@@ -58,6 +58,10 @@
- static vm_offset_t
- find_gicr_pe_base()
+@@ -78,6 +78,13 @@
+ void
+ pe_init_fiq()
  {
 +#if defined(SWEET)
-+	/* AVATRN: SM7435 restricts GICR_TYPER access, so short-circuit CPU 0 to base */
-+	return gicr_base;
-+#else
- 	// We only care about aff1 and aff0
- 	uint32_t phys_id = __builtin_arm_rsr64("MPIDR_EL1") & (MPIDR_AFF1_MASK | MPIDR_AFF0_MASK);
- 
-@@ -73,6 +77,7 @@
- 	}
- 
- 	panic("%s: cannot find GICR base for core %u", __func__, ml_get_cpu_number(phys_id));
++	/* AVATRN: SM7435 GICR MMIO returns synchronous external abort on read
++	 * from XNU EL1 non-secure (unclear why — Linux uses it fine). Make the
++	 * whole function a no-op so we can see how far XNU gets without a GIC.
++	 */
++	return;
 +#endif
- }
+ 	int error;
+ 	DTEntry entry;
  
- void

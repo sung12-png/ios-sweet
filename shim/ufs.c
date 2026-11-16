@@ -231,11 +231,24 @@ void test_ufs(void)
 	uint32_t ocs = 0, st = 0, rc;
 	static const uint8_t tur[6] = { 0x00 };
 	/* A first command may report a unit attention; retry a few times. */
-	for (int i = 0; i < 3; i++) {
-		rc = scsi(0, tur, sizeof(tur), 0, 0, &ocs, &st);
-		con_hex2("UFS TUR", "rc=", rc, "ocs/st=", ocs << 8 | st);
-		if (!rc)
-			break;
+	// AVATRN DEBUG: probe LUNs 0..7 with TUR to find which one(s) accept SCSI.
+	// Also try a REQUEST_SENSE on each to clear a UNIT_ATTENTION CHECK_CONDITION
+	// (the usual first-boot response on Qualcomm UFS).
+	uint8_t rqs[6] = { 0x03, 0, 0, 0, 18, 0 };\
+	static uint8_t sense[18];
+	for (unsigned lun = 0; lun < 8; lun++) {
+		rc = scsi(lun, tur, sizeof(tur), 0, 0, &ocs, &st);
+		con_hex2("TUR L", "lun=", lun, "ocs<<8|st=", ocs << 8 | st);
+		if (ocs == 0 && st == 2) {
+			rc = scsi(lun, rqs, sizeof(rqs), sense, sizeof(sense), &ocs, &st);
+			con_hex2(" RQS", "ocs<<8|st=", ocs << 8 | st, "key/asc=", (sense[2] & 0xf) << 16 | (sense[12] << 8) | sense[13]);
+			// SCSI START UNIT: byte 4 = 0x01 (start, power=active). Clears INIT-REQUIRED.
+			uint8_t su[6] = { 0x1b, 0, 0, 0, 0x01, 0 };
+			rc = scsi(lun, su, sizeof(su), 0, 0, &ocs, &st);
+			con_hex2(" STRT", "ocs<<8|st=", ocs << 8 | st, "rc=", rc);
+			rc = scsi(lun, tur, sizeof(tur), 0, 0, &ocs, &st);
+			con_hex2(" TUR2", "lun=", lun, "ocs<<8|st=", ocs << 8 | st);
+		}
 	}
 
 	static const uint8_t cap10[10] = { 0x25 };	/* READ CAPACITY(10) */

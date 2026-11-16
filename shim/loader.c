@@ -115,9 +115,23 @@ const char *loader_boot(uintptr_t dtb)
 		return "no initrd in /chosen";
 	con_hex2("INITRD", "lo=", rd_start, "hi=", rd_end);
 
+	/* AVATRN: Moto ABL prepends vendor_boot ramdisk in front of ours — the
+	 * SWEETXNU magic may not be at offset 0. Scan page-aligned offsets in
+	 * the ramdisk region. */
 	const struct payload *p = (const struct payload *)rd_start;
-	if (!magic_ok(p->magic))
-		return "no SWEETXNU payload";
+	if (!magic_ok(p->magic)) {
+		for (uint64_t scan = rd_start; scan + sizeof(*p) <= rd_end; scan += 8) {
+			const struct payload *q = (const struct payload *)(uintptr_t)scan;
+			if (magic_ok(q->magic)) {
+				con_hex("PAYLOAD at", scan);
+				p = q;
+				rd_start = scan;
+				break;
+			}
+		}
+		if (!magic_ok(p->magic))
+			return "no SWEETXNU payload in ramdisk region";
+	}
 	if (p->version != 1 || (p->adt_off & 7) || (rd_start & 7))
 		return "bad payload header";
 
