@@ -34,6 +34,7 @@ FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
 # Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none
 UFS, UFS_SIZE = 0x01d84000, 0x3000
 TIMEBASE = 19200000
+BIG_FIRST, CPU_BIG_HZ, CPU_LITTLE_HZ = 6, 2304000000, 1804800000  # sweet: cores 6-7 A76
 VTIMER_INTID = 19
 # QEMU virt (-M virt,gic-version=3 -cpu cortex-a76): GICD/GICR and the generic timer's CNTFRQ
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
@@ -48,6 +49,21 @@ BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 #   tools/remotezip.py URL DeviceTree.d22ap.im4p DIR
 #   ipsw img4 im4p extract DIR/Firmware/all_flash/DeviceTree.d22ap.im4p -o d22ap.adt
 D22AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-x/d22ap.adt')
+
+
+# Per-device overrides (--device NAME). Values from each phone's live FDT.
+DEVICES = {
+    'avatrn': dict(  # Moto Edge 2024, SM7435 "parrot". Live memory banks (8 GiB):
+        # 0x80000000+0x68e00000, 0xf0900000+0xf700000, 0x800000000+0x3fc00000,
+        # 0x840000000+0x7b300000 (contiguous), 0x8c0000000+0xc0000000, ...
+        # Use the 3 GiB bank; fallback 0x840000000 + 0x7b300000.
+        HIGH_PHYS_BASE=0x8c0000000, HIGH_MEM_SIZE=0xc0000000,
+        GICD=0x17200000, GICR=0x17260000,
+        FB=0xb8000000, FB_SIZE=0x2b00000,
+        SWEET_ECID=0x41564154524e0001,  # 'AVATRN' + 1, synthetic
+        VTIMER_INTID=27,
+        BIG_FIRST=4, CPU_BIG_HZ=2400000000, CPU_LITTLE_HZ=1950000000),  # cores 4-7 A78
+}
 
 
 def d22ap_product(path=D22AP_ADT):
@@ -149,7 +165,7 @@ def build(seed=None, qemu=False, highmem=False):
             ('l3-cache-id', u32(0)),     # shared L3
             ('state', cstr('running' if core == 0 else 'stopped')),
             ('timebase-frequency', u32(timebase)),
-            ('clock-frequency', u32(2304000000 if core >= 6 else 1804800000)),
+            ('clock-frequency', u32(CPU_BIG_HZ if core >= BIG_FIRST else CPU_LITTLE_HZ)),
             ('bus-frequency', u32(100000000)),
             ('memory-frequency', u32(1866000000)),
             ('peripheral-frequency', u32(timebase)),
@@ -242,6 +258,8 @@ def build(seed=None, qemu=False, highmem=False):
 
 
 if __name__ == '__main__':
+    if '--device' in sys.argv:
+        globals().update(DEVICES[sys.argv[sys.argv.index('--device') + 1]])
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)

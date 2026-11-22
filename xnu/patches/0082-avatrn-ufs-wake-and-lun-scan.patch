@@ -1,0 +1,42 @@
+Subject: [PATCH] sweet: wake the UFS device, find the partition on any LUN
+
+Avatrn (Moto Edge 2024): ABL leaves the device asleep (all LUs NOT READY 04/02)
+and userdata lives on LUN 4. Send START STOP UNIT (Active) to W-LUN 0xD0, then
+scan LUNs 0-7 for the named GPT partition.
+---
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6b926fe..61aa23c 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -625,13 +625,26 @@ sweet_ufs_init(void)
+ 	error = ufs_take_over_host();
+ 	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
+-		/* The first command after the bootloader may report a unit attention. */
+-		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++		static const uint8_t ssu[6] = { 0x1b, 0, 0, 0, 0x10, 0 };
++		/*
++		 * Some bootloaders (Motorola ABL on SM7435) leave the UFS device in a
++		 * low-power state where every LU answers NOT READY (04/02, initializing
++		 * command required). Like ufshcd_set_dev_pwr_mode(): START STOP UNIT with
++		 * power condition Active, sent to the UFS Device well-known LUN 0xD0.
++		 * It is a no-op on a device that is already active.
++		 */
++		su.lun = 0xd0;
++		(void)ufs_scsi(ssu, sizeof(ssu), 0, false);
++		/* The GPT with the wanted partition may be on any LUN (avatrn: LUN 4). */
++		error = ENOENT;
++		for (uint8_t lun = 0; lun < 8 && error; lun++) {
++			su.lun = lun;
++			/* The first command after the bootloader may report a unit attention. */
++			for (int i = 0; i < 3 && ufs_scsi(tur, sizeof(tur), 0, false); i++) {
++			}
++			error = ufs_find_partition(want);
+ 		}
+ 	}
+-	if (!error) {
+-		error = ufs_find_partition(want);
+-	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error) {
+ 		return error;
