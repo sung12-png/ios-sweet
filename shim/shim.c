@@ -11,14 +11,15 @@
 #include "mmu.h"
 #include "loader.h"
 #include "ufs.h"
+#include "device.h"
 
-#define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
+#define IMEM_RESTART_REASON	DEV_IMEM_RESTART_REASON
 #define RESTART_BOOTLOADER	0x77665500U
-#define PSHOLD			0x0c264000UL
+#define PSHOLD			DEV_PSHOLD
 
-#define GICD_BASE		0x17200000UL
-#define GICR_BASE		0x17a00000UL
-#define GICR_SIZE		0x100000UL
+#define GICD_BASE		DEV_GICD_BASE
+#define GICR_BASE		DEV_GICR_BASE
+#define GICR_SIZE		DEV_GICR_SIZE
 #define GICR_PE_SIZE		0x20000UL
 #define GICR_TYPER		0x08
 #define GICR_WAKER		0x14
@@ -30,8 +31,8 @@
 #define GICR_ISPENDR0		(GICR_SGI + 0x200)
 #define GICR_ISACTIVER0		(GICR_SGI + 0x300)
 #define GICR_ICFGR1		(GICR_SGI + 0xc04)
-#define VTIMER_INTID		19	/* DT: <GIC_PPI 3 ...>, not the usual 27 */
-#define PTIMER_INTID		18	/* DT: <GIC_PPI 2 ...> */
+#define VTIMER_INTID		DEV_VTIMER_INTID
+#define PTIMER_INTID		DEV_PTIMER_INTID
 #define SGI_INTID		1
 
 #define PSCI_VERSION		0x84000000UL
@@ -104,11 +105,21 @@ static void delay_ms(unsigned ms)
 static void __attribute__((noreturn)) reset(unsigned after_s)
 {
 	con_skip();
+#ifdef DEVICE_AVATRN
 	con_str("AVATRN", "held: power-cycle to reboot (reset disabled for diagnosis)");
 	(void)after_s;
 	(void)IMEM_RESTART_REASON;
 	(void)PSHOLD;
 	(void)RESTART_BOOTLOADER;
+#else
+	con_str("RESET", after_s > 20 ? "in 40s" : "in 20s");
+	delay_ms(after_s * 1000);
+	wr32(IMEM_RESTART_REASON, RESTART_BOOTLOADER);
+	__asm__ volatile("dsb sy" ::: "memory");
+	smc(PSCI_SYSTEM_RESET, 0, 0, 0);
+	if (PSHOLD)
+		wr32(PSHOLD, 0);
+#endif
 	for (;;)
 		__asm__ volatile("wfe");
 }
@@ -376,7 +387,7 @@ void shim_main(uint64_t dtb)
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
 	con_clear(RED);
-	con_str("SHIM", "avatrn milestone 4: xnu loader");
+	con_str("SHIM", DEV_NAME " milestone 4: xnu loader");
 	con_skip();
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);

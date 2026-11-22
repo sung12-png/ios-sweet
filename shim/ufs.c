@@ -13,7 +13,8 @@
 #include "console.h"
 #include "ufs.h"
 
-#define UFS_BASE	0x01d84000UL	/* ufshc@1d84000, sweet live FDT */
+#include "device.h"
+#define UFS_BASE	DEV_UFS_BASE
 
 #define REG_CAP		0x00
 #define REG_VER		0x08
@@ -135,11 +136,13 @@ static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *bu
 	return *status_out ? 4 : 0;
 }
 
+static uint8_t cur_lun;
+
 static uint32_t read_blocks(uint32_t lba, uint32_t count, void *buf)
 {
 	uint8_t cdb[10] = { 0x28, 0, lba >> 24, lba >> 16, lba >> 8, lba, 0, count >> 8, count, 0 };
 	uint32_t ocs, st;
-	return scsi(0, cdb, sizeof(cdb), buf, count * BLOCK, &ocs, &st);
+	return scsi(cur_lun, cdb, sizeof(cdb), buf, count * BLOCK, &ocs, &st);
 }
 
 static uint64_t le64(const uint8_t *p)
@@ -192,6 +195,39 @@ static void list_partitions(uint32_t entry_lba, uint32_t nent)
 	}
 }
 
+static void probe_lun(uint8_t lun)
+{
+	uint32_t ocs = 0, st = 0, rc;
+	cur_lun = lun;
+	static const uint8_t cap10[10] = { 0x25 };	/* READ CAPACITY(10) */
+	rc = scsi(cur_lun, cap10, sizeof(cap10), data, 8, &ocs, &st);
+	if (rc) {
+		con_hex2("UFS CAP", "lun=", lun << 8 | rc, "ocs/st=", ocs << 8 | st);
+		return;
+	}
+	con_hex2("UFS LUN", "n/last=", lun << 28 | (be32(data) & 0xfffffff), "last=", be32(data));
+
+	/* READ(10) LBA 0, 2 blocks: protective MBR and the GPT header. */
+	static const uint8_t rd10[10] = { 0x28, 0, 0, 0, 0, 0, 0, 0, 2, 0 };
+	rc = scsi(cur_lun, rd10, sizeof(rd10), data, 2 * BLOCK, &ocs, &st);
+	if (rc)
+		return;
+	const uint8_t *gpt = data + BLOCK;
+	char sig[9];
+	for (int i = 0; i < 8; i++)
+		sig[i] = (gpt[i] >= 32 && gpt[i] < 127) ? gpt[i] : '.';
+	sig[8] = 0;
+	if (gpt[0] != 'E' || gpt[1] != 'F' || gpt[2] != 'I' || gpt[3] != ' ' || gpt[4] != 'P') {
+		con_str("UFS", "no GPT");
+		return;
+	}
+	uint32_t nent = gpt[80] | gpt[81] << 8 | gpt[82] << 16, esz = gpt[84] | gpt[85] << 8;
+	uint32_t elba = gpt[72] | gpt[73] << 8;
+	if (esz != 128 || nent > 128)
+		return;
+	list_partitions(elba, nent);
+}
+
 void test_ufs(void)
 {
 	con_str("UFS", "milestone 5 probe (read-only)");
@@ -230,6 +266,31 @@ void test_ufs(void)
 
 	uint32_t ocs = 0, st = 0, rc;
 	static const uint8_t tur[6] = { 0x00 };
+#ifdef DEVICE_AVATRN
+	/* Device looks asleep: TUR the UFS Device W-LUN (0xD0), then START STOP UNIT
+	 * power condition 1 (Active), like ufshcd_set_dev_pwr_mode(); then LUN0 again. */
+	static const uint8_t ssu[6] = { 0x1b, 0, 0, 0, 0x10, 0 };
+	rc = scsi(0xd0, tur, sizeof(tur), 0, 0, &ocs, &st);
+	con_hex2("UFS WLUN", "tur rc=", rc, "ocs/st=", ocs << 8 | st);
+	if (rc == 4)
+		con_hex2("UFS WLUN", "sense=", (ucd.resp[36] & 0xf) << 16 | ucd.resp[46] << 8 | ucd.resp[47],
+		    "info=", be32(ucd.resp + 37));
+	rc = scsi(0xd0, ssu, sizeof(ssu), 0, 0, &ocs, &st);
+	con_hex2("UFS WLUN", "ssu rc=", rc, "ocs/st=", ocs << 8 | st);
+	if (rc == 4)
+		con_hex2("UFS WLUN", "sense=", (ucd.resp[36] & 0xf) << 16 | ucd.resp[46] << 8 | ucd.resp[47],
+		    "info=", be32(ucd.resp + 37));
+	{
+		uint64_t t0 = ticks();
+		while (ticks() - t0 < 19200000)
+			;
+	}
+	rc = scsi(0, tur, sizeof(tur), 0, 0, &ocs, &st);
+	con_hex2("UFS LUN0", "tur rc=", rc, "ocs/st=", ocs << 8 | st);
+	if (rc == 4)
+		con_hex2("UFS LUN0", "sense=", (ucd.resp[36] & 0xf) << 16 | ucd.resp[46] << 8 | ucd.resp[47],
+		    "info=", be32(ucd.resp + 37));
+#endif
 	/* A first command may report a unit attention; retry a few times. */
 	// AVATRN DEBUG: probe LUNs 0..7 with TUR to find which one(s) accept SCSI.
 	// Also try a REQUEST_SENSE on each to clear a UNIT_ATTENTION CHECK_CONDITION
@@ -250,30 +311,11 @@ void test_ufs(void)
 			con_hex2(" TUR2", "lun=", lun, "ocs<<8|st=", ocs << 8 | st);
 		}
 	}
-
-	static const uint8_t cap10[10] = { 0x25 };	/* READ CAPACITY(10) */
-	rc = scsi(0, cap10, sizeof(cap10), data, 8, &ocs, &st);
-	con_hex2("UFS CAP", "rc=", rc, "ocs/st=", ocs << 8 | st);
-	if (!rc)
-		con_hex2("UFS LUN0", "lastlba=", be32(data), "blk=", be32(data + 4));
-
-	/* READ(10) LBA 0, 2 blocks: protective MBR and the GPT header. */
-	static const uint8_t rd10[10] = { 0x28, 0, 0, 0, 0, 0, 0, 0, 2, 0 };
-	rc = scsi(0, rd10, sizeof(rd10), data, 2 * BLOCK, &ocs, &st);
-	con_hex2("UFS READ", "rc=", rc, "ocs/st=", ocs << 8 | st);
-	if (rc)
-		return;
-	con_hex2("UFS MBR", "sig=", data[510] | data[511] << 8, "type=", data[450]);
-	const uint8_t *gpt = data + BLOCK;
-	char sig[9];
-	for (int i = 0; i < 8; i++)
-		sig[i] = (gpt[i] >= 32 && gpt[i] < 127) ? gpt[i] : '.';
-	sig[8] = 0;
-	con_str("UFS GPT", sig);
-	uint32_t nent = gpt[80] | gpt[81] << 8 | gpt[82] << 16, esz = gpt[84] | gpt[85] << 8;
-	uint32_t elba = gpt[72] | gpt[73] << 8;
-	con_hex2("UFS GPT", "entries=", nent, "lba=", elba);
-	if (esz != 128 || nent > 128)
-		return;
-	list_partitions(elba, nent);
+#ifdef DEVICE_AVATRN
+	for (uint8_t l = 0; l < 8; l++) {
+		probe_lun(l);
+	}
+#else
+	probe_lun(0);
+#endif
 }

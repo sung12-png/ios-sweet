@@ -20,6 +20,7 @@ _head:
 	.globl _start
 _start:
 	msr	daifset, #0xf
+#ifdef DEVICE_AVATRN
 	/* AVATRN: immediate paint of top 1/16 of FB with GREEN as the first
 	 * thing we do. If no green bar appears, ABL never jumped to us or
 	 * panel scanout stopped around image handoff. */
@@ -33,6 +34,7 @@ _start:
 	b.hi	10b
 	dsb	sy
 	/* end avatrn paint */
+#endif
 	mov	x19, x0			/* DTB pointer from ABL */
 	msr	spsel, #1
 	adr	x1, _stack_top
