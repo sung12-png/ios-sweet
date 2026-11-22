@@ -115,22 +115,37 @@ const char *loader_boot(uintptr_t dtb)
 		return "no initrd in /chosen";
 	con_hex2("INITRD", "lo=", rd_start, "hi=", rd_end);
 
-	/* AVATRN: Moto ABL prepends vendor_boot ramdisk in front of ours — the
-	 * SWEETXNU magic may not be at offset 0. Scan page-aligned offsets in
-	 * the ramdisk region. */
+	/* AVATRN: Moto ABL prepends the vendor_boot ramdisk in front of ours, so the
+	 * SWEETXNU payload starts at an arbitrary byte offset (vendor ramdisk is
+	 * 12451356 bytes = 4 mod 8). Scan byte by byte, then slide the payload down
+	 * to an 8-byte aligned address: the MMU is off here (Device memory), so the
+	 * 64-bit header and segment copies below fault on unaligned addresses. */
 	const struct payload *p = (const struct payload *)rd_start;
-	if (!magic_ok(p->magic)) {
-		for (uint64_t scan = rd_start; scan + sizeof(*p) <= rd_end; scan += 8) {
-			const struct payload *q = (const struct payload *)(uintptr_t)scan;
-			if (magic_ok(q->magic)) {
-				con_hex("PAYLOAD at", scan);
-				p = q;
-				rd_start = scan;
+	if ((rd_start & 7) || !magic_ok(p->magic)) {
+		uint64_t found = 0;
+		for (uint64_t scan = rd_start; scan + sizeof(*p) <= rd_end; scan++) {
+			if (*(volatile const uint8_t *)scan != 'S')
+				continue;
+			if (magic_ok((const char *)(uintptr_t)scan)) {
+				found = scan;
 				break;
 			}
 		}
-		if (!magic_ok(p->magic))
+		if (!found)
 			return "no SWEETXNU payload in ramdisk region";
+		con_hex("PAYLOAD at", found);
+		if (found & 7) {
+			uint64_t dst = found & ~7UL;
+			volatile uint8_t *d = (volatile uint8_t *)dst;
+			volatile const uint8_t *src = (volatile const uint8_t *)found;
+			for (uint64_t i = 0; i < rd_end - found; i++)
+				d[i] = src[i];	/* ascending copy, dst < src: safe */
+			rd_end -= found - dst;
+			found = dst;
+			con_hex("ALIGNED to", found);
+		}
+		p = (const struct payload *)(uintptr_t)found;
+		rd_start = found;
 	}
 	if (p->version != 1 || (p->adt_off & 7) || (rd_start & 7))
 		return "bad payload header";
