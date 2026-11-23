@@ -1,0 +1,29 @@
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 04ccee1..7cb152a 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -169,6 +169,24 @@ pe_init_fiq()
+ 		}
+ 	}
+ 
++#if defined(SWEET)
++	/*
++	 * AVATRN: sweet's ABL leaves GICD_CTLR.ARE_NS set, Moto's (SM7435) does not,
++	 * and with affinity routing off the redistributor SGI frame (GICR_IGROUPR0
++	 * etc.) aborts with a synchronous external abort. Enable ARE_NS first.
++	 */
++	{
++		uint32_t d = gicd_read32(GICD_CTLR);
++		kprintf("SWEET GIC: GICD_CTLR=0x%x GICR_WAKER=0x%x\n", d, gicr_read32(GICR_WAKER));
++		if (!(d & GICD_CTLR_ARE_NS)) {
++			gicd_write32(GICD_CTLR, d | GICD_CTLR_ARE_NS);
++			while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
++				;
++			}
++			kprintf("SWEET GIC: ARE_NS enabled, GICD_CTLR=0x%x\n", gicd_read32(GICD_CTLR));
++		}
++	}
++#endif
+ #if defined(SWEET)
+ 	/*
+ 	 * Real hardware with two security states: Group 0 is TrustZone's and
